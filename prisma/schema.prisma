@@ -1,0 +1,108 @@
+// Learn more: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum AppointmentSource {
+  WEBSITE
+  WHATSAPP
+  ADMIN
+}
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+model Customer {
+  id           String        @id @default(cuid())
+  name         String
+  phone        String        @unique
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  appointments Appointment[]
+}
+
+model Service {
+  id              String        @id @default(cuid())
+  name            String
+  description     String?
+  durationMinutes Int
+  price           Decimal       @db.Decimal(10, 2)
+  isActive        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  appointments    Appointment[]
+}
+
+model Staff {
+  id           String        @id @default(cuid())
+  name         String
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  workingHours WorkingHour[]
+  blockedTimes BlockedTime[]
+  appointments Appointment[]
+}
+
+// dayOfWeek: 0=Sunday … 6=Saturday
+// startTime / endTime stored as "HH:MM" strings (Jerusalem local time)
+model WorkingHour {
+  id        String   @id @default(cuid())
+  staffId   String
+  staff     Staff    @relation(fields: [staffId], references: [id])
+  dayOfWeek Int
+  startTime String
+  endTime   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([staffId, dayOfWeek])
+}
+
+// All DateTime values stored in UTC
+model BlockedTime {
+  id        String   @id @default(cuid())
+  staffId   String
+  staff     Staff    @relation(fields: [staffId], references: [id])
+  startAt   DateTime
+  endAt     DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Appointment {
+  id         String            @id @default(cuid())
+  customerId String
+  customer   Customer          @relation(fields: [customerId], references: [id])
+  serviceId  String
+  service    Service           @relation(fields: [serviceId], references: [id])
+  staffId    String
+  staff      Staff             @relation(fields: [staffId], references: [id])
+  startAt    DateTime
+  endAt      DateTime
+  status     AppointmentStatus @default(PENDING)
+  source     AppointmentSource @default(WEBSITE)
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  // Partial overlap prevention is enforced in server-side booking logic.
+  // This index speeds up the overlap query.
+  @@index([staffId, startAt, endAt])
+  @@index([customerId])
+}
