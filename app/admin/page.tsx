@@ -60,6 +60,11 @@ export default async function AdminPage() {
           title="Blocked Times"
           description="Block staff unavailability"
         />
+        <NavCard
+          href="/admin/whatsapp-test"
+          title="WhatsApp Test"
+          description="Send a manual test message"
+        />
       </div>
     </main>
   );
