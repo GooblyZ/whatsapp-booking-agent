@@ -25,15 +25,32 @@ enum AppointmentSource {
   ADMIN
 }
 
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum ConversationChannel {
+  WHATSAPP
+}
+
+enum ConversationState {
+  NEW
+  ACTIVE
+  HUMAN_HANDOFF
+  CLOSED
+}
+
 // ─── Models ──────────────────────────────────────────────────────────────────
 
 model Customer {
-  id           String        @id @default(cuid())
-  name         String
-  phone        String        @unique
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  appointments Appointment[]
+  id            String         @id @default(cuid())
+  name          String
+  phone         String         @unique
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  appointments  Appointment[]
+  conversations Conversation[]
 }
 
 model Service {
@@ -84,6 +101,48 @@ model BlockedTime {
   reason    String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// One conversation per sender phone per channel.
+model Conversation {
+  id         String              @id @default(cuid())
+  customerId String?
+  customer   Customer?           @relation(fields: [customerId], references: [id])
+  phone      String
+  channel    ConversationChannel
+  state      ConversationState   @default(NEW)
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  messages   Message[]
+
+  @@unique([phone, channel])
+  @@index([phone])
+}
+
+model Message {
+  id                String           @id @default(cuid())
+  conversationId    String
+  conversation      Conversation     @relation(fields: [conversationId], references: [id])
+  direction         MessageDirection
+  externalMessageId String?          @unique
+  fromPhone         String?
+  toPhone           String?
+  body              String?
+  rawPayload        Json?
+  createdAt         DateTime         @default(now())
+
+  @@index([conversationId])
+}
+
+// Raw log of every webhook call received from a provider.
+model WebhookEvent {
+  id              String    @id @default(cuid())
+  provider        String
+  externalEventId String?   @unique
+  eventType       String?
+  rawPayload      Json
+  processedAt     DateTime?
+  createdAt       DateTime  @default(now())
 }
 
 model Appointment {
