@@ -41,6 +41,13 @@ enum ConversationState {
   CLOSED
 }
 
+enum MessageStatus {
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
 // ─── Models ──────────────────────────────────────────────────────────────────
 
 model Customer {
@@ -129,6 +136,10 @@ model Message {
   toPhone           String?
   body              String?
   rawPayload        Json?
+  status            MessageStatus?
+  statusUpdatedAt   DateTime?
+  metaErrorCode     String?
+  metaErrorMessage  String?
   createdAt         DateTime         @default(now())
 
   @@index([conversationId])

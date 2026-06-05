@@ -4,6 +4,7 @@ import {
   ConversationChannel,
   ConversationState,
   MessageDirection,
+  MessageStatus,
   Prisma,
 } from "@/app/generated/prisma/client";
 
@@ -66,8 +67,22 @@ interface WaTextMessage {
   text?: { body: string };
 }
 
+interface WaStatusError {
+  code?: number;
+  title?: string;
+}
+
+interface WaStatus {
+  id: string;
+  status: string;
+  timestamp?: string;
+  recipient_id?: string;
+  errors?: WaStatusError[];
+}
+
 interface WaChangeValue {
   messages?: WaTextMessage[];
+  statuses?: WaStatus[];
 }
 
 interface WaEntry {
@@ -101,6 +116,9 @@ async function processWebhookPayload(body: unknown): Promise<void> {
         if (msg.type !== "text" || !msg.text?.body) continue;
         await storeInboundTextMessage(msg);
       }
+      for (const status of change.value.statuses ?? []) {
+        await updateMessageStatus(status);
+      }
     }
   }
 }
@@ -109,6 +127,38 @@ function extractEventType(body: unknown): string | null {
   if (typeof body !== "object" || body === null) return null;
   const obj = body as Record<string, unknown>;
   return typeof obj.object === "string" ? obj.object : null;
+}
+
+// ─── Inbound message storage ──────────────────────────────────────────────────
+
+// ─── Status callback handler ──────────────────────────────────────────────────
+
+async function updateMessageStatus(status: WaStatus): Promise<void> {
+  const mappedStatus = mapMetaStatus(status.status);
+  if (!mappedStatus) return; // unknown status value — skip silently
+
+  const error = status.errors?.[0];
+
+  // updateMany: safe if externalMessageId is not found (returns count 0, no throw)
+  await prisma.message.updateMany({
+    where: { externalMessageId: status.id },
+    data: {
+      status: mappedStatus,
+      statusUpdatedAt: new Date(),
+      metaErrorCode: error?.code != null ? String(error.code) : null,
+      metaErrorMessage: error?.title ?? null,
+    },
+  });
+}
+
+function mapMetaStatus(s: string): MessageStatus | null {
+  switch (s) {
+    case "sent":      return MessageStatus.SENT;
+    case "delivered": return MessageStatus.DELIVERED;
+    case "read":      return MessageStatus.READ;
+    case "failed":    return MessageStatus.FAILED;
+    default:          return null;
+  }
 }
 
 // ─── Inbound message storage ──────────────────────────────────────────────────
