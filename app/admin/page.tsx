@@ -65,6 +65,11 @@ export default async function AdminPage() {
           title="WhatsApp Test"
           description="Send a manual test message"
         />
+        <NavCard
+          href="/admin/agent-test"
+          title="Agent Console"
+          description="Test message intent analysis"
+        />
       </div>
     </main>
   );
