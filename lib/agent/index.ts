@@ -1,2 +1,12 @@
 export { analyzeMessage } from "./analyzer";
-export type { AgentAnalysisResult, AgentIntent, AgentConfidence, SuggestedTool, MissingField, SuggestedToolCall } from "./types";
+export { runSuggestedTool } from "./tool-runner";
+export type {
+  AgentAnalysisResult,
+  AgentIntent,
+  AgentConfidence,
+  SuggestedTool,
+  MissingField,
+  SuggestedToolCall,
+  ToolRunResult,
+  ToolStatus,
+} from "./types";

@@ -28,6 +28,17 @@ export interface SuggestedToolCall {
   reason: string;
 }
 
+export type ToolStatus = "executed" | "skipped" | "forbidden";
+
+export interface ToolRunResult {
+  status: ToolStatus;
+  actualToolName: string;
+  args: Record<string, unknown>;
+  result: unknown | null;
+  skippedReason: string | null;
+  enrichedDraft: string;
+}
+
 export interface AgentAnalysisResult {
   intent: AgentIntent;
   confidence: AgentConfidence;

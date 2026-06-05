@@ -2,7 +2,7 @@
 
 import { useActionState } from "react";
 import { analyzeWhatsAppMessage, AnalyzeState } from "./actions";
-import type { AgentAnalysisResult, AgentConfidence, AgentIntent, MissingField } from "@/lib/agent";
+import type { AgentAnalysisResult, AgentConfidence, AgentIntent, MissingField, ToolRunResult, ToolStatus } from "@/lib/agent";
 
 const INTENT_COLORS: Record<AgentIntent, string> = {
   BOOK_APPOINTMENT:     "bg-green-100 text-green-800",
@@ -101,6 +101,60 @@ function ResultPanel({ result }: { result: AgentAnalysisResult }) {
   );
 }
 
+const TOOL_STATUS_STYLES: Record<ToolStatus, string> = {
+  executed: "bg-green-100 text-green-800",
+  skipped:  "bg-yellow-100 text-yellow-800",
+  forbidden: "bg-red-100 text-red-800",
+};
+
+function ToolRunPanel({ toolRun }: { toolRun: ToolRunResult }) {
+  return (
+    <div className="mt-8 space-y-4">
+      <div className="flex items-center gap-3">
+        <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Tool Execution</h3>
+        <span className={`px-2 py-0.5 rounded text-xs font-semibold ${TOOL_STATUS_STYLES[toolRun.status]}`}>
+          {toolRun.status.toUpperCase()}
+        </span>
+      </div>
+
+      <div className="bg-white border border-gray-200 rounded-lg p-4 space-y-3">
+        <div className="flex gap-3">
+          <span className="text-xs text-gray-400 w-32 shrink-0">Tool called</span>
+          <span className="text-sm font-mono font-bold text-gray-900">{toolRun.actualToolName}()</span>
+        </div>
+        {Object.keys(toolRun.args).length > 0 && (
+          <div className="flex gap-3">
+            <span className="text-xs text-gray-400 w-32 shrink-0">Args</span>
+            <pre className="text-xs text-gray-700 bg-gray-50 rounded p-2 overflow-x-auto flex-1">
+              {JSON.stringify(toolRun.args, null, 2)}
+            </pre>
+          </div>
+        )}
+        {toolRun.skippedReason && (
+          <div className="flex gap-3">
+            <span className="text-xs text-gray-400 w-32 shrink-0">Reason</span>
+            <span className="text-sm text-yellow-700">{toolRun.skippedReason}</span>
+          </div>
+        )}
+      </div>
+
+      {toolRun.result !== null && (
+        <div className="bg-white border border-gray-200 rounded-lg p-4">
+          <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Tool result</p>
+          <pre className="text-xs text-gray-700 bg-gray-50 rounded p-3 overflow-x-auto max-h-64">
+            {JSON.stringify(toolRun.result, null, 2)}
+          </pre>
+        </div>
+      )}
+
+      <div className="bg-gray-900 rounded-lg p-4">
+        <p className="text-xs font-semibold text-gray-400 uppercase mb-2">Final draft response</p>
+        <p className="text-sm text-white leading-relaxed whitespace-pre-line">{toolRun.enrichedDraft}</p>
+      </div>
+    </div>
+  );
+}
+
 const EXAMPLES = [
   "Hi, I want to book a haircut tomorrow evening",
   "Can I get haircut and beard next Friday after 4?",
@@ -188,8 +242,13 @@ export default function AgentTestForm() {
         </div>
       )}
 
-      {/* Result */}
-      {state && "result" in state && <ResultPanel result={state.result} />}
+      {/* Analysis + tool execution */}
+      {state && "result" in state && (
+        <>
+          <ResultPanel result={state.result} />
+          {state.toolRun && <ToolRunPanel toolRun={state.toolRun} />}
+        </>
+      )}
     </div>
   );
 }

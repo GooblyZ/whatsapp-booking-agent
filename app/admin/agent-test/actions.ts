@@ -1,10 +1,10 @@
 "use server";
 
-import { analyzeMessage } from "@/lib/agent";
-import type { AgentAnalysisResult } from "@/lib/agent";
+import { analyzeMessage, runSuggestedTool } from "@/lib/agent";
+import type { AgentAnalysisResult, ToolRunResult } from "@/lib/agent";
 
 export type AnalyzeState =
-  | { result: AgentAnalysisResult; message: string }
+  | { result: AgentAnalysisResult; toolRun: ToolRunResult | null; message: string }
   | { error: string }
   | null;
 
@@ -20,6 +20,23 @@ export async function analyzeWhatsAppMessage(
 
   const phone = formData.get("phone");
   const phoneStr = typeof phone === "string" && phone.trim() ? phone.trim() : undefined;
+
   const result = analyzeMessage(message.trim(), phoneStr);
-  return { result, message: message.trim() };
+
+  let toolRun: ToolRunResult | null = null;
+  try {
+    toolRun = await runSuggestedTool(result, message.trim(), phoneStr);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    toolRun = {
+      status: "skipped",
+      actualToolName: result.suggestedToolCall.tool,
+      args: {},
+      result: null,
+      skippedReason: `Tool execution error: ${msg}`,
+      enrichedDraft: result.draftResponse,
+    };
+  }
+
+  return { result, toolRun, message: message.trim() };
 }
