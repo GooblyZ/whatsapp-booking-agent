@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db/prisma";
 import { getAvailableSlots } from "@/lib/booking/availability";
+import { getJerusalemDayOfWeek } from "@/lib/booking/timezone";
 
 // ─── Result types ──────────────────────────────────────────────────────────────
 
@@ -35,6 +36,11 @@ export interface AvailabilityResult {
   filteredSlotTimes: string[];
   filterApplied: string | null;
   noSlotsReason: string | null;
+  // Working-hour metadata sourced from WorkingHour table (or static fallback).
+  // Used by the response composer for accurate business-hours explanations.
+  workingDayStart: string | null;
+  workingDayEnd: string | null;
+  isWorkingDay: boolean;
 }
 
 export interface AppointmentResult {
@@ -174,6 +180,9 @@ export async function checkAvailabilityTool({
     filteredSlotTimes: [],
     filterApplied: timePreference,
     noSlotsReason: null,
+    workingDayStart: null,
+    workingDayEnd: null,
+    isWorkingDay: false,
   };
 
   if (!extractedService) {
@@ -196,6 +205,23 @@ export async function checkAvailabilityTool({
   if (!staff) {
     base.noSlotsReason = "No active staff found";
     return base;
+  }
+
+  // Fetch working-hour metadata for this specific day from the DB.
+  // Falls back to STATIC_HOURS so the composer always has accurate data.
+  const dayOfWeek = getJerusalemDayOfWeek(dateStr);
+  const wh = await prisma.workingHour.findFirst({ where: { staffId: staff.id, dayOfWeek } });
+  if (wh) {
+    base.workingDayStart = wh.startTime;
+    base.workingDayEnd = wh.endTime;
+    base.isWorkingDay = true;
+  } else {
+    const staticDay = STATIC_HOURS.find((h) => h.dayOfWeek === dayOfWeek);
+    if (staticDay && !staticDay.isClosed) {
+      base.workingDayStart = staticDay.startTime;
+      base.workingDayEnd = staticDay.endTime;
+      base.isWorkingDay = true;
+    }
   }
 
   // Fetch slots

@@ -1,10 +1,13 @@
 "use server";
 
-import { analyzeMessage, runSuggestedTool } from "@/lib/agent";
-import type { AgentAnalysisResult, ToolRunResult } from "@/lib/agent";
+import { analyzeMessage, runSuggestedTool, runGeminiAgent, isGeminiEnabled } from "@/lib/agent";
+import type { AgentAnalysisResult, ToolRunResult, LlmAgentResult } from "@/lib/agent";
+
+export type AgentMode = "rule" | "llm";
 
 export type AnalyzeState =
-  | { result: AgentAnalysisResult; toolRun: ToolRunResult | null; message: string }
+  | { mode: "rule"; result: AgentAnalysisResult; toolRun: ToolRunResult | null; message: string }
+  | { mode: "llm"; llmResult: LlmAgentResult; message: string }
   | { error: string }
   | null;
 
@@ -20,9 +23,19 @@ export async function analyzeWhatsAppMessage(
 
   const phone = formData.get("phone");
   const phoneStr = typeof phone === "string" && phone.trim() ? phone.trim() : undefined;
+  const modeRaw = formData.get("mode");
+  const mode: AgentMode = modeRaw === "llm" ? "llm" : "rule";
 
+  if (mode === "llm") {
+    if (!isGeminiEnabled()) {
+      return { error: "Gemini LLM mode is not available. Check GEMINI_API_KEY, LLM_AGENT_ENABLED, and LLM_PROVIDER." };
+    }
+    const llmResult = await runGeminiAgent(message.trim(), phoneStr);
+    return { mode: "llm", llmResult, message: message.trim() };
+  }
+
+  // Rule-based mode
   const result = analyzeMessage(message.trim(), phoneStr);
-
   let toolRun: ToolRunResult | null = null;
   try {
     toolRun = await runSuggestedTool(result, message.trim(), phoneStr);
@@ -38,5 +51,9 @@ export async function analyzeWhatsAppMessage(
     };
   }
 
-  return { result, toolRun, message: message.trim() };
+  return { mode: "rule", result, toolRun, message: message.trim() };
+}
+
+export async function getGeminiAvailability(): Promise<boolean> {
+  return isGeminiEnabled();
 }

@@ -1,7 +1,12 @@
 import Link from "next/link";
 import AgentTestForm from "./AgentTestForm";
+import { getGeminiAvailability } from "./actions";
 
-export default function AgentTestPage() {
+export const dynamic = "force-dynamic";
+
+export default async function AgentTestPage() {
+  const geminiAvailable = await getGeminiAvailability();
+
   return (
     <main className="min-h-screen bg-gray-50 p-8">
       <div className="mb-6">
@@ -12,10 +17,10 @@ export default function AgentTestPage() {
 
       <h1 className="text-2xl font-bold text-gray-900 mb-1">Agent Test Console</h1>
       <p className="text-sm text-gray-500 mb-8">
-        Simulate how the booking agent will interpret customer messages. No actions are executed. Internal use only.
+        Simulate how the booking agent will interpret customer messages. Internal use only.
       </p>
 
-      <AgentTestForm />
+      <AgentTestForm geminiAvailable={geminiAvailable} />
     </main>
   );
 }
