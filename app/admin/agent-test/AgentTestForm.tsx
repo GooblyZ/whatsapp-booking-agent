@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useActionState, useState, useEffect, useRef } from "react";
 import { analyzeWhatsAppMessage, AnalyzeState } from "./actions";
 import type {
   AgentAnalysisResult,
@@ -10,8 +10,12 @@ import type {
   ToolRunResult,
   ToolStatus,
   LlmAgentResult,
+  LlmStatus,
   NormalizedFields,
+  ConversationState,
+  MessageTurn,
 } from "@/lib/agent";
+import ConversationPanel from "./ConversationPanel";
 
 // ─── Shared colour maps ────────────────────────────────────────────────────────
 
@@ -102,14 +106,12 @@ function ToolRunSection({ toolRun }: { toolRun: ToolRunResult }) {
 
       {toolRun.result !== null && (
         <div className="bg-white border border-gray-200 rounded-lg p-4">
-          <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Tool result</p>
+          <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Tool result (internal)</p>
           <pre className="text-xs text-gray-700 bg-gray-50 rounded p-3 overflow-x-auto max-h-64">
             {JSON.stringify(toolRun.result, null, 2)}
           </pre>
         </div>
       )}
-
-      <DraftBox label="Final draft response" text={toolRun.enrichedDraft} />
     </div>
   );
 }
@@ -214,17 +216,48 @@ function NormalizedSection({ raw, norm }: {
 // ─── LLM result panel ──────────────────────────────────────────────────────────
 
 function LlmResultPanel({ llmResult }: { llmResult: LlmAgentResult }) {
-  const { geminiRaw, normalized, toolRun, finalDraft, fallbackUsed, fallbackReason, safetyWarnings, modelUsed, analysis } = llmResult;
+  const { agentAction, geminiRaw, normalized, toolRun, finalDraft, fallbackUsed, fallbackReason, safetyWarnings, modelUsed, analysis, llmStatus } = llmResult;
   const intentKey = analysis.intent in INTENT_COLORS ? analysis.intent : "UNKNOWN";
   const confidenceKey = analysis.confidence in CONFIDENCE_COLORS ? analysis.confidence : "LOW";
+  const isQuota = llmStatus === "quota_exceeded";
+  const isFallback = llmStatus === "fallback_used";
 
   return (
     <div className="mt-6 space-y-5">
+
+      {/* LLM status banner — shown before everything else when LLM is unavailable */}
+      {isQuota && (
+        <div className="bg-red-50 border-2 border-red-400 rounded-lg p-4">
+          <p className="text-sm font-bold text-red-700 mb-1">⚠ Gemini quota exceeded — fallback-only mode</p>
+          <p className="text-sm text-red-600">This response does not represent real LLM Agent reasoning. Do not evaluate agent quality while in this state.</p>
+          {fallbackReason && <p className="text-xs text-red-400 font-mono mt-2 break-all">{fallbackReason}</p>}
+        </div>
+      )}
+      {isFallback && (
+        <div className="bg-orange-50 border border-orange-300 rounded-lg p-3">
+          <p className="text-xs font-semibold text-orange-700 uppercase mb-1">LLM unavailable — fallback mode</p>
+          <p className="text-sm text-orange-800">{fallbackReason ?? "Gemini failed — rule-based analyzer used."}</p>
+        </div>
+      )}
+
+      {/* ── Customer-facing response — THE response the customer would receive ── */}
+      <div className={`rounded-lg p-4 border-2 ${isQuota || isFallback ? "border-orange-300 bg-orange-50" : "border-emerald-400 bg-emerald-50"}`}>
+        <p className={`text-xs font-bold uppercase mb-2 ${isQuota || isFallback ? "text-orange-600" : "text-emerald-700"}`}>
+          ✉ Customer-facing response{(isQuota || isFallback) ? " (fallback — not LLM)" : ""}
+        </p>
+        <p className="text-sm leading-relaxed whitespace-pre-line text-gray-900" dir="auto">{finalDraft}</p>
+      </div>
+
       {/* Header badges */}
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-xs bg-violet-100 text-violet-700 px-2 py-0.5 rounded font-medium">
-          Gemini LLM · {modelUsed}
+        <span className={`text-xs px-2 py-0.5 rounded font-medium ${isQuota ? "bg-red-100 text-red-700" : "bg-violet-100 text-violet-700"}`}>
+          {isQuota ? "⚠ QUOTA EXCEEDED" : `Gemini LLM · ${modelUsed}`}
         </span>
+        {agentAction && (
+          <span className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded font-semibold">
+            {agentAction.actionType}
+          </span>
+        )}
         <span className={`px-3 py-1 rounded-full text-sm font-semibold ${INTENT_COLORS[intentKey as AgentIntent]}`}>
           {geminiRaw.intent.replace(/_/g, " ")}
         </span>
@@ -234,13 +267,31 @@ function LlmResultPanel({ llmResult }: { llmResult: LlmAgentResult }) {
         <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded">
           lang: {geminiRaw.language}
         </span>
+        <span className={`text-xs px-2 py-0.5 rounded font-mono ${isQuota ? "bg-red-100 text-red-600" : isFallback ? "bg-orange-100 text-orange-700" : "bg-green-100 text-green-700"}`}>
+          {llmStatus}
+        </span>
       </div>
 
-      {/* Fallback warning */}
-      {fallbackUsed && (
-        <div className="bg-orange-50 border border-orange-300 rounded-lg p-4">
-          <p className="text-xs font-semibold text-orange-700 uppercase mb-1">Fallback used</p>
-          <p className="text-sm text-orange-800">{fallbackReason ?? "Gemini failed — rule-based analyzer used."}</p>
+      {/* AgentAction debug panel */}
+      {agentAction && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-2">
+          <p className="text-xs font-semibold text-blue-600 uppercase mb-3">AgentAction (LLM reasoning)</p>
+          <Field label="actionType" value={agentAction.actionType} />
+          <Field label="serviceCandidate" value={agentAction.serviceCandidate} />
+          <Field label="dateCandidate" value={agentAction.dateCandidate} />
+          <Field label="requestedTime" value={agentAction.requestedTimeCandidate} />
+          <Field label="timePeriod" value={agentAction.timePeriodCandidate} />
+          <Field label="selectedSlot" value={agentAction.selectedSlotCandidate} />
+          <Field label="customerName" value={agentAction.customerName} />
+          {agentAction.responseGoal && (
+            <div className="pt-2 border-t border-blue-200">
+              <p className="text-xs text-blue-500 font-medium mb-0.5">responseGoal</p>
+              <p className="text-xs text-blue-800">{agentAction.responseGoal}</p>
+            </div>
+          )}
+          {agentAction.debugReasoningSummary && (
+            <p className="text-xs text-blue-400 italic">{agentAction.debugReasoningSummary}</p>
+          )}
         </div>
       )}
 
@@ -283,16 +334,11 @@ function LlmResultPanel({ llmResult }: { llmResult: LlmAgentResult }) {
         </div>
       )}
 
-      {/* Gemini draft */}
-      <DraftBox label="Gemini draft response" text={geminiRaw.draftResponse} />
+      {/* Internal debug: AgentAction response goal / fallback draft */}
+      <DraftBox label={agentAction ? "[Internal] AgentAction response goal" : "[Internal] Fallback draft"} text={geminiRaw.draftResponse} />
 
-      {/* Tool execution */}
+      {/* Tool execution (internal — raw DB result) */}
       {toolRun && <ToolRunSection toolRun={toolRun} />}
-
-      {/* Final draft (enriched) — shown only when different from gemini draft */}
-      {toolRun && toolRun.enrichedDraft !== geminiRaw.draftResponse && (
-        <DraftBox label="Final draft response (tool-enriched)" text={finalDraft} />
-      )}
     </div>
   );
 }
@@ -318,20 +364,54 @@ const EXAMPLES = [
 
 export default function AgentTestForm({ geminiAvailable }: { geminiAvailable: boolean }) {
   const [mode, setMode] = useState<"rule" | "llm">("rule");
+  const [convState, setConvState] = useState<ConversationState | null>(null);
+  const [history, setHistory] = useState<MessageTurn[]>([]);
   const [state, formAction, pending] = useActionState<AnalyzeState, FormData>(
     analyzeWhatsAppMessage,
     null
   );
+  const prevStateRef = useRef<AnalyzeState>(null);
+
+  // Sync conversation state and history from each server action result
+  useEffect(() => {
+    if (state === prevStateRef.current) return;
+    prevStateRef.current = state;
+    if (state && "mode" in state && state.mode === "llm" && "updatedState" in state && state.updatedState) {
+      setConvState(state.updatedState);
+      setHistory((prev) => [
+        ...prev,
+        { role: "user" as const, text: state.message },
+        { role: "agent" as const, text: state.llmResult.finalDraft },
+      ]);
+    }
+  }, [state]);
+
+  function handleModeChange(newMode: "rule" | "llm") {
+    setMode(newMode);
+    if (newMode === "rule") {
+      setConvState(null);
+      setHistory([]);
+    }
+  }
+
+  function handleReset() {
+    setConvState(null);
+    setHistory([]);
+  }
+
+  const showSidebar = mode === "llm" && convState !== null;
 
   return (
-    <div className="max-w-2xl">
+    <div className={showSidebar ? "max-w-5xl" : "max-w-2xl"}>
+      <div className={showSidebar ? "flex gap-8 items-start" : undefined}>
+      <div className="flex-1 min-w-0">
       {/* Mode selector */}
       <div className="mb-6">
         <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Analysis mode</p>
         <div className="flex gap-2">
           <button
             type="button"
-            onClick={() => setMode("rule")}
+            onClick={() => handleModeChange("rule")}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
               mode === "rule"
                 ? "bg-gray-900 text-white"
@@ -342,7 +422,7 @@ export default function AgentTestForm({ geminiAvailable }: { geminiAvailable: bo
           </button>
           <button
             type="button"
-            onClick={() => setMode("llm")}
+            onClick={() => handleModeChange("llm")}
             disabled={!geminiAvailable}
             title={!geminiAvailable ? "Gemini LLM mode is not available. Check GEMINI_API_KEY, LLM_AGENT_ENABLED, and LLM_PROVIDER." : undefined}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
@@ -353,7 +433,7 @@ export default function AgentTestForm({ geminiAvailable }: { geminiAvailable: bo
                 : "bg-gray-100 border border-gray-200 text-gray-400 cursor-not-allowed"
             }`}
           >
-            Gemini LLM
+            Gemini LLM {mode === "llm" && convState ? "(multi-turn)" : ""}
           </button>
         </div>
         {!geminiAvailable && (
@@ -365,6 +445,8 @@ export default function AgentTestForm({ geminiAvailable }: { geminiAvailable: bo
 
       <form action={formAction} className="space-y-4">
         <input type="hidden" name="mode" value={mode} />
+        <input type="hidden" name="conversationStateJson" value={convState ? JSON.stringify(convState) : ""} />
+        <input type="hidden" name="conversationHistoryJson" value={JSON.stringify(history)} />
 
         <div>
           <label htmlFor="message" className="block text-sm font-medium text-gray-700 mb-1">
@@ -436,6 +518,19 @@ export default function AgentTestForm({ geminiAvailable }: { geminiAvailable: bo
       {state && "mode" in state && state.mode === "llm" && (
         <LlmResultPanel llmResult={state.llmResult} />
       )}
+      </div>{/* end flex-1 */}
+
+      {/* Sidebar: conversation state + history (LLM multi-turn only) */}
+      {showSidebar && (
+        <div className="w-80 shrink-0 sticky top-8">
+          <ConversationPanel
+            state={convState}
+            history={history}
+            onReset={handleReset}
+          />
+        </div>
+      )}
+      </div>{/* end flex row */}
     </div>
   );
 }

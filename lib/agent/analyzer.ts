@@ -46,7 +46,11 @@ const SERVICES_RE = [
 
 const AVAILABILITY_RE = [
   /\b(available|availability|when can i (come|book|get in)|any (slots|openings|spots|times)|free (slots|time|times))\b/i,
-  /יש\s*(תור|מקום|זמן)\s*(ל|ב|מחר|היום|ל)/,
+  /\bhow many (slots|appointments|times?|openings?)\b/i,
+  /\b(slots|appointments|times?)\s*(available|open|free|left)\b/i,
+  // Hebrew: "כמה תורים", "יש זמינות", "יש תורים", "מה פנוי", "יש הרבה", "מה זמין"
+  /כמה\s*(תורים|מקומות|פנויים?)|יש\s*(תורים?|זמינות|מקום)\b|מה\s*(פנוי|זמין)\b|יש\s*הרבה/,
+  /יש\s*(תור|מקום|זמן)\s*(ל|ב|מחר|היום)/,
 ];
 
 const BOOK_EXPLICIT_RE = [
@@ -75,9 +79,10 @@ const SERVICES: { name: string; re: RegExp }[] = [
 
 const DATES: { label: string; re: RegExp }[] = [
   // Specific multi-word — check before bare day names
+  { label: "in three days", re: /\bin three days\b|בעוד\s*שלושה\s*ימים/i },
+  { label: "day after tomorrow", re: /\bday after tomorrow\b|מחרתיים|בעוד\s*יומיים|עוד\s*יומיים/i },
   { label: "tomorrow", re: /\btomorrow\b|מחר/i },
   { label: "today", re: /\btoday\b|היום/i },
-  { label: "day after tomorrow", re: /\bday after tomorrow\b/i },
   { label: "next Monday", re: /\bnext monday\b/i },
   { label: "next Tuesday", re: /\bnext tuesday\b/i },
   { label: "next Wednesday", re: /\bnext wednesday\b/i },

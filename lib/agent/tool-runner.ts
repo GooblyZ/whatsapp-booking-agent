@@ -56,7 +56,9 @@ function resolveDatePreference(label: string | null): string | null {
   switch (label) {
     case "today": return todayStr;
     case "tomorrow": return addDays(todayStr, 1);
-    case "day after tomorrow": return addDays(todayStr, 2);
+    case "day after tomorrow":
+    case "in two days": return addDays(todayStr, 2);
+    case "in three days": return addDays(todayStr, 3);
     case "next week": return addDays(todayStr, 7);
     case "this week": return todayStr;
   }

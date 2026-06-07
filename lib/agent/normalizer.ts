@@ -13,8 +13,9 @@ const SERVICE_MAP: [RegExp, string][] = [
   [/beard\s*trim/i,                      "Beard"],
   [/^זקן$/i,                             "Beard"],
   [/^beard$/i,                           "Beard"],
-  [/תספורת\s*לילדים/i,                   "Kids Haircut"],
+  [/תספורת\s*(?:ל)?ילד(?:ים)?/i,         "Kids Haircut"],  // matches תספורת ילדים, תספורת לילדים, תספורת לילד
   [/kids?\s*haircut/i,                   "Kids Haircut"],
+  [/^(?:תספורת\s+)?ילד(?:ים)?$/i,        "Kids Haircut"],  // standalone ילדים / ילד
   [/^תספורת$/i,                          "Haircut"],
   [/^haircut$/i,                         "Haircut"],
 ];
@@ -35,7 +36,8 @@ export function normalizeService(raw: string | null): string | null {
 // Maps Hebrew/mixed date expressions to the English labels that
 // resolveDatePreference() in tool-runner.ts already handles.
 const DATE_MAP: [RegExp, string][] = [
-  [/^מחרתיים$|^מחרת יום מחר$/,       "day after tomorrow"],
+  [/^(בעוד\s*שלושה\s*ימים|in three days)$/i, "in three days"],
+  [/^(מחרתיים|מחרת יום מחר|בעוד\s*יומיים|עוד\s*יומיים|in two days)$/i, "day after tomorrow"],
   [/^מחר$/,                            "tomorrow"],
   [/^היום$/,                           "today"],
   [/^שבוע הבא$/,                       "next week"],
@@ -87,6 +89,15 @@ export function normalizeTimePreference(raw: string | null): string | null {
   const atDash = t.match(/^ב-(\d{1,2}:\d{2})$/);
   if (atDash) return `at ${atDash[1]}`;
 
+  // "בN" / "בN:MM" / "בN בבוקר" / "בN בערב" (e.g. "ב8 בבוקר" → "at 08:00")
+  const heNum = t.match(/^ב(\d{1,2})(?::(\d{2}))?\s*(בבוקר|בצהריים|בערב|בלילה)?$/);
+  if (heNum) {
+    const h = parseInt(heNum[1], 10), m = heNum[2] ? parseInt(heNum[2], 10) : 0;
+    let h24 = h;
+    if (/בערב|בלילה/.test(heNum[3] ?? "") && h >= 1 && h <= 8) h24 = h + 12;
+    return `at ${String(h24).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  }
+
   // Named periods
   if (/^(ערב|בערב)$/.test(t)) return "evening";
   if (/^(בוקר|בבוקר)$/.test(t)) return "morning";
@@ -115,4 +126,13 @@ export function normalizeGeminiFields(
     datePreference: normalizeDatePreference(datePreference),
     timePreference: normalizeTimePreference(timePreference),
   };
+}
+
+// Extracts an exact "HH:mm" if the normalized time preference represents a
+// specific clock time (e.g. "at 08:00" → "08:00"). Returns null for vague
+// periods like "morning", "evening", or "after 16:00".
+export function normalizeExactTime(normalizedTimePref: string | null): string | null {
+  if (!normalizedTimePref) return null;
+  const m = normalizedTimePref.match(/^at\s+(\d{2}:\d{2})$/i);
+  return m ? m[1] : null;
 }

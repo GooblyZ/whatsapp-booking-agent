@@ -310,6 +310,41 @@ export function explainUnavailablePreference(
   );
 }
 
+// ─── Availability count draft ──────────────────────────────────────────────────
+
+function composeCountDraft(
+  av: AvailabilityResult,
+  lang: Lang,
+  svcCanonical: string | null,
+  origDate: string | null,
+): string {
+  const svc = formatServiceNameForLanguage(svcCanonical, lang);
+  const datePhr = formatDatePhrase(origDate, lang);
+  const isHe = lang === "he" || /[א-ת]/.test(datePhr);
+  // Use filtered if available, otherwise all
+  const slots = (av.filteredSlotTimes?.length ?? 0) > 0 ? av.filteredSlotTimes : (av.allSlotTimes ?? []);
+  const count = slots.length;
+
+  if (count === 0) {
+    const prefix = datePhr ? (isHe ? `${datePhr} — ` : `On ${datePhr} — `) : "";
+    return isHe
+      ? `${prefix}אין תורים פנויים ל${svc}. תרצה לבדוק יום אחר?`
+      : `${prefix}no slots available for ${svc}. Would you like to check another day?`;
+  }
+
+  const listed = formatSlotList(slots, lang);
+  const label = isHe
+    ? count >= 4 ? "יש זמינות טובה יחסית" : count <= 2 ? "יש מעט זמינות" : `יש ${count} תורים פנויים`
+    : count >= 4 ? "Good availability" : count <= 2 ? "Limited availability" : `${count} slots available`;
+  const slotWord = isHe ? (count === 1 ? "תור פנוי אחד" : `${count} תורים פנויים`) : `${count} slot${count === 1 ? "" : "s"}`;
+
+  if (isHe) {
+    const dateStr = datePhr ? `${datePhr} ` : "";
+    return `${dateStr}יש ${slotWord} ל${svc}: ${listed}. ${label}. מה מתאים לך?`;
+  }
+  return `${datePhr ? datePhr + ": " : ""}${slotWord} for ${svc}: ${listed}. ${label}. Which works for you?`;
+}
+
 // ─── Availability draft ────────────────────────────────────────────────────────
 
 function composeAvailabilityDraft(
@@ -318,8 +353,15 @@ function composeAvailabilityDraft(
   normalizedService: string | null,
   origDate: string | null,
   origTime: string | null,
+  isCountQuery = false,
 ): string {
   const svcCanonical = av.serviceFound ? av.serviceName : (normalizedService ?? av.serviceName);
+
+  // ── Count query: route to dedicated count draft ───────────────────────────────
+  if (isCountQuery) {
+    return composeCountDraft(av, lang, svcCanonical, origDate);
+  }
+
   const svc = formatServiceNameForLanguage(svcCanonical, lang);
 
   // ── No slots at all ──────────────────────────────────────────────────────────
@@ -487,6 +529,7 @@ export function composeLlmResponse(
           norm.service,
           origDate,
           origTime,
+          (geminiRaw as { queryStyle?: string }).queryStyle === "count",
         );
 
       case "getServices":
