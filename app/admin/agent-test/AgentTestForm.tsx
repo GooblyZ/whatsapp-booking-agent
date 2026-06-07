@@ -106,10 +106,14 @@ function ToolRunSection({ toolRun }: { toolRun: ToolRunResult }) {
 
       {toolRun.result !== null && (
         <div className="bg-white border border-gray-200 rounded-lg p-4">
-          <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Tool result (internal)</p>
-          <pre className="text-xs text-gray-700 bg-gray-50 rounded p-3 overflow-x-auto max-h-64">
-            {JSON.stringify(toolRun.result, null, 2)}
-          </pre>
+          <details>
+            <summary className="text-xs font-semibold text-gray-500 uppercase cursor-pointer select-none hover:text-gray-700">
+              Tool result (internal debug) ▸ click to expand
+            </summary>
+            <pre className="mt-2 text-xs text-gray-700 bg-gray-50 rounded p-3 overflow-x-auto max-h-64">
+              {JSON.stringify(toolRun.result, null, 2)}
+            </pre>
+          </details>
         </div>
       )}
     </div>
@@ -270,27 +274,39 @@ function LlmResultPanel({ llmResult }: { llmResult: LlmAgentResult }) {
         <span className={`text-xs px-2 py-0.5 rounded font-mono ${isQuota ? "bg-red-100 text-red-600" : isFallback ? "bg-orange-100 text-orange-700" : "bg-green-100 text-green-700"}`}>
           {llmStatus}
         </span>
+        {/* Phase indicators */}
+        <span className={`text-xs px-2 py-0.5 rounded border font-mono ${agentAction ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-gray-100 text-gray-400 border-gray-200"}`}>
+          Phase 1: {agentAction ? "ran" : "skipped"}
+        </span>
+        <span className={`text-xs px-2 py-0.5 rounded border font-mono ${!fallbackUsed ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-gray-100 text-gray-400 border-gray-200"}`}>
+          Phase 2: {!fallbackUsed ? "ran" : "skipped"}
+        </span>
       </div>
 
       {/* AgentAction debug panel */}
       {agentAction && (
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-2">
-          <p className="text-xs font-semibold text-blue-600 uppercase mb-3">AgentAction (LLM reasoning)</p>
+          <p className="text-xs font-semibold text-blue-600 uppercase mb-3">
+            AgentAction (Phase 1 — LLM reasoning) <span className="normal-case font-normal text-blue-400">raw LLM classification, not validated</span>
+          </p>
           <Field label="actionType" value={agentAction.actionType} />
+          <Field label="confidence" value={agentAction.confidence} />
           <Field label="serviceCandidate" value={agentAction.serviceCandidate} />
           <Field label="dateCandidate" value={agentAction.dateCandidate} />
           <Field label="requestedTime" value={agentAction.requestedTimeCandidate} />
           <Field label="timePeriod" value={agentAction.timePeriodCandidate} />
+          <Field label="availabilityGoal" value={agentAction.availabilityGoal} />
           <Field label="selectedSlot" value={agentAction.selectedSlotCandidate} />
           <Field label="customerName" value={agentAction.customerName} />
+          <Field label="customerPhone (raw)" value={agentAction.customerPhone} />
           {agentAction.responseGoal && (
             <div className="pt-2 border-t border-blue-200">
-              <p className="text-xs text-blue-500 font-medium mb-0.5">responseGoal</p>
+              <p className="text-xs text-blue-500 font-medium mb-0.5">responseGoal (Phase 2 hint)</p>
               <p className="text-xs text-blue-800">{agentAction.responseGoal}</p>
             </div>
           )}
           {agentAction.debugReasoningSummary && (
-            <p className="text-xs text-blue-400 italic">{agentAction.debugReasoningSummary}</p>
+            <p className="text-xs text-blue-400 italic mt-1">{agentAction.debugReasoningSummary}</p>
           )}
         </div>
       )}
@@ -340,6 +356,59 @@ function LlmResultPanel({ llmResult }: { llmResult: LlmAgentResult }) {
       {/* Tool execution (internal — raw DB result) */}
       {toolRun && <ToolRunSection toolRun={toolRun} />}
     </div>
+  );
+}
+
+// ─── Manual QA checklist ──────────────────────────────────────────────────────
+
+const QA_TESTS: { label: string; steps: string[] }[] = [
+  { label: "Price query", steps: ["כמה עולה זקן?"] },
+  { label: "Unknown service", steps: ["אפשר לקבוע תור לתספורת ילדים מחר?"] },
+  { label: "Exact unavailable time", steps: ["אפשר מחר לקבוע תור לעיצוב זקן ב8 בבוקר?"] },
+  { label: "Earliest morning slot", steps: ["אפשר תור זקן מחר בבוקר כמה מוקדם"] },
+  { label: "Late morning (later_in_period)", steps: ["אפשר תור זקן מחר מאוחר בבוקר?"] },
+  {
+    label: "Full booking flow (happy path)",
+    steps: [
+      "אפשר מחר לקבוע תור לעיצוב זקן ב9?",
+      "→ pick offered slot if needed",
+      "→ אמיר",
+      "→ 0521234567",
+      "→ כן",
+    ],
+  },
+  {
+    label: "Invalid phone flow",
+    steps: [
+      "אפשר מחר לקבוע תור לעיצוב זקן ב9?",
+      "→ אמיר",
+      "→ 123  (invalid — agent must ask again, NOT echo 123)",
+      "→ 0521234567  (valid — flow continues)",
+    ],
+  },
+  { label: "Out of scope", steps: ["תסביר לי על פוליטיקה"] },
+];
+
+function QaChecklist() {
+  return (
+    <details className="mt-4 border border-gray-200 rounded-lg">
+      <summary className="px-4 py-2 text-xs font-semibold text-gray-600 uppercase cursor-pointer select-none hover:bg-gray-50 rounded-lg">
+        Manual QA checklist ({QA_TESTS.length} tests) ▸
+      </summary>
+      <div className="px-4 pb-4 pt-2 space-y-3">
+        <p className="text-xs text-gray-400">Internal testing only. Paste each message into the input above (LLM mode).</p>
+        {QA_TESTS.map((test, i) => (
+          <div key={i} className="border border-gray-100 rounded p-3 bg-gray-50">
+            <p className="text-xs font-semibold text-gray-700 mb-1">{i + 1}. {test.label}</p>
+            <ul className="space-y-0.5">
+              {test.steps.map((step, j) => (
+                <li key={j} className="text-xs text-gray-600 font-mono" dir="auto">{step}</li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -503,6 +572,9 @@ export default function AgentTestForm({ geminiAvailable }: { geminiAvailable: bo
           ))}
         </div>
       </div>
+
+      {/* Manual QA checklist */}
+      <QaChecklist />
 
       {/* Error */}
       {"error" in (state ?? {}) && (
