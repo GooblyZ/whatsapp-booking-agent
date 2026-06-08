@@ -27,16 +27,23 @@ export interface Business {
 export interface BusinessSettings {
   id: string;
   business_id: string;
-  language: string;
+  // Operational
   booking_enabled: boolean;
   confirmation_required: boolean;
   default_slot_duration_minutes: number;
-  cancellation_policy_text: string | null;
-  // Location fields (migration 002)
+  // Business identity (shown in settings page)
   address: string | null;
   city: string | null;
+  // DB columns that exist but are NO LONGER surfaced in the UI.
+  // These remain null after migration 002. Content lives in knowledge_base_items instead.
+  /** @deprecated Use KB category "parking" */
   parking_instructions: string | null;
+  /** @deprecated Use KB category "contact" / "parking" */
   entrance_instructions: string | null;
+  /** @deprecated Use KB category "policy" */
+  cancellation_policy_text: string | null;
+  /** @deprecated Use ai_settings.language */
+  language: string;
   created_at: string;
   updated_at: string;
 }
@@ -147,6 +154,7 @@ export interface ConversationState {
 }
 
 export type KnowledgeBaseItemCategory =
+  | "about"     // "About the business" — primary Gemini context
   | "faq"
   | "pricing"
   | "parking"

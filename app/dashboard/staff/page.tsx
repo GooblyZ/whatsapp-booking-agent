@@ -85,7 +85,7 @@ function StaffForm({
 export default async function StaffPage({
   searchParams,
 }: {
-  searchParams: Promise<{ mode?: string; edit?: string; saved?: string }>;
+  searchParams: Promise<{ mode?: string; edit?: string; saved?: string; error?: string }>;
 }) {
   const businessId = getDefaultBusinessId();
   const [staff, params] = await Promise.all([getStaffMembers(businessId), searchParams]);
@@ -96,7 +96,7 @@ export default async function StaffPage({
 
   return (
     <div>
-      {!mode && !editId && <SaveBanner saved={params.saved} />}
+      {!mode && !editId && <SaveBanner saved={params.saved} error={params.error} />}
       <div
         style={{
           display: "flex",

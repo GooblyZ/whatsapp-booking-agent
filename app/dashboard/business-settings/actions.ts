@@ -24,17 +24,18 @@ function orNull(v: string): string | null {
 export async function saveBusinessSettingsAction(formData: FormData) {
   const businessId = getDefaultBusinessId();
 
+  const name = (formData.get("name") as string)?.trim() ?? "";
+  if (name.length < 2) {
+    redirect("/dashboard/business-settings?error=invalid_name");
+  }
+
   const tzRaw = (formData.get("timezone") as string)?.trim() ?? "";
   const timezoneProvided = tzRaw.length > 0;
   const timezoneValid    = timezoneProvided && isValidTimezone(tzRaw);
   const timezoneError    = timezoneProvided && !timezoneValid;
 
-  const phoneRaw = (formData.get("phone") as string)?.trim() ?? "";
-  const phoneProvided = phoneRaw.length > 0;
-  const phoneValid    = !phoneProvided || PHONE_RE.test(phoneRaw);
-
-  const durationRaw = parseInt((formData.get("default_slot_duration_minutes") as string) ?? "30", 10);
-  const duration    = Number.isNaN(durationRaw) || durationRaw < 5 ? 30 : durationRaw;
+  const phoneRaw   = (formData.get("phone") as string)?.trim() ?? "";
+  const phoneValid = phoneRaw.length === 0 || PHONE_RE.test(phoneRaw);
 
   if (timezoneError) {
     redirect("/dashboard/business-settings?error=invalid_timezone");
@@ -43,19 +44,24 @@ export async function saveBusinessSettingsAction(formData: FormData) {
     redirect("/dashboard/business-settings?error=invalid_phone");
   }
 
+  const durationRaw = parseInt((formData.get("default_slot_duration_minutes") as string) ?? "30", 10);
+  const duration    = Number.isNaN(durationRaw) || durationRaw < 5 ? 30 : durationRaw;
+
   await updateBusinessSettings(businessId, {
-    name:     (formData.get("name") as string)?.trim() || undefined,
-    phone:    phoneProvided ? phoneRaw : null,
+    name,
+    phone:    phoneRaw.length > 0 ? phoneRaw : null,
     timezone: timezoneValid ? tzRaw : undefined,
-    language: (formData.get("language") as string)?.trim() || undefined,
+    // Location (identity fields — not booking logic)
+    address: orNull(formData.get("address") as string ?? ""),
+    city:    orNull(formData.get("city") as string ?? ""),
+    // Booking system
     booking_enabled:               formData.get("booking_enabled") === "true",
     default_slot_duration_minutes: duration,
-    cancellation_policy_text:      orNull(formData.get("cancellation_policy_text") as string ?? ""),
-    // Location
-    address:              orNull(formData.get("address") as string ?? ""),
-    city:                 orNull(formData.get("city") as string ?? ""),
-    parking_instructions: orNull(formData.get("parking_instructions") as string ?? ""),
-    entrance_instructions: orNull(formData.get("entrance_instructions") as string ?? ""),
+    // NOTE: parking_instructions, entrance_instructions, cancellation_policy_text,
+    // and language are intentionally NOT saved here anymore.
+    // Parking/entrance → Knowledge Base (category: parking, contact)
+    // Cancellation policy → Knowledge Base (category: policy)
+    // Language → ai_settings.language only
   });
 
   redirect("/dashboard/business-settings?saved=1");

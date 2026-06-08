@@ -32,7 +32,7 @@ interface Props {
 }
 
 export function SaveBanner({ saved, error }: Props) {
-  if (error === "invalid_phone") {
+  if (error === "invalid_phone" || error === "invalid_staff_phone") {
     return (
       <div style={errorStyle} role="alert">
         <strong>⚠️ מספר הטלפון שהזנת אינו תקין ולא נשמר.</strong>
@@ -65,6 +65,38 @@ export function SaveBanner({ saved, error }: Props) {
         </code>
         .<br />
         <span style={{ fontSize: "13px" }}>שאר ההגדרות נשמרו בהצלחה.</span>
+      </div>
+    );
+  }
+
+  if (error === "invalid_name") {
+    return (
+      <div style={errorStyle} role="alert">
+        <strong>⚠️ השם חייב להכיל לפחות 2 תווים.</strong>
+      </div>
+    );
+  }
+
+  if (error === "invalid_service_name") {
+    return (
+      <div style={errorStyle} role="alert">
+        <strong>⚠️ שם השירות חייב להכיל לפחות 2 תווים.</strong>
+      </div>
+    );
+  }
+
+  if (error === "kb_title_short") {
+    return (
+      <div style={errorStyle} role="alert">
+        <strong>⚠️ הכותרת חייבת להכיל לפחות 3 תווים.</strong>
+      </div>
+    );
+  }
+
+  if (error === "kb_content_short") {
+    return (
+      <div style={errorStyle} role="alert">
+        <strong>⚠️ התוכן חייב להכיל לפחות 10 תווים.</strong>
       </div>
     );
   }

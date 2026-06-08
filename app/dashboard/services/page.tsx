@@ -130,7 +130,7 @@ function ServiceForm({
 export default async function ServicesPage({
   searchParams,
 }: {
-  searchParams: Promise<{ mode?: string; edit?: string; saved?: string }>;
+  searchParams: Promise<{ mode?: string; edit?: string; saved?: string; error?: string }>;
 }) {
   const businessId = getDefaultBusinessId();
   const [services, categories, params] = await Promise.all([
@@ -145,7 +145,7 @@ export default async function ServicesPage({
 
   return (
     <div>
-      {!mode && !editId && <SaveBanner saved={params.saved} />}
+      {!mode && !editId && <SaveBanner saved={params.saved} error={params.error} />}
       <div
         style={{
           display: "flex",

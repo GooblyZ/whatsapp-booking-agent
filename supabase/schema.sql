@@ -363,9 +363,9 @@ CREATE TABLE IF NOT EXISTS knowledge_base_items (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
 
-  -- faq | pricing | parking | policy | contact | custom
+  -- about | faq | pricing | parking | policy | contact | custom
   category    TEXT NOT NULL DEFAULT 'faq'
-    CHECK (category IN ('faq', 'pricing', 'parking', 'policy', 'contact', 'custom')),
+    CHECK (category IN ('about', 'faq', 'pricing', 'parking', 'policy', 'contact', 'custom')),
 
   title       TEXT NOT NULL,
   content     TEXT NOT NULL,

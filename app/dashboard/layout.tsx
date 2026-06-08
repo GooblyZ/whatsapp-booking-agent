@@ -40,7 +40,8 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
         <a href="/dashboard/services" style={{ color: "#ccc", textDecoration: "none" }}>שירותים</a>
         <a href="/dashboard/business-hours" style={{ color: "#ccc", textDecoration: "none" }}>שעות פעילות</a>
         <a href="/dashboard/staff" style={{ color: "#ccc", textDecoration: "none" }}>צוות</a>
-        <a href="/dashboard/ai-assistant" style={{ color: "#ccc", textDecoration: "none" }}>עוזר AI</a>
+        <a href="/dashboard/knowledge-base" style={{ color: "#ccc", textDecoration: "none" }}>בסיס ידע</a>
+        <a href="/dashboard/ai-assistant" style={{ color: "#ccc", textDecoration: "none" }}>הגדרות AI</a>
         <a href="/dashboard/activity" style={{ color: "#ccc", textDecoration: "none" }}>פעילות</a>
 
         {hasPassword && (

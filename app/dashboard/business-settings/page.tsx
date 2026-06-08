@@ -5,8 +5,6 @@ import { getBusinessWithSettings } from "@/lib/services/business";
 import { saveBusinessSettingsAction } from "./actions";
 import { SaveBanner } from "@/app/dashboard/_components/SaveBanner";
 
-// ── Shared styles ────────────────────────────────────────────────
-
 const inp: React.CSSProperties = {
   width: "100%",
   padding: "8px",
@@ -40,8 +38,6 @@ const divider: React.CSSProperties = {
   margin: "28px 0 24px",
 };
 
-// ── Page ─────────────────────────────────────────────────────────
-
 export default async function BusinessSettingsPage({
   searchParams,
 }: {
@@ -62,20 +58,50 @@ export default async function BusinessSettingsPage({
         action={saveBusinessSettingsAction}
         style={{ display: "flex", flexDirection: "column", gap: "16px", maxWidth: "500px", marginTop: "20px" }}
       >
-        {/* ── Section 1: Business Profile ──────────────────────── */}
-        <h2 style={sectionHead}>פרופיל העסק</h2>
+        {/* ── Section 1: Business Identity ───────────────────── */}
+        <h2 style={sectionHead}>פרטי העסק</h2>
 
         <label style={fieldWrap}>
           <span style={fieldLabel}>שם העסק *</span>
-          <input name="name" required defaultValue={business.name} style={inp} />
+          <input name="name" required minLength={2} defaultValue={business.name} style={inp} />
           <span style={hint}>שם זה מופיע ללקוחות ובממשק הניהול.</span>
         </label>
 
         <label style={fieldWrap}>
           <span style={fieldLabel}>טלפון ליצירת קשר</span>
-          <input name="phone" defaultValue={business.phone ?? ""} placeholder="לדוגמה: 050-1234567" style={inp} />
-          <span style={hint}>אופציונלי. משמש לזיהוי העסק בלבד — אינו נשלח ללקוחות אוטומטית.</span>
+          <input
+            name="phone"
+            defaultValue={business.phone ?? ""}
+            placeholder="לדוגמה: 050-1234567"
+            style={inp}
+          />
+          <span style={hint}>אופציונלי. לזיהוי העסק בלבד.</span>
         </label>
+
+        <label style={fieldWrap}>
+          <span style={fieldLabel}>כתובת</span>
+          <input
+            name="address"
+            defaultValue={settings?.address ?? ""}
+            placeholder="לדוגמה: רחוב הרצל 15"
+            style={inp}
+          />
+        </label>
+
+        <label style={fieldWrap}>
+          <span style={fieldLabel}>עיר</span>
+          <input
+            name="city"
+            defaultValue={settings?.city ?? ""}
+            placeholder="לדוגמה: תל אביב"
+            style={{ ...inp, maxWidth: "220px" }}
+          />
+        </label>
+
+        <hr style={divider} />
+
+        {/* ── Section 2: Booking System ────────────────────────── */}
+        <h2 style={sectionHead}>הגדרות קביעת תורים</h2>
 
         <label style={fieldWrap}>
           <span style={fieldLabel}>אזור זמן</span>
@@ -99,75 +125,24 @@ export default async function BusinessSettingsPage({
             <option value="UTC" />
           </datalist>
           <span style={hint}>
-            קובע את השעון לפיו מחושבות שעות התורים. עסקים בישראל: <strong>Asia/Jerusalem</strong>.
-            ערך שגוי יגרום לתורים להוצע בשעה הלא נכונה.
+            קובע את השעון לפיו מחושבות שעות התורים.
+            עסקים בישראל: <strong>Asia/Jerusalem</strong>.
           </span>
         </label>
 
-        <hr style={divider} />
-
-        {/* ── Section 2: Location ───────────────────────────────── */}
-        <h2 style={sectionHead}>מיקום והגעה</h2>
-        <p style={{ ...hint, marginTop: 0, marginBottom: "12px" }}>
-          פרטים אלו יוצגו ללקוחות על ידי העוזר החכם כאשר ישאלו על מיקום, חניה או הגעה.
-        </p>
-
-        <label style={fieldWrap}>
-          <span style={fieldLabel}>כתובת</span>
-          <input
-            name="address"
-            defaultValue={settings?.address ?? ""}
-            placeholder="לדוגמה: רחוב הרצל 15"
-            style={inp}
-          />
-        </label>
-
-        <label style={fieldWrap}>
-          <span style={fieldLabel}>עיר</span>
-          <input
-            name="city"
-            defaultValue={settings?.city ?? ""}
-            placeholder="לדוגמה: תל אביב"
-            style={{ ...inp, maxWidth: "220px" }}
-          />
-        </label>
-
-        <label style={fieldWrap}>
-          <span style={fieldLabel}>הוראות חניה</span>
-          <textarea
-            name="parking_instructions"
-            defaultValue={settings?.parking_instructions ?? ""}
-            rows={2}
-            placeholder="לדוגמה: חניה חינם מאחורי הבניין, כניסה מרחוב הנביאים."
-            style={{ ...inp, resize: "vertical" }}
-          />
-        </label>
-
-        <label style={fieldWrap}>
-          <span style={fieldLabel}>הוראות כניסה / הגעה</span>
-          <textarea
-            name="entrance_instructions"
-            defaultValue={settings?.entrance_instructions ?? ""}
-            rows={2}
-            placeholder="לדוגמה: קומה 3, דלת שמאלית. לחץ על הפעמון בכניסה."
-            style={{ ...inp, resize: "vertical" }}
-          />
-        </label>
-
-        <hr style={divider} />
-
-        {/* ── Section 3: Booking Behaviour ─────────────────────── */}
-        <h2 style={sectionHead}>הגדרות קביעת תורים</h2>
-
         <label style={fieldWrap}>
           <span style={fieldLabel}>קבלת תורים מופעלת</span>
-          <select name="booking_enabled" defaultValue={String(settings?.booking_enabled ?? true)} style={inp}>
+          <select
+            name="booking_enabled"
+            defaultValue={String(settings?.booking_enabled ?? true)}
+            style={inp}
+          >
             <option value="true">כן — ניתן לקבוע תורים</option>
             <option value="false">לא — תורים חסומים כרגע</option>
           </select>
           <span style={hint}>
-            כאשר &quot;לא&quot;, לקוח שיכתוב &quot;תור&quot; בWhatsApp יקבל הודעה שקביעת תורים אינה זמינה
-            ולא יוכל להמשיך.
+            כאשר &quot;לא&quot;, לקוח שיכתוב &quot;תור&quot; בWhatsApp יקבל הודעה שקביעת תורים
+            אינה זמינה.
           </span>
         </label>
 
@@ -179,41 +154,11 @@ export default async function BusinessSettingsPage({
             min="5"
             step="5"
             defaultValue={settings?.default_slot_duration_minutes ?? 30}
-            style={inp}
+            style={{ ...inp, maxWidth: "120px" }}
           />
           <span style={hint}>
-            משמש כברירת מחדל לחישוב פערים בין תורים. כל שירות יכול לדרוס ערך זה.
+            ברירת מחדל לפערים בין תורים. כל שירות יכול לדרוס ערך זה.
           </span>
-        </label>
-
-        <label style={fieldWrap}>
-          <span style={fieldLabel}>מדיניות ביטולים</span>
-          <textarea
-            name="cancellation_policy_text"
-            defaultValue={settings?.cancellation_policy_text ?? ""}
-            rows={3}
-            placeholder="לדוגמה: ביטול עד 24 שעות לפני התור — ללא חיוב."
-            style={{ ...inp, resize: "vertical" }}
-          />
-          <span style={hint}>
-            אופציונלי. טקסט חופשי שיועמד לרשות העוזר החכם בעתיד. אינו נשלח אוטומטית ללקוחות כרגע.
-          </span>
-        </label>
-
-        <hr style={divider} />
-
-        {/* ── Section 4: Language (advanced) ───────────────────── */}
-        <h2 style={sectionHead}>שפה</h2>
-
-        <label style={fieldWrap}>
-          <span style={fieldLabel}>שפת ממשק ברירת מחדל</span>
-          <input
-            name="language"
-            defaultValue={settings?.language ?? "he"}
-            placeholder="he"
-            style={{ ...inp, maxWidth: "100px" }}
-          />
-          <span style={hint}>קוד שפה: he (עברית), en (אנגלית), ar (ערבית). משמש את העוזר החכם בעתיד.</span>
         </label>
 
         <button
@@ -234,6 +179,21 @@ export default async function BusinessSettingsPage({
           שמור הגדרות
         </button>
       </form>
+
+      <div
+        style={{
+          marginTop: "32px",
+          padding: "12px 16px",
+          background: "#f8f8f8",
+          border: "1px solid #e0e0e0",
+          borderRadius: "6px",
+          fontSize: "13px",
+          color: "#666",
+        }}
+      >
+        💡 <strong>מידע לבוט</strong> (חניה, הוראות הגעה, מדיניות ביטולים, FAQ) מנוהל
+        ב<a href="/dashboard/knowledge-base" style={{ color: "#0070f3" }}>בסיס הידע</a>.
+      </div>
     </div>
   );
 }
