@@ -6,35 +6,63 @@ import {
   saveOutboundMessage,
   loadActiveServices,
   getBusinessTimezone,
-  getCustomerName,
   updateCustomerName,
   isBookingEnabled,
 } from "./helpers";
-import { getAvailableSlots, parseHebrewDate, businessTimeToUTC, todayInTZ } from "./availability";
+import { getAvailableSlots, isIntervalFree, parseHebrewDate, businessTimeToUTC, todayInTZ } from "./availability";
+import { runConversationTurn } from "@/lib/ai/idle-handler";
+import { loadBookingSession } from "@/lib/ai/booking-session";
+import { stripEmojis } from "@/lib/ai/reply-polish";
+import { recordWhatsAppSendResult } from "@/lib/integration-health";
 
-const BOOKING_TRIGGERS = [
-  "תור", "קביעת תור", "לקבוע תור", "להזמין תור", "קבע תור", "הזמן תור",
-  "לקבוע", "אני רוצה תור", "רוצה תור", "book",
-];
+// Conversation states that mean "a booking is in progress, missing field X".
+// These are CONTEXT for the AI receptionist, not menus that own the conversation.
+const BOOKING_STATES = new Set<string>([
+  "booking_collect_name", "booking_select_service",
+  "booking_select_date", "booking_select_slot", "booking_confirm",
+]);
 
-const CANCEL_TRIGGERS = [
-  "ביטול", "בטל", "לא רוצה", "לא תודה", "יציאה", "צא", "stop", "cancel",
-];
+// Explicit, unambiguous cancel COMMANDS — handled deterministically for reliability.
+// EXACT match only (after stripping trailing punctuation). Substring matching is
+// forbidden here: phrases like "לא רוצה" are routine FRAGMENTS of correction
+// sentences ("...אבל לא רוצה את זה" = rejecting a detail), and matching them wiped
+// an active booking live. Natural / softer cancels ("עזוב", "לא משנה", "לא רוצה"
+// inside a sentence) are understood by Gemini instead.
+const CANCEL_COMMANDS = new Set([
+  "ביטול", "בטל", "לבטל", "ביטול תור", "בטל תור", "בטל את התור", "יציאה", "stop", "cancel",
+]);
 
-function isBookingIntent(text: string): boolean {
-  const t = text.trim();
-  return BOOKING_TRIGGERS.some((kw) => t === kw || t.includes(kw));
+export function isCancelIntent(text: string): boolean {
+  const t = text.trim().toLowerCase().replace(/[!?.…\s]+$/g, "").trim();
+  return CANCEL_COMMANDS.has(t);
 }
 
-function isCancelIntent(text: string): boolean {
-  const t = text.trim().toLowerCase();
-  return CANCEL_TRIGGERS.some((kw) => t === kw || t.includes(kw));
+/**
+ * AI-settings enforcement at the SINGLE outbound chokepoint: owner settings
+ * (emoji_usage=none) apply to EVERY reply — model-written, guard, and the
+ * deterministic strings in this file alike (live: the cancel notice carried 😊
+ * and the success message 🎉😊 under emoji=none + luxury tone). Fail-open: if
+ * settings can't be read, the text is sent unmodified.
+ */
+async function applyOutboundSettings(db: DB, businessId: string, text: string): Promise<string> {
+  try {
+    const { data } = await db
+      .from("ai_settings")
+      .select("emoji_usage")
+      .eq("business_id", businessId)
+      .maybeSingle();
+    if (data?.emoji_usage === "none") return stripEmojis(text);
+  } catch {
+    // settings unavailable → send as-is
+  }
+  return text;
 }
 
 // TODO: future — add a retry queue for failed WhatsApp sends (e.g. SQS, BullMQ).
 async function reply(
-  db: DB, businessId: string, customerId: string, toPhone: string, text: string
+  db: DB, businessId: string, customerId: string, toPhone: string, rawText: string
 ): Promise<void> {
+  const text = await applyOutboundSettings(db, businessId, rawText);
   let sendStatus: "sent" | "failed" = "sent";
   console.log(`[booking] reply → "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}"`);
 
@@ -42,6 +70,14 @@ async function reply(
   if (!result.success) {
     sendStatus = "failed";
     console.error(`[booking] WhatsApp send failed: ${result.error}`);
+  }
+
+  // Integration health: auth failures suspend AI for this business (nothing can
+  // be delivered); successes reset the state. Never blocks the message save.
+  try {
+    await recordWhatsAppSendResult(db, businessId, result);
+  } catch (err) {
+    console.error("[booking] failed to record send health:", err instanceof Error ? err.message : String(err));
   }
 
   // Always save the outbound message regardless of send outcome so no reply is lost.
@@ -52,13 +88,27 @@ async function reply(
   }
 }
 
+/**
+ * AI-FIRST router over a BOOKING-CONTEXT architecture.
+ *
+ * The conversation engine (lib/ai/idle-handler.ts) handles almost every message:
+ * it maintains the booking SESSION (service/day/time gathered in any order),
+ * computes availability from accumulated context, and arms the deterministic
+ * confirm step when everything is set and the slot is free.
+ *
+ * Deterministic handling is reserved for:
+ *   - the final confirm step ("כן"/"לא" → existing appointment INSERT, unchanged)
+ *   - explicit cancel commands ("ביטול")
+ *   - valid structured input while in a LEGACY menu state (technical fallback mode)
+ *   - technical failures (AI disabled / API down) → legacy menu as last resort
+ */
 export async function handleBookingFlow(
   db: DB, businessId: string, fromPhone: string, customerId: string, messageText: string
 ): Promise<void> {
   const { state: rawState, context: rawContext, expiresAt } = await getConversationState(db, businessId, customerId);
   const timezone = await getBusinessTimezone(db, businessId);
 
-  // Lazy session expiry: if a non-idle session has passed its TTL, reset silently to idle.
+  // Lazy session expiry for non-idle states.
   let state = rawState;
   let context = rawContext;
   if (state !== "idle" && expiresAt && expiresAt < new Date()) {
@@ -68,77 +118,181 @@ export async function handleBookingFlow(
     context = {};
   }
 
+  const replyFn = (text: string) => reply(db, businessId, customerId, fromPhone, text);
+  const isMenuState = BOOKING_STATES.has(state);
+  const session = loadBookingSession(context);
+  const bookingActive = isMenuState || state === "booking_confirm" || session.active;
   const textPreview = messageText.slice(0, 40) + (messageText.length > 40 ? "…" : "");
-  console.log(`[booking] flow state="${state}" input="${textPreview}"`);
+  console.log(`[router] state="${state}" booking_active=${bookingActive} input="${textPreview}"`);
 
-  // Cancel from any active step
-  if (state !== "idle" && isCancelIntent(messageText)) {
-    await reply(db, businessId, customerId, fromPhone, "קביעת התור בוטלה. נשמח לעזור בכל עת! 😊");
+  // Explicit cancel COMMAND while any booking is active → deterministic, reliable stop.
+  if (bookingActive && isCancelIntent(messageText)) {
+    console.log(`[router] state=${state} ai_called=false deterministic_called=true reason=explicit_cancel reply_source=system`);
+    await replyFn("קביעת התור בוטלה. נשמח לעזור בכל עת! 😊");
     await upsertConversationState(db, businessId, customerId, "idle", {});
     return;
   }
 
-  // Re-trigger from any active step restarts the flow.
-  // Exclude booking_collect_name so a customer's name isn't mistaken for a booking trigger.
-  if (state !== "idle" && state !== "booking_collect_name" && isBookingIntent(messageText)) {
-    await startBookingFlow(db, businessId, customerId, fromPhone);
+  // Final confirm step: literal yes/no → existing deterministic execution path.
+  if (state === "booking_confirm" && isYesNoInput(messageText)) {
+    console.log(`[router] state=booking_confirm structured_input_match=true ai_called=false deterministic_called=true reason=final_confirmation reply_source=system`);
+    await handleConfirmation(db, businessId, customerId, fromPhone, messageText, context, timezone);
     return;
   }
 
+  // LEGACY menu states (reachable only via technical fallback): valid structured
+  // input keeps the menu working; anything else flows to the engine, which
+  // MIGRATES the legacy progress into the booking session.
+  if (isMenuState) {
+    const structured = isStructuredInputForState(state, messageText, context, timezone);
+    console.log(`[router] state=${state} structured_input_match=${structured}`);
+    if (structured) {
+      console.log(`[router] state=${state} ai_called=false deterministic_called=true reason=valid_structured_input reply_source=system`);
+      await dispatchDeterministic(db, businessId, customerId, fromPhone, messageText, state, context, timezone);
+      return;
+    }
+  }
+
+  // EVERYTHING ELSE → the conversation engine (AI-first; one Gemini call).
+  console.log(`[router] state=${state} ai_called=true deterministic_called=false reply_source=gemini`);
+  const turnAnchor = await latestInboundAt(db, businessId, customerId);
+  const outcome = await runConversationTurn(db, businessId, customerId, messageText, context, timezone, state);
+
+  // Technical failure + clear booking keyword → legacy menu as a TRUE fallback
+  // (never used for conversational uncertainty).
+  if (isTechnicalFailure(outcome.decision.fallbackReason) && /תור/.test(messageText)) {
+    console.log(`[router] technical_fallback=${outcome.decision.fallbackReason} → legacy menu flow`);
+    await startMenuFallback(db, businessId, customerId, fromPhone);
+    return;
+  }
+
+  // SUPERSEDE CHECK (zero-latency burst handling): if a newer message arrived
+  // while we were thinking, skip this reply — the newest message's turn answers
+  // with the full combined context (session merge was already persisted).
+  if (await hasNewerInbound(db, businessId, customerId, turnAnchor)) {
+    console.log(`[router] superseded by newer inbound message — reply skipped (state preserved)`);
+    return;
+  }
+
+  await replyFn(outcome.replyText);
+}
+
+// ── Router helpers ─────────────────────────────────────────────────────────────
+
+function isTechnicalFailure(reason: string | undefined): boolean {
+  if (!reason) return false;
+  // Transient overload is NOT a menu-fallback trigger: degraded mode keeps the
+  // conversational session going deterministically — better than a menu reset.
+  if (reason === "gemini_overloaded") return false;
+  return reason === "ai_disabled" || reason === "not_configured" || reason === "context_load_error" ||
+    reason === "malformed_json" || reason.startsWith("gemini_");
+}
+
+/** created_at of the newest inbound message for this customer (turn anchor). */
+async function latestInboundAt(db: DB, businessId: string, customerId: string): Promise<string | null> {
+  const { data } = await db
+    .from("messages")
+    .select("created_at")
+    .eq("business_id", businessId)
+    .eq("customer_id", customerId)
+    .eq("direction", "inbound")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return (data?.created_at as string) ?? null;
+}
+
+/** True if an inbound message newer than the anchor exists (burst supersede). */
+async function hasNewerInbound(db: DB, businessId: string, customerId: string, anchorISO: string | null): Promise<boolean> {
+  if (!anchorISO) return false;
+  const { data } = await db
+    .from("messages")
+    .select("id")
+    .eq("business_id", businessId)
+    .eq("customer_id", customerId)
+    .eq("direction", "inbound")
+    .gt("created_at", anchorISO)
+    .limit(1);
+  return !!(data && data.length > 0);
+}
+
+/** Is the message clean structured input for the current LEGACY menu step? */
+function isStructuredInputForState(
+  state: string, text: string, context: Record<string, unknown>, timezone: string
+): boolean {
+  const t = text.trim();
   switch (state) {
-    case "idle":
-      if (isBookingIntent(messageText)) {
-        await startBookingFlow(db, businessId, customerId, fromPhone);
-      }
-      // Non-booking messages in idle state are ignored here; AI will handle them later.
-      break;
-    case "booking_collect_name":
-      await handleNameCollection(db, businessId, customerId, fromPhone, messageText);
-      break;
-    case "booking_select_service":
-      await handleServiceSelection(db, businessId, customerId, fromPhone, messageText, context);
-      break;
+    case "booking_collect_name": {
+      if (t.includes("?")) return false;
+      const stop = new Set(["מה", "מה?", "היי", "הי", "שלום", "עזוב", "לא משנה", "לא", "כן", "אהלן", "הלו", "מה נשמע"]);
+      if (stop.has(t)) return false;
+      return NAME_RE.test(t);
+    }
+    case "booking_select_service": {
+      const list = (context.services_list ?? []) as Array<{ name: string }>;
+      const n = parseInt(t, 10);
+      if (/^\d+$/.test(t) && n >= 1 && n <= list.length) return true;
+      return list.some((s) => s.name.trim().toLowerCase() === t.toLowerCase());
+    }
     case "booking_select_date":
-      await handleDateSelection(db, businessId, customerId, fromPhone, messageText, context, timezone);
-      break;
-    case "booking_select_slot":
-      await handleSlotSelection(db, businessId, customerId, fromPhone, messageText, context);
-      break;
-    case "booking_confirm":
-      await handleConfirmation(db, businessId, customerId, fromPhone, messageText, context, timezone);
-      break;
+      return parseHebrewDate(t, timezone) !== null;
+    case "booking_select_slot": {
+      const slots = (context.available_slots ?? []) as string[];
+      const n = parseInt(t, 10);
+      return /^\d+$/.test(t) && n >= 1 && n <= slots.length;
+    }
     default:
-      await upsertConversationState(db, businessId, customerId, "idle", {});
+      return false;
   }
 }
 
 /**
- * Entry point when customer triggers booking intent.
- * Checks booking_enabled setting first, then customer name.
- *   → booking disabled: send "unavailable" reply, stay idle
- *   → no name: ask for it, set state booking_collect_name
- *   → name known: proceed directly to service selection
+ * Unified final-confirmation parsing (router + confirm handler use the SAME
+ * logic). Notes from live behavior:
+ *   - assent slang counts ("יאללה", "סגור") — a soft model CTA invites these
+ *   - "כן אבל / כן רק ש…" is NOT a clean yes — a qualified answer goes to the
+ *     engine, which understands the qualification (the old startsWith("כן")
+ *     would have booked over the customer's objection)
  */
-async function startBookingFlow(
+export function parseYesNo(text: string): "yes" | "no" | null {
+  const t = text.trim().toLowerCase();
+  if (t === "לא" || t === "no" || t === "לא תודה") return "no";
+  const yes = ["כן", "אישור", "אשר", "מאשר", "מאשרת", "yes", "ok", "אוקיי", "בטח", "סבבה", "סגור", "יאללה"];
+  if (yes.includes(t)) return "yes";
+  if (/^כן[\s,.!]/.test(t)) {
+    return /אבל|רק\s|חוץ\s?מ|בעצם/.test(t) ? null : "yes";
+  }
+  return null;
+}
+
+function isYesNoInput(text: string): boolean {
+  return parseYesNo(text) !== null;
+}
+
+/** Routes valid structured input to the existing deterministic step handler. */
+async function dispatchDeterministic(
+  db: DB, businessId: string, customerId: string, fromPhone: string,
+  text: string, state: string, context: Record<string, unknown>, timezone: string
+): Promise<void> {
+  switch (state) {
+    case "booking_collect_name":   await handleNameCollection(db, businessId, customerId, fromPhone, text); break;
+    case "booking_select_service": await handleServiceSelection(db, businessId, customerId, fromPhone, text, context); break;
+    case "booking_select_date":    await handleDateSelection(db, businessId, customerId, fromPhone, text, context, timezone); break;
+    case "booking_select_slot":    await handleSlotSelection(db, businessId, customerId, fromPhone, text, context); break;
+  }
+}
+
+/** Legacy menu entry — used ONLY on technical failure of the AI layer. */
+async function startMenuFallback(
   db: DB, businessId: string, customerId: string, fromPhone: string
 ): Promise<void> {
   const enabled = await isBookingEnabled(db, businessId);
   if (!enabled) {
-    console.log(`[booking] booking disabled for business=${businessId.slice(-6)} — sending unavailable message`);
     await reply(db, businessId, customerId, fromPhone,
       "קביעת תורים אינה זמינה כרגע. לפרטים נוספים אנא צרו קשר ישירות עם העסק."
     );
     return;
   }
-
-  const existingName = await getCustomerName(db, customerId);
-
-  if (!existingName) {
-    await reply(db, businessId, customerId, fromPhone, "בשמחה 😊 איך קוראים לך?");
-    await upsertConversationState(db, businessId, customerId, "booking_collect_name", {});
-    return;
-  }
-
   await startServiceSelection(db, businessId, customerId, fromPhone);
 }
 
@@ -193,12 +347,18 @@ async function handleServiceSelection(
   text: string, context: Record<string, unknown>
 ): Promise<void> {
   const list = (context.services_list ?? []) as Array<{ id: string; name: string; duration_minutes: number }>;
-  const idx  = parseInt(text.trim(), 10) - 1;
+  const t = text.trim();
+  // Accept a number OR an exact service name (case-insensitive).
+  const idx = /^\d+$/.test(t)
+    ? parseInt(t, 10) - 1
+    : list.findIndex((s) => s.name.trim().toLowerCase() === t.toLowerCase());
 
   if (isNaN(idx) || idx < 0 || idx >= list.length) {
-    let msg = `לא הבנתי. שלח את מספר השירות (1-${list.length}):\n\n`;
+    let msg =
+      "אנחנו באמצע קביעת תור 😊\n" +
+      `כדי להמשיך, שלח/י את *מספר* השירות הרצוי (1-${list.length}).\n` +
+      "אם רצית לשאול משהו אחר, שלח/י 'ביטול' ואז כתוב/כתבי את השאלה.\n\n";
     list.forEach((s, i) => { msg += `${i + 1}. ${s.name}\n`; });
-    msg += "\nלביטול שלח *ביטול*.";
     await reply(db, businessId, customerId, fromPhone, msg);
     return;
   }
@@ -225,9 +385,9 @@ async function handleDateSelection(
 
   if (!date) {
     await reply(db, businessId, customerId, fromPhone,
-      "לא הצלחתי להבין את התאריך.\n" +
-      "שלח בפורמט יום/חודש (לדוגמה: 15/6)\n" +
-      "או *מחר* / *מחרתיים*.\n\nלביטול שלח *ביטול*."
+      "אנחנו באמצע קביעת תור 😊\n" +
+      "כדי להמשיך, שלח/י תאריך בפורמט יום/חודש (לדוגמה: 15/6), או 'מחר' / 'מחרתיים'.\n" +
+      "אם רצית לשאול משהו אחר, שלח/י 'ביטול' ואז כתוב/כתבי את השאלה."
     );
     return;
   }
@@ -272,9 +432,11 @@ async function handleSlotSelection(
   const idx   = parseInt(text.trim(), 10) - 1;
 
   if (isNaN(idx) || idx < 0 || idx >= slots.length) {
-    let msg = `לא הבנתי. שלח את מספר השעה (1-${slots.length}):\n\n`;
+    let msg =
+      "אנחנו באמצע קביעת תור 😊\n" +
+      `כדי להמשיך, שלח/י את *מספר* השעה הרצויה (1-${slots.length}).\n` +
+      "אם רצית לשאול משהו אחר, שלח/י 'ביטול' ואז כתוב/כתבי את השאלה.\n\n";
     slots.forEach((s, i) => { msg += `${i + 1}. ${s}\n`; });
-    msg += "\nלביטול שלח *ביטול*.";
     await reply(db, businessId, customerId, fromPhone, msg);
     return;
   }
@@ -297,22 +459,62 @@ async function handleSlotSelection(
   });
 }
 
+/** The chosen slot is no longer free (conflict / race) — offer live alternatives. */
+async function offerAlternativesAfterConflict(
+  db: DB, businessId: string, customerId: string, fromPhone: string,
+  date: string, slotTime: string, duration: number, timezone: string,
+  context: Record<string, unknown>
+): Promise<void> {
+  console.warn(`[booking] slot conflict business=${businessId} date=${date} slot=${slotTime}`);
+  const updatedSlots = await getAvailableSlots(db, businessId, date, duration, timezone);
+  if (updatedSlots.length === 0) {
+    const [y, mo, d] = date.split("-");
+    await reply(db, businessId, customerId, fromPhone,
+      `השעה הזו כבר נתפסה ואין שעות פנויות אחרות בתאריך ${d}/${mo}/${y}.\n` +
+      `שלח תאריך אחר, או שלח *ביטול* לסיום.`
+    );
+    await upsertConversationState(db, businessId, customerId, "booking_select_date", {
+      ...context,
+      selected_slot_time: undefined,
+      available_slots: undefined,
+    });
+  } else {
+    let msg = "השעה הזו כבר נתפסה. הנה שעות פנויות אחרות:\n\n";
+    updatedSlots.forEach((s, i) => { msg += `${i + 1}. ${s}\n`; });
+    msg += "\nשלח את *מספר* השעה הרצויה.\nלביטול שלח *ביטול*.";
+    await reply(db, businessId, customerId, fromPhone, msg);
+    await upsertConversationState(db, businessId, customerId, "booking_select_slot", {
+      ...context,
+      selected_slot_time: undefined,
+      available_slots: updatedSlots,
+    });
+  }
+}
+
 async function handleConfirmation(
   db: DB, businessId: string, customerId: string, fromPhone: string,
   text: string, context: Record<string, unknown>, timezone: string
 ): Promise<void> {
   const t = text.trim();
 
-  // Explicit cancellation
-  if (t === "לא" || isCancelIntent(t)) {
+  // Explicit cancellation (same parser as the router — no drift).
+  if (parseYesNo(t) === "no" || isCancelIntent(t)) {
     await reply(db, businessId, customerId, fromPhone, "קביעת התור בוטלה. נשמח לעזור בכל עת! 😊");
     await upsertConversationState(db, businessId, customerId, "idle", {});
     return;
   }
 
-  const isYes = ["כן", "אישור", "אשר", "yes", "ok"].includes(t) || t.startsWith("כן");
+  const isYes = parseYesNo(t) === "yes";
   if (!isYes) {
-    await reply(db, businessId, customerId, fromPhone, "שלח *כן* לאישור התור או *לא* לביטול.");
+    const svc = context.selected_service_name as string;
+    const slot = context.selected_slot_time as string;
+    const [yy, mm, dd] = ((context.selected_date as string) ?? "--").split("-");
+    await reply(db, businessId, customerId, fromPhone,
+      "אנחנו באמצע קביעת תור 😊\n" +
+      "כדי לסיים, שלח/י *כן* לאישור או *לא* לביטול.\n" +
+      "אם רצית לשאול משהו אחר, שלח/י 'ביטול' ואז כתוב/כתבי את השאלה.\n\n" +
+      `שירות: *${svc}*\nתאריך: *${dd}/${mm}/${yy}*\nשעה: *${slot}*`
+    );
     return;
   }
 
@@ -321,6 +523,15 @@ async function handleConfirmation(
   const serviceId = context.selected_service_id as string | undefined;
   const duration  = (context.selected_duration_minutes as number) ?? 30;
   const serviceName = context.selected_service_name as string;
+
+  // PRE-INSERT SAFETY: verify the interval is STILL free. The exact-start unique
+  // constraint only catches identical start times — off-grid bookings (e.g.
+  // 15:30 on a 45-min grid) could otherwise overlap a neighboring appointment.
+  const stillFree = await isIntervalFree(db, businessId, date, slotTime, duration, timezone);
+  if (!stillFree) {
+    await offerAlternativesAfterConflict(db, businessId, customerId, fromPhone, date, slotTime, duration, timezone, context);
+    return;
+  }
 
   // Convert business-local time to UTC for storage
   const startTime = businessTimeToUTC(date, slotTime, timezone);
@@ -339,30 +550,7 @@ async function handleConfirmation(
   if (error) {
     // Unique constraint violation (error code 23505) = slot was taken by a concurrent booking.
     if (error.code === "23505") {
-      console.warn(`[booking] slot collision business=${businessId} date=${date} slot=${slotTime}`);
-      const updatedSlots = await getAvailableSlots(db, businessId, date, duration, timezone);
-      if (updatedSlots.length === 0) {
-        const [y, mo, d] = date.split("-");
-        await reply(db, businessId, customerId, fromPhone,
-          `השעה הזו כבר נתפסה ואין שעות פנויות אחרות בתאריך ${d}/${mo}/${y}.\n` +
-          `שלח תאריך אחר, או שלח *ביטול* לסיום.`
-        );
-        await upsertConversationState(db, businessId, customerId, "booking_select_date", {
-          ...context,
-          selected_slot_time: undefined,
-          available_slots: undefined,
-        });
-      } else {
-        let msg = "השעה הזו כבר נתפסה. הנה שעות פנויות אחרות:\n\n";
-        updatedSlots.forEach((s, i) => { msg += `${i + 1}. ${s}\n`; });
-        msg += "\nשלח את *מספר* השעה הרצויה.\nלביטול שלח *ביטול*.";
-        await reply(db, businessId, customerId, fromPhone, msg);
-        await upsertConversationState(db, businessId, customerId, "booking_select_slot", {
-          ...context,
-          selected_slot_time: undefined,
-          available_slots: updatedSlots,
-        });
-      }
+      await offerAlternativesAfterConflict(db, businessId, customerId, fromPhone, date, slotTime, duration, timezone, context);
       return;
     }
 

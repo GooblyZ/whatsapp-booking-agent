@@ -34,6 +34,11 @@ export interface BusinessSettings {
   // Business identity (shown in settings page)
   address: string | null;
   city: string | null;
+  // WhatsApp integration health (migration 006 — optional until applied)
+  whatsapp_status?: "healthy" | "degraded" | "auth_failed";
+  last_whatsapp_error?: string | null;
+  last_whatsapp_error_at?: string | null;
+  whatsapp_consecutive_failures?: number;
   // DB columns that exist but are NO LONGER surfaced in the UI.
   // These remain null after migration 002. Content lives in knowledge_base_items instead.
   /** @deprecated Use KB category "parking" */
@@ -186,8 +191,25 @@ export interface AISettings {
   emoji_usage: AISettingsEmojiUsage;
   language: string;
   custom_instructions: string | null;
+  // AI control toggles — all default true. Disabling never affects bookings.
+  ai_enabled: boolean;
+  faq_enabled: boolean;
+  intent_detection_enabled: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** A single row in ai_events — non-sensitive Gemini activity log. */
+export interface AIEvent {
+  id: string;
+  business_id: string;
+  customer_id: string | null;
+  called: boolean;
+  intent: string | null;
+  confidence: number | null;
+  success: boolean;
+  response_type: string | null;
+  created_at: string;
 }
 
 export interface BusinessAIContext {

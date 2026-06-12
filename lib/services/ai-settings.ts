@@ -23,6 +23,10 @@ export interface UpdateAISettingsInput {
   emoji_usage?: AISettingsEmojiUsage;
   language?: string;
   custom_instructions?: string | null;
+  // AI control toggles — disabling never affects the booking flow.
+  ai_enabled?: boolean;
+  faq_enabled?: boolean;
+  intent_detection_enabled?: boolean;
 }
 
 export async function updateAISettings(

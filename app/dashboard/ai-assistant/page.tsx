@@ -72,6 +72,69 @@ export default async function AIAssistantPage({
           maxWidth: "480px",
         }}
       >
+        {/* AI control toggles */}
+        <fieldset
+          style={{
+            border: "1px solid #e0e0e0",
+            borderRadius: "8px",
+            padding: "12px 16px",
+            margin: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+          }}
+        >
+          <legend style={{ fontWeight: "600", fontSize: "14px", padding: "0 6px" }}>מצב AI</legend>
+
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "14px" }}>
+            <input
+              type="checkbox"
+              name="ai_enabled"
+              value="on"
+              defaultChecked={aiSettings?.ai_enabled !== false}
+              style={{ marginTop: "3px" }}
+            />
+            <span>
+              <strong>AI פעיל</strong>
+              <span style={{ ...hint, display: "block" }}>
+                כשמכובה — הבוט עדיין מקבל תורים (&apos;תור&apos;), אך לא עונה על שאלות חופשיות.
+              </span>
+            </span>
+          </label>
+
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "14px" }}>
+            <input
+              type="checkbox"
+              name="faq_enabled"
+              value="on"
+              defaultChecked={aiSettings?.faq_enabled !== false}
+              style={{ marginTop: "3px" }}
+            />
+            <span>
+              <strong>מענה לשאלות (FAQ)</strong>
+              <span style={{ ...hint, display: "block" }}>
+                מענה אוטומטי לשאלות על שעות, מחירים, מיקום ועוד — מבוסס בסיס הידע.
+              </span>
+            </span>
+          </label>
+
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "14px" }}>
+            <input
+              type="checkbox"
+              name="intent_detection_enabled"
+              value="on"
+              defaultChecked={aiSettings?.intent_detection_enabled !== false}
+              style={{ marginTop: "3px" }}
+            />
+            <span>
+              <strong>זיהוי כוונת קביעת תור</strong>
+              <span style={{ ...hint, display: "block" }}>
+                זיהוי משפטים כמו &quot;אני רוצה תספורת מחר&quot; והצעה לפתוח תהליך קביעת תור.
+              </span>
+            </span>
+          </label>
+        </fieldset>
+
         {/* Assistant name */}
         <label style={fieldWrap}>
           <span style={fieldLabel}>שם העוזר</span>

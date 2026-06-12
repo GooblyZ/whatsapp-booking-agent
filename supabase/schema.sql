@@ -404,10 +404,35 @@ CREATE TABLE IF NOT EXISTS ai_settings (
 
   custom_instructions TEXT,
 
+  -- AI control toggles (see migration 005). Disabling AI never affects bookings.
+  ai_enabled               BOOLEAN NOT NULL DEFAULT TRUE,  -- master switch for the Gemini layer
+  faq_enabled              BOOLEAN NOT NULL DEFAULT TRUE,  -- answer FAQ questions
+  intent_detection_enabled BOOLEAN NOT NULL DEFAULT TRUE,  -- act on detected booking intent
+
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
   CONSTRAINT ai_settings_business_id_unique UNIQUE (business_id)
+);
+
+-- ============================================================
+-- ai_events
+-- Safe, non-sensitive log of Gemini activity (monitoring & cost visibility).
+-- Stores metadata only — never the API key, prompt, context, or message text.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS ai_events (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id   UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  customer_id   UUID REFERENCES customers(id) ON DELETE SET NULL,
+
+  called        BOOLEAN NOT NULL DEFAULT FALSE,   -- was the Gemini API actually called?
+  intent        TEXT,                             -- detected intent, or NULL
+  confidence    NUMERIC(4, 3),                    -- 0.000–1.000, or NULL
+  success       BOOLEAN NOT NULL DEFAULT TRUE,    -- decision resolved without error?
+  response_type TEXT,                             -- faq_answer | booking_confirm | irrelevant | ...
+
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- ============================================================
@@ -418,6 +443,8 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_base_items_business_id ON knowledge_bas
 CREATE INDEX IF NOT EXISTS idx_knowledge_base_items_category    ON knowledge_base_items(business_id, category);
 CREATE INDEX IF NOT EXISTS idx_knowledge_base_items_active      ON knowledge_base_items(business_id, active);
 CREATE INDEX IF NOT EXISTS idx_ai_settings_business_id          ON ai_settings(business_id);
+CREATE INDEX IF NOT EXISTS idx_ai_events_business_id            ON ai_events(business_id);
+CREATE INDEX IF NOT EXISTS idx_ai_events_business_created       ON ai_events(business_id, created_at);
 
 -- ============================================================
 -- updated_at triggers for new tables
@@ -493,3 +520,16 @@ ALTER TABLE messages
 --    Distinct from created_at (which records when the server received the webhook).
 ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS wa_timestamp TIMESTAMPTZ;
+
+-- 5. WhatsApp integration health (migration 006)
+--    Per-business delivery health; auth_failed suspends AI replies until the
+--    Meta token is reconnected (dashboard surfaces the alert).
+ALTER TABLE business_settings
+  ADD COLUMN IF NOT EXISTS whatsapp_status TEXT NOT NULL DEFAULT 'healthy'
+    CHECK (whatsapp_status IN ('healthy', 'degraded', 'auth_failed'));
+ALTER TABLE business_settings
+  ADD COLUMN IF NOT EXISTS last_whatsapp_error TEXT;
+ALTER TABLE business_settings
+  ADD COLUMN IF NOT EXISTS last_whatsapp_error_at TIMESTAMPTZ;
+ALTER TABLE business_settings
+  ADD COLUMN IF NOT EXISTS whatsapp_consecutive_failures INTEGER NOT NULL DEFAULT 0;

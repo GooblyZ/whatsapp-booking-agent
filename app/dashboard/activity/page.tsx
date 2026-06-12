@@ -2,6 +2,29 @@ export const dynamic = "force-dynamic";
 
 import { supabaseServer } from "@/lib/supabase/server";
 import { getDefaultBusinessId } from "@/lib/config";
+import { getRecentAIEvents } from "@/lib/ai/events";
+
+// Maps an ai_events response_type to a human title for the feed.
+const AI_EVENT_TITLES: Record<string, string> = {
+  conversation:      "🤖 שיחה טבעית",
+  faq_answer:        "🤖 מענה לשאלה",
+  booking_intent:    "🤖 שיחה על קביעת תור",
+  booking_handoff:   "🤖 מעבר לתהליך קביעת תור",
+  cancel_reschedule: "🤖 בקשת ביטול / שינוי תור",
+  irrelevant:        "🤖 הודעה לא רלוונטית — הופנתה חזרה",
+  unknown:           "🤖 הודעה לא ברורה",
+  noise:             "🤖 הודעה קצרה / לא תקינה",
+  abuse:             "🤖 הודעה לא הולמת",
+  grounding_failed:  "🤖 תשובה נחסמה (אימות עובדות)",
+  ai_disabled:       "🤖 AI מושבת",
+  not_configured:    "🤖 AI לא מוגדר",
+  error:             "🤖 שגיאת AI",
+  // legacy
+  booking_confirm:   "🤖 זוהתה כוונת קביעת תור",
+  booking_clarify:   "🤖 כוונת תור — נדרשת הבהרה",
+  booking_disabled:  "🤖 בקשת תור — קביעת תורים מושבתת",
+  greeting:          "🤖 ברכת שלום",
+};
 
 const STATUS_LABELS: Record<string, string> = {
   pending:   "ממתין",
@@ -49,7 +72,7 @@ function formatDateTime(iso: string): string {
 
 interface FeedEvent {
   id:        string;
-  type:      "message" | "appointment";
+  type:      "message" | "appointment" | "ai";
   createdAt: string;
   title:     string;
   subtitle:  string;
@@ -61,7 +84,7 @@ export default async function ActivityPage() {
   const db         = supabaseServer();
   const businessId = getDefaultBusinessId();
 
-  const [messagesResult, appointmentsResult] = await Promise.all([
+  const [messagesResult, appointmentsResult, aiEvents] = await Promise.all([
     db
       .from("messages")
       .select("id, direction, body, from_phone, created_at")
@@ -74,6 +97,7 @@ export default async function ActivityPage() {
       .eq("business_id", businessId)
       .order("created_at", { ascending: false })
       .limit(20),
+    getRecentAIEvents(businessId, 30),
   ]);
 
   const msgEvents: FeedEvent[] = (messagesResult.data ?? []).map((msg) => {
@@ -107,15 +131,30 @@ export default async function ActivityPage() {
     };
   });
 
-  const feed: FeedEvent[] = [...msgEvents, ...apptEvents]
+  const aiFeedEvents: FeedEvent[] = aiEvents.map((ev) => {
+    const rt = ev.response_type ?? "unknown";
+    const conf = ev.confidence != null ? ` · confidence=${Number(ev.confidence).toFixed(2)}` : "";
+    const calledNote = ev.called ? "" : " · ללא קריאת AI";
+    return {
+      id:         `ai-${ev.id}`,
+      type:       "ai",
+      createdAt:  ev.created_at,
+      title:      AI_EVENT_TITLES[rt] ?? `🤖 ${rt}`,
+      subtitle:   `intent=${ev.intent ?? "—"}${conf}${calledNote}`,
+      badge:      ev.success ? (ev.intent ?? "AI") : "שגיאה",
+      badgeColor: ev.success ? "#7c3aed" : "#dc3545",
+    };
+  });
+
+  const feed: FeedEvent[] = [...msgEvents, ...apptEvents, ...aiFeedEvents]
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
-    .slice(0, 40);
+    .slice(0, 50);
 
   return (
     <div>
       <h1 style={{ marginBottom: "6px" }}>פעילות אחרונה</h1>
       <p style={{ color: "#666", marginTop: 0, marginBottom: "20px", fontSize: "14px" }}>
-        הודעות WhatsApp ותורים — 40 האחרונים.
+        הודעות WhatsApp, תורים ופעילות AI — 50 האחרונים.
       </p>
 
       {feed.length === 0 && (
@@ -141,14 +180,17 @@ export default async function ActivityPage() {
                 width: "32px",
                 height: "32px",
                 borderRadius: "50%",
-                background: event.type === "message" ? "#e8f0fe" : "#e8f5e9",
+                background:
+                  event.type === "message" ? "#e8f0fe"
+                  : event.type === "ai" ? "#f3e8ff"
+                  : "#e8f5e9",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 fontSize: "14px",
               }}
             >
-              {event.type === "message" ? "💬" : "📅"}
+              {event.type === "message" ? "💬" : event.type === "ai" ? "🤖" : "📅"}
             </div>
 
             {/* Content */}

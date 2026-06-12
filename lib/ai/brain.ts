@@ -1,0 +1,447 @@
+// lib/ai/brain.ts
+// Server-side only.
+//
+// The receptionist brain. Conversation (not intent classification) is the primary
+// abstraction: runReceptionistTurn() reasons over the customer's goal, the live
+// BOOKING CONTEXT, the facts, and real availability, then decides what to say and
+// returns structured understanding for the system to merge into the session.
+//
+// PURE — no DB writes, no logging, no actions — so callers (conversation engine /
+// debug page) reuse it safely.
+//
+// AI-FIRST: uncertainty / missing info NEVER triggers a rule-based path — Gemini
+// asks a natural clarifying question. Deterministic fallback is reserved for real
+// failures (API down, malformed output, unresolvable grounding, AI disabled).
+
+import type { BusinessAIContext } from "@/types/database";
+import type { GeminiTurn, GeminiUsage } from "./gemini";
+import { geminiGenerateConversation } from "./gemini";
+import { buildFacts, formatFacts, buildFactIndex, type BusinessFacts, type Capabilities } from "./facts";
+import { buildReceptionistInstruction } from "./persona";
+import { verifyGrounding, extractTimeTokens } from "./grounding";
+import { buildContextReply, type BookingSession } from "./booking-session";
+import { renderVerdictReplyHe, type AvailabilityInfo } from "./availability-facts";
+import type { AIEventResponseType } from "./events";
+
+export type ReceptionistIntent =
+  | "smalltalk" | "faq" | "booking" | "cancel_request"
+  | "reschedule_request" | "out_of_scope" | "unclear";
+
+const VALID_INTENTS: ReceptionistIntent[] = [
+  "smalltalk", "faq", "booking", "cancel_request", "reschedule_request", "out_of_scope", "unclear",
+];
+
+/** Appointment lifecycle intent — the system must never confuse these. */
+export type AppointmentIntent = "BOOK" | "RESCHEDULE" | "CANCEL" | "MODIFY" | "LIST" | "NONE";
+
+const VALID_APPT_INTENTS: AppointmentIntent[] = ["BOOK", "RESCHEDULE", "CANCEL", "MODIFY", "LIST", "NONE"];
+
+/** Gemini's structured output. `reply` is the only thing a customer ever sees. */
+export interface ReceptionistTurn {
+  reply: string;
+  understanding: {
+    conversationGoal?: string | null;
+    intent: ReceptionistIntent;
+    appointmentIntent: AppointmentIntent;
+    serviceName?: string | null;
+    dateText?: string | null;
+    time?: string | null;            // concrete "HH:MM"
+    timePreference?: string | null;  // softer ("בערב")
+    customerReference?: string | null;
+    missingInformation?: string | null;
+    /** Customer wants a DIFFERENT value for a detail of the current DRAFT. */
+    changeRequest?: "service" | "day" | "time" | null;
+    userCorrecting?: boolean;     // "you misunderstood / forgot"
+    userRepeatingInfo?: boolean;  // repeating info already given
+    userFrustrated?: boolean;
+    explicitConfirmation?: boolean;
+  };
+  needs?: "none" | "services" | "availability" | "policies";
+}
+
+/** Everything the brain needs for one turn (facts in, words out). */
+export interface TurnInput {
+  /**
+   * Recent history as REAL turns (preferred — native multi-turn attention).
+   * When provided, it is sent as actual conversation contents.
+   */
+  historyTurns?: GeminiTurn[];
+  /** Legacy/simple alternative: transcript embedded in the instruction. */
+  conversationContext: string;
+  message: string;               // the customer's current message
+  availabilityBlock?: string;    // rendered system-checked availability + evaluation
+  bookingBlock?: string;         // rendered CURRENT BOOKING working memory
+  stuckTurns?: number;           // loop detection signal (>=2 → change strategy)
+  allowedTimes?: string[];       // extra exact times quotable this turn (slots, nearest)
+  replyGuidance?: string;        // system-computed next-step hint for this reply
+}
+
+export interface ReceptionistDecision {
+  geminiCalled: boolean;
+  ok: boolean;
+  turn: ReceptionistTurn | null;
+  replyText: string;
+  responseType: AIEventResponseType;
+  grounded: boolean | null;
+  replySource: "gemini" | "fallback";
+  wantsToCancel: boolean;          // customer wants to stop/pause the booking
+  branch: string;                  // which path produced the reply (debug)
+  skipReason?: string;
+  fallbackReason?: string;
+  groundingViolations?: string[];
+  /** Exact token usage + estimated cost for this turn's Gemini call (null if not called / unavailable). */
+  usage?: GeminiUsage | null;
+}
+
+// Deterministic safety fallbacks — used ONLY for real failures, never for "the AI
+// is unsure". The grounding fallback is made fact-aware in groundingFallback().
+export const FALLBACK = {
+  aiDisabled:
+    "כדי לקבוע תור כתוב/כתבי 'תור' 🙂 לכל שאלה אחרת נשמח לעזור ישירות.",
+  noise:
+    "לא בטוח/ה שהבנתי 🙂 אפשר לשאול אותי כל שאלה על העסק, או לקבוע תור.",
+  abuse:
+    "נשמח לעזור בכל שאלה שקשורה לעסק 🙂",
+  error:
+    "נראה שמשהו השתבש אצלי לרגע 😅 אפשר לכתוב שוב, ואני כאן.",
+  errorAlt:
+    "סליחה, עדיין יש לי שיהוק טכני קטן 🙏 שווה לנסות שוב בעוד רגע, או לפנות ישירות לעסק.",
+  overloaded:
+    "יש לי רגע עומס קטן במערכת 🙏 אפשר לכתוב לי מה תרצה לקבוע — שירות, יום ושעה — ואני אסדר את זה לפי הפרטים שיש לי.",
+  overloadedAgain:
+    "אני עדיין בעומס קצר 🙏 אפשר בינתיים לכתוב לי שירות, יום ושעה — ואני אמשיך לפי מה שיש לי.",
+  grounding:
+    "אני רוצה לתת לך מידע מדויק ולא בטוח/ה בפרט הזה כרגע 🙏 מומלץ לפנות ישירות לעסק.",
+} as const;
+
+type InputKind = "ok" | "noise" | "abuse";
+
+const NOISE_TOKENS = new Set(["asdf", "asd", "asdfgh", "qwerty"]);
+const ABUSE_TOKENS = ["fuck", "shit", "bitch", "זין", "כוס", "שרמוטה", "מניאק"];
+
+/**
+ * Cheap deterministic guard BEFORE Gemini — spam/noise/abuse ONLY. Everything
+ * else (greetings, smalltalk, questions, digits, times) goes to Gemini.
+ */
+export function classifyInput(text: string): InputKind {
+  const t = text.trim();
+  if (t.length < 1) return "noise";
+  const lower = t.toLowerCase();
+  if (ABUSE_TOKENS.some((w) => lower.includes(w))) return "abuse";
+  if (NOISE_TOKENS.has(lower)) return "noise";
+  if (!/[a-zA-Z֐-׿0-9]/.test(t)) return "noise";     // emoji/punct only
+  if (/^(.)\1{3,}$/.test(t)) return "noise";           // "חחחחח", "kkkk"
+  return "ok";
+}
+
+function fallback(
+  replyText: string,
+  responseType: AIEventResponseType,
+  branch: string,
+  extra: Partial<ReceptionistDecision> = {}
+): ReceptionistDecision {
+  return {
+    geminiCalled: false,
+    ok: false,
+    turn: null,
+    replyText,
+    responseType,
+    grounded: null,
+    replySource: "fallback",
+    wantsToCancel: false,
+    branch,
+    ...extra,
+  };
+}
+
+/** Fact-aware grounding fallback: use known facts instead of a generic deflection. */
+function groundingFallback(facts: BusinessFacts, kinds: string[]): string {
+  if (kinds.includes("time")) {
+    const open = facts.hours.filter((h) => !h.closed && h.opens && h.closes);
+    if (open.length > 0) {
+      const summary = open.map((h) => `${h.day} ${h.opens}-${h.closes}`).join(", ");
+      return `רגע, שאדייק 🙏 שעות הפעילות שלנו: ${summary}. אפשר לבדוק שעה בטווח הזה?`;
+    }
+  }
+  return FALLBACK.grounding;
+}
+
+/**
+ * Decides how the receptionist responds to one customer message.
+ * PURE: no DB writes, no logging, no booking execution. Calls Gemini (read-only).
+ */
+export async function runReceptionistTurn(
+  ctx: BusinessAIContext,
+  input: TurnInput
+): Promise<ReceptionistDecision> {
+  const ai = ctx.aiSettings;
+  const aiEnabled = ai?.ai_enabled !== false;
+  const faqEnabled = ai?.faq_enabled !== false;
+  const intentEnabled = ai?.intent_detection_enabled !== false;
+
+  if (!aiEnabled) {
+    return fallback(FALLBACK.aiDisabled, "ai_disabled", "ai_disabled", { skipReason: "ai_disabled", fallbackReason: "ai_disabled" });
+  }
+
+  const guard = classifyInput(input.message);
+  if (guard === "abuse") return fallback(FALLBACK.abuse, "abuse", "guard_abuse", { skipReason: "abuse" });
+  if (guard === "noise") return fallback(FALLBACK.noise, "noise", "guard_noise", { skipReason: "noise" });
+
+  const facts = buildFacts(ctx);
+  const caps: Capabilities = {
+    canAnswer: faqEnabled,
+    canStartBooking: intentEnabled && facts.bookingEnabled,
+    canCancel: false,
+    canReschedule: false,
+  };
+
+  const useNativeHistory = (input.historyTurns?.length ?? 0) > 0;
+  const factsBlock = formatFacts(facts);
+  const instruction = buildReceptionistInstruction(ctx, {
+    factsBlock,
+    caps,
+    // With native history, the transcript block is redundant — the turns speak
+    // for themselves (and far more naturally).
+    conversationContext: useNativeHistory ? "" : input.conversationContext,
+    nativeHistory: useNativeHistory,
+    availabilityBlock: input.availabilityBlock,
+    bookingBlock: input.bookingBlock,
+    stuckTurns: input.stuckTurns,
+    replyGuidance: input.replyGuidance,
+  });
+  const turns: GeminiTurn[] = [
+    ...(input.historyTurns ?? []),
+    { role: "user", text: input.message.slice(0, 1000) },
+  ];
+
+  // Cost instrumentation: per-request prompt composition (CHAR sizes only — safe
+  // metadata, no content). persona_base = instruction minus the injected blocks.
+  {
+    const sz = (s: string | undefined) => (s ?? "").length;
+    const historyChars = (input.historyTurns ?? []).reduce((n, t) => n + t.text.length, 0);
+    const injected =
+      sz(factsBlock) + sz(input.availabilityBlock) + sz(input.bookingBlock) +
+      sz(input.replyGuidance) + (useNativeHistory ? 0 : sz(input.conversationContext)) +
+      sz(ctx.aiSettings?.custom_instructions ?? undefined);
+    console.log(
+      `[gemini-prompt] chars: instruction=${instruction.length}` +
+      ` (persona_base≈${Math.max(0, instruction.length - injected)}` +
+      ` facts=${sz(factsBlock)} availability=${sz(input.availabilityBlock)}` +
+      ` booking=${sz(input.bookingBlock)} guidance=${sz(input.replyGuidance)}` +
+      ` custom=${sz(ctx.aiSettings?.custom_instructions ?? undefined)}` +
+      ` transcript=${useNativeHistory ? 0 : sz(input.conversationContext)})` +
+      ` + history_turns=${input.historyTurns?.length ?? 0} (${historyChars} chars)` +
+      ` + message=${Math.min(input.message.length, 1000)}`
+    );
+  }
+
+  const res = await geminiGenerateConversation(instruction, turns);
+  if (!res.ok) {
+    if (res.code === "not_configured") {
+      return fallback(FALLBACK.error, "not_configured", "not_configured", { skipReason: "not_configured", fallbackReason: "not_configured" });
+    }
+    if (res.code === "overloaded") {
+      // 503 / high demand — transient upstream pressure, NOT a generic glitch:
+      // the customer gets a useful "leave me the details" line, and the engine's
+      // cooldown (lib/ai/gemini.ts) keeps the next turns deterministic.
+      return fallback(FALLBACK.overloaded, "error", "api_overloaded", { geminiCalled: true, fallbackReason: "gemini_overloaded" });
+    }
+    return fallback(FALLBACK.error, "error", "api_error", { geminiCalled: true, fallbackReason: `gemini_${res.code}` });
+  }
+
+  const turn = parseReceptionistTurn(res.text);
+  if (!turn) {
+    // Failure-path diagnostic: short head of the raw model output (generated
+    // text only — no secrets, no customer PII).
+    console.warn(
+      `[ai] malformed_json rawLen=${res.text.length} head(160)="${res.text.slice(0, 160).replace(/\s+/g, " ")}"`
+    );
+    return fallback(FALLBACK.error, "error", "parse_error", { geminiCalled: true, fallbackReason: "malformed_json", usage: res.usage });
+  }
+
+  // Strict grounding (last-resort fence; availability truth was fed upstream):
+  // allowed = inside open-hours ranges ∪ system-provided times ∪ customer-echoed times.
+  const index = buildFactIndex(facts);
+  const allowedTimes = new Set(input.allowedTimes ?? []);
+  const echoTimes = extractTimeTokens(input.message);
+
+  const grounding = verifyGrounding(turn.reply, index, allowedTimes, echoTimes);
+  if (!grounding.ok) {
+    console.warn(`[ai] grounding failed: ${grounding.violations.join("; ")}`);
+    return fallback(groundingFallback(facts, grounding.kinds), "grounding_failed", "grounding_failed", {
+      geminiCalled: true,
+      turn,
+      grounded: false,
+      wantsToCancel: turn.understanding.intent === "cancel_request",
+      groundingViolations: grounding.violations,
+      fallbackReason: `grounding:${grounding.kinds.join(",") || "unknown"}`,
+      usage: res.usage,
+    });
+  }
+
+  return {
+    geminiCalled: true,
+    ok: true,
+    turn,
+    replyText: turn.reply,
+    responseType: intentToResponseType(turn.understanding.intent),
+    grounded: true,
+    replySource: "gemini",
+    wantsToCancel: turn.understanding.intent === "cancel_request",
+    branch: "gemini_reply",
+    usage: res.usage,
+  };
+}
+
+function intentToResponseType(intent: ReceptionistIntent): AIEventResponseType {
+  switch (intent) {
+    case "faq": return "faq_answer";
+    case "smalltalk": return "conversation";
+    case "booking": return "booking_intent";
+    case "cancel_request":
+    case "reschedule_request": return "cancel_reschedule";
+    case "out_of_scope": return "irrelevant";
+    default: return "unknown";
+  }
+}
+
+/** Parses + validates Gemini's JSON into a ReceptionistTurn. Returns null if untrustworthy. */
+export function parseReceptionistTurn(raw: string): ReceptionistTurn | null {
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed as Record<string, unknown>;
+
+  const reply = typeof obj.reply === "string" ? obj.reply.trim() : "";
+  if (reply.length === 0) return null;
+
+  const u = (typeof obj.understanding === "object" && obj.understanding !== null
+    ? obj.understanding
+    : {}) as Record<string, unknown>;
+
+  const rawIntent = typeof u.intent === "string" ? u.intent : "unclear";
+  const intent = (VALID_INTENTS as string[]).includes(rawIntent)
+    ? (rawIntent as ReceptionistIntent)
+    : "unclear";
+
+  const rawApptIntent = typeof u.appointmentIntent === "string" ? u.appointmentIntent.toUpperCase() : "NONE";
+  const appointmentIntent = (VALID_APPT_INTENTS as string[]).includes(rawApptIntent)
+    ? (rawApptIntent as AppointmentIntent)
+    : "NONE";
+
+  const needsRaw = typeof obj.needs === "string" ? obj.needs : "none";
+  const needs = (["none", "services", "availability", "policies"] as const).includes(
+    needsRaw as "none" | "services" | "availability" | "policies"
+  )
+    ? (needsRaw as ReceptionistTurn["needs"])
+    : "none";
+
+  return {
+    reply,
+    understanding: {
+      conversationGoal: optionalString(u.conversationGoal),
+      intent,
+      appointmentIntent,
+      serviceName: optionalString(u.serviceName),
+      dateText: optionalString(u.dateText),
+      time: optionalString(u.time),
+      timePreference: optionalString(u.timePreference),
+      customerReference: optionalString(u.customerReference),
+      missingInformation: optionalString(u.missingInformation),
+      changeRequest: parseChangeRequest(u.changeRequest),
+      userCorrecting: u.userCorrecting === true,
+      userRepeatingInfo: u.userRepeatingInfo === true,
+      userFrustrated: u.userFrustrated === true,
+      explicitConfirmation: u.explicitConfirmation === true,
+    },
+    needs,
+  };
+}
+
+function optionalString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim();
+  return t.length > 0 ? t : undefined;
+}
+
+function parseChangeRequest(v: unknown): "service" | "day" | "time" | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim().toLowerCase();
+  return t === "service" || t === "day" || t === "time" ? t : undefined;
+}
+
+// ── Degraded mode (Gemini overload cooldown) ──────────────────────────────────
+
+// Low-value acknowledgements — during an overload cooldown these never justify
+// an AI call ("אוקי" right after a 503 storm must not re-trigger the model).
+// "לא" is deliberately EXCLUDED: it can mean offer rejection.
+const ACK_TOKENS = new Set([
+  "אוקי", "אוקיי", "אוקי תודה", "בסדר", "סבבה", "טוב", "מעולה", "אחלה", "מגניב",
+  "תודה", "תודה רבה", "סגור", "הבנתי", "כן", "יאללה",
+  "ok", "okay", "thanks", "thank you", "10x",
+]);
+
+export function isLowValueAck(text: string): boolean {
+  const t = text.trim().toLowerCase().replace(/[!?.,…]+$/g, "").trim();
+  if (t.length === 0 || t.length > 14) return false;
+  return ACK_TOKENS.has(t) || /^אוקי+$/.test(t) || /^סבבה+$/.test(t);
+}
+
+/**
+ * True for our own failure/degraded lines. They carry no conversational
+ * information, and fed back as model turns they teach the model to talk about
+ * glitches — so conversation memory keeps them OUT of the AI-facing history
+ * (the guard-facing transcript keeps everything).
+ */
+export function isKnownFallbackText(s: string): boolean {
+  return /משהו השתבש אצלי|שיהוק טכני|עומס קטן במערכת|עדיין בעומס|הייתה לי תקלה/.test(s);
+}
+
+/**
+ * True when the overload notice was already shown in the current conversation
+ * window — checked against ALL assistant lines of the transcript, not just the
+ * last one (an intermediate "סבבה" must not reset the notice and cause spam).
+ */
+export function overloadNoticeAlreadyShown(transcript: string): boolean {
+  return transcript
+    .split("\n")
+    .some((l) => l.startsWith("Assistant (you, earlier): ") && l.includes("עומס"));
+}
+
+/**
+ * Deterministic reply for a turn served WITHOUT Gemini (overload cooldown).
+ * Priorities: honest availability verdict > booking continuation (recap + ONE
+ * question) > short ack > degraded notice. The notice appears at most once per
+ * conversation window (noticeSent — see overloadNoticeAlreadyShown).
+ */
+export function composeDegradedReply(
+  message: string,
+  session: BookingSession,
+  availability: AvailabilityInfo | null,
+  noticeSent: boolean
+): string {
+  const notice = "יש לי רגע עומס קטן במערכת 🙏";
+
+  // A system-checked verdict on a concrete request is the most useful thing we own.
+  if (availability?.requested && availability.requested.category !== "available") {
+    const verdict = renderVerdictReplyHe(availability, session.rejectedSlots);
+    if (verdict) return verdict;
+  }
+  if (isLowValueAck(message)) {
+    if (noticeSent) return "סבבה 🙂";
+    return session.active
+      ? `${notice} ${buildContextReply(session)}`
+      : `${notice} כשתרצה — אפשר לכתוב לי שירות, יום ושעה ואני אסדר את זה.`;
+  }
+  if (session.active) {
+    const ctx = buildContextReply(session);
+    return noticeSent ? ctx : `${notice} ${ctx}`;
+  }
+  return noticeSent ? FALLBACK.overloadedAgain : FALLBACK.overloaded;
+}

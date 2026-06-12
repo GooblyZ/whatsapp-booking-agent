@@ -114,6 +114,63 @@ export async function getAvailableSlots(
   return available;
 }
 
+/**
+ * True when the interval [time, time+duration] lies inside opening hours and
+ * overlaps NO pending/confirmed appointment. Needed for OFF-GRID times: the
+ * slot grid steps by service duration, so "15:30" on a 45-minute grid is not a
+ * grid slot — but on an empty day a human receptionist would happily book it
+ * (live: 15:30 on an empty Friday was reported "taken"). Also used as the
+ * pre-INSERT safety check (the exact-start unique constraint cannot catch
+ * overlapping bookings with different start times).
+ */
+export async function isIntervalFree(
+  db: DB,
+  businessId: string,
+  date: string,
+  time: string,
+  durationMinutes: number,
+  timezone: string
+): Promise<boolean> {
+  const dayOfWeek = new Date(date + "T12:00:00Z").getDay();
+  const { data: hoursRow } = await db
+    .from("business_hours")
+    .select("opens_at, closes_at, is_closed")
+    .eq("business_id", businessId)
+    .eq("day_of_week", dayOfWeek)
+    .maybeSingle();
+
+  let opensAt = "09:00";
+  let closesAt = "18:00";
+  if (hoursRow) {
+    if (hoursRow.is_closed) return false;
+    if (hoursRow.opens_at) opensAt = hoursRow.opens_at as string;
+    if (hoursRow.closes_at) closesAt = hoursRow.closes_at as string;
+  }
+  const [h, m] = time.split(":").map(Number);
+  const [oh, om] = opensAt.split(":").map(Number);
+  const [ch, cm] = closesAt.split(":").map(Number);
+  const start = h * 60 + m;
+  if (start < oh * 60 + om || start + durationMinutes > ch * 60 + cm) return false;
+
+  const dayStartUTC = businessTimeToUTC(date, "00:00", timezone);
+  const dayEndUTC = businessTimeToUTC(date, "23:59", timezone);
+  const { data: booked } = await db
+    .from("appointments")
+    .select("start_time, end_time")
+    .eq("business_id", businessId)
+    .in("status", ["pending", "confirmed"])
+    .gte("start_time", dayStartUTC.toISOString())
+    .lte("start_time", dayEndUTC.toISOString());
+
+  const reqStart = businessTimeToUTC(date, time, timezone);
+  const reqEnd = new Date(reqStart.getTime() + durationMinutes * 60_000);
+  return !(booked ?? []).some((b) => {
+    const bStart = new Date(b.start_time as string);
+    const bEnd = new Date(b.end_time as string);
+    return reqStart < bEnd && reqEnd > bStart;
+  });
+}
+
 // Parses a Hebrew or numeric date string into YYYY-MM-DD (business timezone).
 // Accepts: "מחר", "מחרתיים", "DD/MM", "DD/MM/YYYY"
 export function parseHebrewDate(input: string, timezone: string): string | null {

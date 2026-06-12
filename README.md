@@ -108,6 +108,8 @@ Copy `.env.example` to `.env.local` and fill in all values.
 | `META_ACCESS_TOKEN` | Meta permanent access token |
 | `META_PHONE_NUMBER_ID` | Meta WhatsApp phone number ID |
 | `DEFAULT_BUSINESS_ID` | UUID of the business row in Supabase for this webhook instance |
+| `GEMINI_API_KEY` | Google Gemini API key. **Server only. Never expose to the browser.** Enables the AI FAQ / intent-understanding layer. If unset, the bot still works deterministically (booking flow + fixed replies). |
+| `GEMINI_MODEL` | Gemini model name. Optional — defaults to `gemini-2.5-flash-lite` (the single production model; no multi-model routing). |
 | `DASHBOARD_ACCESS_PASSWORD` | Password for the `/dashboard` management UI. **Required in production.** If not set, the dashboard is accessible without authentication and both `/login` and the dashboard nav show a yellow warning banner. |
 | `META_VERIFY_TOKEN` | A secret string you choose and enter in the Meta webhook console to verify ownership. |
 | `META_ACCESS_TOKEN` | Meta permanent system user access token (or temporary test token). |

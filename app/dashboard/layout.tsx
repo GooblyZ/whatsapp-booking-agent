@@ -43,6 +43,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
         <a href="/dashboard/knowledge-base" style={{ color: "#ccc", textDecoration: "none" }}>בסיס ידע</a>
         <a href="/dashboard/ai-assistant" style={{ color: "#ccc", textDecoration: "none" }}>הגדרות AI</a>
         <a href="/dashboard/activity" style={{ color: "#ccc", textDecoration: "none" }}>פעילות</a>
+        <a href="/dashboard/ai-debug" style={{ color: "#8b7fd6", textDecoration: "none" }}>בדיקת AI</a>
 
         {hasPassword && (
           <form action={logoutAction} style={{ marginRight: "auto" }}>

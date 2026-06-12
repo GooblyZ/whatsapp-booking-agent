@@ -29,6 +29,10 @@ export async function saveAISettingsAction(formData: FormData) {
     emoji_usage:         (formData.get("emoji_usage")     as AISettingsEmojiUsage)       || "low",
     language:            safeLanguage(formData.get("language")),
     custom_instructions: customInstr?.length ? customInstr : null,
+    // Unchecked checkboxes are absent from FormData → treated as false.
+    ai_enabled:               formData.get("ai_enabled") === "on",
+    faq_enabled:              formData.get("faq_enabled") === "on",
+    intent_detection_enabled: formData.get("intent_detection_enabled") === "on",
   });
 
   redirect("/dashboard/ai-assistant?saved=1");

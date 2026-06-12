@@ -2,6 +2,8 @@ export const dynamic = "force-dynamic";
 
 import { supabaseServer } from "@/lib/supabase/server";
 import { getDefaultBusinessId } from "@/lib/config";
+import { countAIEventsSince } from "@/lib/ai/events";
+import { readPersistedWhatsAppHealth } from "@/lib/integration-health";
 
 // ── Setup Checklist ─────────────────────────────────────────────
 
@@ -114,12 +116,27 @@ export default async function DashboardPage() {
   const biz      = bizResult.data as { name: string; timezone: string; phone: string | null } | null;
   const settings = settingsResult.data as { booking_enabled: boolean; language: string } | null;
 
+  // ── AI usage counters (PART 6). Approximate — counts billable Gemini calls. ──
+  // Day/month boundaries use UTC; "approximate counts are enough".
+  const now          = new Date();
+  const startOfToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+  const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+  const [aiCallsToday, aiCallsMonth] = await Promise.all([
+    countAIEventsSince(businessId, startOfToday),
+    countAIEventsSince(businessId, startOfMonth),
+  ]);
+
   // "Business profile done" = owner has set a real timezone (not the schema default "UTC").
   const profileDone =
     Boolean(biz?.name?.trim()) && Boolean(biz?.timezone) && biz?.timezone !== "UTC";
 
   const whatsappConnected = Boolean(process.env.META_PHONE_NUMBER_ID);
   const bookingEnabled    = settings?.booking_enabled !== false;
+
+  // Persisted WhatsApp delivery health (null until migration 006 is applied).
+  const waHealth = await readPersistedWhatsAppHealth(db, businessId);
+  const waAuthFailed = waHealth?.status === "auth_failed";
+  const waDegraded = waHealth?.status === "degraded";
 
   const setupItems: SetupItem[] = [
     {
@@ -190,6 +207,37 @@ export default async function DashboardPage() {
   return (
     <div>
       <h1 style={{ marginBottom: "20px" }}>לוח בקרה</h1>
+
+      {/* ── WhatsApp delivery alert ─────────────────────────── */}
+      {(waAuthFailed || waDegraded) && (
+        <div
+          style={{
+            background: waAuthFailed ? "#fdecea" : "#fff3cd",
+            border: `1px solid ${waAuthFailed ? "#f5c2c0" : "#ffc107"}`,
+            color: waAuthFailed ? "#b71c1c" : "#856404",
+            borderRadius: "8px",
+            padding: "14px 18px",
+            marginBottom: "20px",
+            fontSize: "14px",
+          }}
+        >
+          <strong>
+            {waAuthFailed
+              ? "⛔ תקלת חיבור ל-WhatsApp: האימות מול Meta נכשל."
+              : "⚠️ תקלות בשליחת הודעות WhatsApp."}
+          </strong>
+          <div style={{ marginTop: "4px" }}>
+            {waAuthFailed
+              ? "הודעות מלקוחות נשמרות, אך הבוט לא יכול לענות עד לחידוש הטוקן. חדש/י את META_ACCESS_TOKEN ואתחל/י את השרת."
+              : "בדוק/י את חיבור ה-API של Meta."}
+            {waHealth?.lastErrorAt && (
+              <span style={{ color: "#888" }}>
+                {" "}(כשלים רצופים: {waHealth.consecutiveFailures}, אחרון: {new Date(waHealth.lastErrorAt).toLocaleString("he-IL")})
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       <SetupChecklist items={setupItems} />
 
@@ -275,6 +323,39 @@ export default async function DashboardPage() {
         {stats.map((stat) => statCard(stat.label, stat.value, stat.link))}
       </div>
 
+      {/* ── AI Usage ──────────────────────────────────────────── */}
+      <div
+        style={{
+          border: "1px solid #e0e0e0",
+          borderRadius: "8px",
+          padding: "14px 20px",
+          marginBottom: "24px",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+          <div style={{ fontWeight: "600", fontSize: "14px" }}>🤖 שימוש AI</div>
+          <a
+            href="/dashboard/ai-debug"
+            style={{ fontSize: "12px", color: "#0070f3", textDecoration: "none" }}
+          >
+            בדיקת AI →
+          </a>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "12px 40px" }}>
+          <div>
+            <div style={{ fontSize: "26px", fontWeight: "700" }}>≈ {aiCallsToday}</div>
+            <div style={{ color: "#666", fontSize: "13px" }}>קריאות Gemini היום</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "26px", fontWeight: "700" }}>≈ {aiCallsMonth}</div>
+            <div style={{ color: "#666", fontSize: "13px" }}>קריאות Gemini החודש</div>
+          </div>
+        </div>
+        <div style={{ fontSize: "11px", color: "#aaa", marginTop: "8px" }}>
+          ספירה מקורבת של קריאות בפועל ל‑Gemini (לא כולל הודעות שסוננו לפני קריאה). בדיקות מעמוד &quot;בדיקת AI&quot; אינן נספרות.
+        </div>
+      </div>
+
       {/* ── System Health ─────────────────────────────────────── */}
       <div
         style={{
@@ -309,9 +390,9 @@ export default async function DashboardPage() {
           />
           <HealthItem
             label="WhatsApp"
-            ok={whatsappConnected}
-            okText="מחובר"
-            badText="לא מוגדר — ה‑bot לא פעיל"
+            ok={whatsappConnected && !waAuthFailed}
+            okText={waDegraded ? "מחובר (תקלות שליחה)" : "מחובר"}
+            badText={waAuthFailed ? "אימות נכשל — חדש את טוקן Meta" : "לא מוגדר — ה‑bot לא פעיל"}
             link={null}
           />
         </div>
