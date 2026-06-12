@@ -3,6 +3,12 @@
 > Full background for anyone (human or AI) picking up this project cold.
 > Companion docs: `CURRENT_STATE.md` (what works), `REPOSITORY_MAP.md` (where things are),
 > `CLAUDE.md` (rules), `SESSION_HANDOFF.md` (TL;DR).
+>
+> ⚠ **PRODUCT PIVOT (2026-06-12)**: this document describes the conversational-
+> scheduling architecture, which is now the LEGACY path (`BOOKING_MODE=conversational`,
+> still the live default). The target architecture — AI as conversation/intent layer,
+> web booking platform as the scheduling owner, event-driven automation — is specified
+> in **`TRANSITION_PLAN.md`**, which supersedes this document where they conflict.
 
 ## Product vision
 A WhatsApp-first **AI receptionist SaaS** for Israeli small businesses (hair salons,

@@ -1,8 +1,28 @@
-# CURRENT_STATE — receptionist-core (as of 2026-06-12)
+# CURRENT_STATE — receptionist-core (as of 2026-06-12, post-pivot)
 
-Git: `main` @ `7df3fbc` (= code of `f5ff9ce` "Add Gemini-powered AI receptionist…").
-Lint ✅ · Build ✅ · Simulation suite: 20/20 scenarios green (numbered 1–19 and 21 — there
-is no #20; last full run 2026-06-11).
+Lint ✅ · Build ✅ · Simulation suite green (scenarios 1–19, 21, 22 — there is no #20;
+last full run 2026-06-12, includes the new platform-mode scenario 22).
+
+## PRODUCT TRANSITION (owner decision 2026-06-12 — see TRANSITION_PLAN.md)
+Scheduling moves OUT of the AI conversation into the **booking platform**. Built and
+validated this session (live behavior unchanged until the owner flips the flag):
+- **`/book/[slug]`** — public mobile-first RTL booking wizard (service → day → visual
+  slot grid → details → deterministic booking + WhatsApp confirmation with manage link).
+  Past times today are filtered (+15-min lead) — the old bug #3 never reaches this path.
+- **`/appointment/[id]`** — self-service view / cancel / reschedule (uuid link).
+- **`lib/booking/platform.ts`** — deterministic platform service layer (shares
+  getAvailableSlots / isIntervalFree / collision handling with the chat path).
+- **`BOOKING_MODE` flag** — `conversational` (default, exact pre-pivot behavior) |
+  `platform` (AI detects BOOK/CANCEL/RESCHEDULE intent → system attaches links;
+  `lib/ai/platform-turn.ts`; persona drops all scheduling machinery).
+- **Event layer** — migration `007_platform_events_waitlist.sql` (events + waitlist
+  tables + source='platform'; NOT yet applied), fail-open emitter (`lib/events/emit.ts`),
+  jobs-runner skeleton (`POST /api/jobs/process`, JOBS_SECRET-gated).
+- **`lib/booking/outbound.ts`** — single outbound chokepoint shared by chat + platform.
+
+Founder checkpoints before flipping: set `PUBLIC_BASE_URL`, apply migrations 006+007,
+manual phone walkthrough of both pages. Phases 4–6 (waitlist e2e, reminders,
+conversational-machinery removal) are scoped in TRANSITION_PLAN.md.
 
 ## What currently works (validated live and/or in sims)
 - End-to-end WhatsApp booking in Hebrew: greeting → any-order field collection →

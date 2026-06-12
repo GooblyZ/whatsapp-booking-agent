@@ -579,6 +579,53 @@ async function main() {
   const r21 = st21.turns[st21.turns.length - 1].text;
   console.log(`   [soft] recommendation names real services: ${/פן|פנים|תספור|צביע/.test(r21) ? "YES ✓" : `no ("${r21}") — prompt-level, non-blocking`}`);
 
+  console.log("\n================ SCENARIO 22: PLATFORM MODE (intent routing, no chat scheduling) ================");
+  // Pure: the platform persona drops every conversational-scheduling instruction.
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const inst = buildReceptionistInstruction(ctx, {
+      factsBlock: "facts", caps: { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false },
+      conversationContext: "", platformMode: true,
+    });
+    console.log("  [pure] platform persona has no detail-collection instructions:",
+      !inst.includes("collect service + day + time") && !inst.includes("AVAILABILITY block says the time is AVAILABLE") &&
+      inst.includes("BOOKING PAGE") && inst.includes("NEVER write a URL")
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  // Live: booking intent detected; reply collects nothing and offers no times.
+  {
+    const d22 = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "היי, אפשר לקבוע תור לתספורת למחר?", bookingBlock: "", platformMode: true,
+    });
+    const u22 = d22.turn?.understanding;
+    const intentDetected = u22?.appointmentIntent === "BOOK" || u22?.intent === "booking";
+    console.log(`  [live] booking intent detected for routing: ${intentDetected ? "PASS ✓" : `FAIL ✗ (intent=${u22?.intent} appt=${u22?.appointmentIntent})`}`);
+    console.log(`  [live] reply offers no concrete times: ${!/\d{1,2}:\d{2}/.test(d22.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
+    console.log(`  [live] reply claims no completed booking: ${!claimsBookingCompleted(d22.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
+  }
+
+  // Live: cancellation request → manage-intent detected (routes to self-service link).
+  {
+    const d22b = await runReceptionistTurn(ctx, {
+      conversationContext: "",
+      message: "אני רוצה לבטל את התור שלי",
+      bookingBlock: "EXISTING APPOINTMENTS (system-checked) for this customer:\n• 20/06 בשעה 16:00 — תספורת (confirmed)",
+      platformMode: true,
+    });
+    const u22b = d22b.turn?.understanding;
+    const manageIntent = u22b?.appointmentIntent === "CANCEL" || u22b?.intent === "cancel_request";
+    console.log(`  [live] cancel intent detected for routing: ${manageIntent ? "PASS ✓" : `FAIL ✗ (intent=${u22b?.intent} appt=${u22b?.appointmentIntent})`}`);
+  }
+
+  // Live: FAQ still answered from facts in platform mode (conversation quality intact).
+  {
+    const d22c = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "יש אצלכם חניה?", bookingBlock: "", platformMode: true,
+    });
+    console.log(`  [live] FAQ answered from facts: ${/חניה|בניין/.test(d22c.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22c.replyText}")`}`);
+  }
+
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");
   // LAST in the suite — it manipulates the process-global gemini health state.
   resetGeminiHealth();

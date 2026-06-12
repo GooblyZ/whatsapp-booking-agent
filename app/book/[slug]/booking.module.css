@@ -1,0 +1,331 @@
+/* Booking platform — mobile-first, RTL. Uses logical properties throughout. */
+
+.page {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 12px 24px;
+  background: #f6f7f9;
+  color: #16181d;
+}
+
+.card {
+  width: 100%;
+  max-width: 480px;
+  background: #ffffff;
+  border: 1px solid #e6e8ec;
+  border-radius: 16px;
+  padding: 24px 20px 28px;
+}
+
+.header {
+  text-align: center;
+  margin-block-end: 20px;
+}
+
+.businessName {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin-block-start: 4px;
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.footer {
+  margin-block-start: 16px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+/* ── Step indicator ─────────────────────────────────────────── */
+
+.steps {
+  display: flex;
+  gap: 6px;
+  list-style: none;
+  margin-block-end: 20px;
+}
+
+.steps li {
+  flex: 1;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  padding-block: 6px;
+  border-block-start: 3px solid #e6e8ec;
+  color: #9ca3af;
+}
+
+.stepActive { border-block-start-color: #16181d !important; color: #16181d !important; }
+.stepDone   { border-block-start-color: #a7f3d0 !important; color: #6b7280 !important; }
+.stepIdle   {}
+
+.stepTitle {
+  font-size: 18px;
+  font-weight: 700;
+  margin-block-end: 14px;
+}
+
+.backLink {
+  appearance: none;
+  border: none;
+  background: none;
+  font-size: 13px;
+  color: #6b7280;
+  cursor: pointer;
+  padding: 4px 0;
+  margin-block-end: 6px;
+}
+.backLink:hover { color: #16181d; }
+
+/* ── Service step ───────────────────────────────────────────── */
+
+.serviceList {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.serviceCard {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: start;
+  padding: 14px 16px;
+  min-height: 56px;
+  background: #ffffff;
+  border: 1px solid #e6e8ec;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.serviceCard:hover  { border-color: #16181d; }
+.serviceCard:active { background: #f6f7f9; }
+
+.serviceName { font-size: 16px; font-weight: 600; }
+.serviceMeta { font-size: 13px; color: #6b7280; font-variant-numeric: tabular-nums; }
+.serviceDesc { font-size: 13px; color: #6b7280; margin-block-start: 4px; }
+
+/* ── Day picker ─────────────────────────────────────────────── */
+
+.dayScroller {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-block-end: 8px;
+  margin-block-end: 14px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.dayScroller::-webkit-scrollbar { display: none; }
+
+.dayChip,
+.dayChipActive {
+  flex: 0 0 auto;
+  min-width: 64px;
+  min-height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid #e6e8ec;
+  background: #ffffff;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.dayChipActive {
+  border-color: #16181d;
+  background: #16181d;
+  color: #ffffff;
+}
+
+.dayChipLabel { font-size: 13px; font-weight: 600; }
+.dayChipSub   { font-size: 12px; opacity: 0.75; font-variant-numeric: tabular-nums; }
+
+/* ── Slot grid ──────────────────────────────────────────────── */
+
+.slotGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+@media (max-width: 360px) {
+  .slotGrid { grid-template-columns: repeat(3, 1fr); }
+}
+
+.slotChip,
+.slotChipActive {
+  min-height: 44px;
+  border-radius: 10px;
+  border: 1px solid #e6e8ec;
+  background: #ffffff;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.slotChip:hover { border-color: #16181d; }
+
+.slotChipActive {
+  border-color: #16181d;
+  background: #16181d;
+  color: #ffffff;
+}
+
+.slotSkeleton {
+  min-height: 44px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #f1f2f4 25%, #e9eaee 50%, #f1f2f4 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.2s linear infinite;
+}
+
+@keyframes shimmer {
+  to { background-position: -200% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slotSkeleton { animation: none; }
+  .serviceCard, .dayChip, .dayChipActive, .slotChip, .slotChipActive { transition: none; }
+}
+
+/* ── Details / form ─────────────────────────────────────────── */
+
+.summaryBox {
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #f6f7f9;
+  font-size: 14px;
+  font-weight: 600;
+  margin-block-end: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.form { display: flex; flex-direction: column; gap: 14px; }
+
+.label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.input {
+  min-height: 48px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid #d6d9de;
+  font-size: 16px; /* ≥16px prevents iOS zoom */
+  background: #ffffff;
+  color: inherit;
+}
+
+.input:focus-visible {
+  outline: 2px solid #16181d;
+  outline-offset: 1px;
+  border-color: #16181d;
+}
+
+.primaryBtn {
+  min-height: 52px;
+  border: none;
+  border-radius: 12px;
+  background: #16181d;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primaryBtn:disabled { opacity: 0.6; cursor: default; }
+
+.secondaryBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding-inline: 20px;
+  border-radius: 12px;
+  border: 1px solid #d6d9de;
+  font-size: 15px;
+  font-weight: 600;
+  color: inherit;
+}
+
+.finePrint {
+  font-size: 12px;
+  color: #6b7280;
+  text-align: center;
+}
+
+.errorNote {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+  font-size: 14px;
+  margin-block-end: 10px;
+}
+
+.emptyState {
+  padding: 18px 12px;
+  text-align: center;
+  color: #6b7280;
+  font-size: 14px;
+}
+
+/* ── Success ────────────────────────────────────────────────── */
+
+.success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+  padding-block: 12px;
+}
+
+.successIcon {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #ecfdf5;
+  color: #047857;
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.successTitle { font-size: 20px; font-weight: 700; }
+.successText  { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.successHint  { font-size: 13px; color: #6b7280; }
+
+/* Keyboard focus for every interactive element */
+.serviceCard:focus-visible,
+.dayChip:focus-visible,
+.dayChipActive:focus-visible,
+.slotChip:focus-visible,
+.slotChipActive:focus-visible,
+.primaryBtn:focus-visible,
+.secondaryBtn:focus-visible,
+.backLink:focus-visible {
+  outline: 2px solid #16181d;
+  outline-offset: 2px;
+}

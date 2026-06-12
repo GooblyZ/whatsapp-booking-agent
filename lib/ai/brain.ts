@@ -74,6 +74,8 @@ export interface TurnInput {
   stuckTurns?: number;           // loop detection signal (>=2 → change strategy)
   allowedTimes?: string[];       // extra exact times quotable this turn (slots, nearest)
   replyGuidance?: string;        // system-computed next-step hint for this reply
+  /** Platform mode: scheduling happens on the booking page; persona drops it. */
+  platformMode?: boolean;
 }
 
 export interface ReceptionistDecision {
@@ -208,6 +210,7 @@ export async function runReceptionistTurn(
     bookingBlock: input.bookingBlock,
     stuckTurns: input.stuckTurns,
     replyGuidance: input.replyGuidance,
+    platformMode: input.platformMode,
   });
   const turns: GeminiTurn[] = [
     ...(input.historyTurns ?? []),

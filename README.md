@@ -115,6 +115,9 @@ Copy `.env.example` to `.env.local` and fill in all values.
 | `META_ACCESS_TOKEN` | Meta permanent system user access token (or temporary test token). |
 | `META_PHONE_NUMBER_ID` | WhatsApp Business phone number ID from the Meta developer console. |
 | `META_API_VERSION` | Meta Graph API version (default: `v20.0`). Optional. |
+| `BOOKING_MODE` | `conversational` (default — pre-pivot chat booking) or `platform` — AI detects intent and routes to the web booking page (see `TRANSITION_PLAN.md`). |
+| `PUBLIC_BASE_URL` | Public origin for customer-facing links (`/book/[slug]`, `/appointment/[id]`) — the ngrok/deployed URL. Falls back to `http://localhost:3000` with a warning. |
+| `JOBS_SECRET` | Bearer secret for `POST /api/jobs/process` (event runner). Unset = runner disabled. |
 
 ---
 

@@ -8,7 +8,7 @@ export type AppointmentStatus =
   | "completed"
   | "no_show";
 
-export type AppointmentSource = "whatsapp" | "dashboard" | "manual" | "system";
+export type AppointmentSource = "whatsapp" | "dashboard" | "manual" | "system" | "platform";
 
 export type MessageDirection = "inbound" | "outbound";
 
@@ -195,6 +195,47 @@ export interface AISettings {
   ai_enabled: boolean;
   faq_enabled: boolean;
   intent_detection_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// ── Booking platform event layer (migration 007) ────────────────────────────
+
+export type PlatformEventStatus = "pending" | "processed" | "skipped";
+
+export interface PlatformEvent {
+  id: string;
+  business_id: string;
+  customer_id: string | null;
+  appointment_id: string | null;
+  type:
+    | "appointment_booked"
+    | "appointment_cancelled"
+    | "appointment_rescheduled"
+    | "reminder_due"
+    | "waitlist_opportunity"
+    | "abandoned_booking"
+    | "customer_inactive";
+  payload: Record<string, unknown>;
+  status: PlatformEventStatus;
+  created_at: string;
+  processed_at: string | null;
+}
+
+export type WaitlistStatus = "active" | "notified" | "converted" | "expired" | "cancelled";
+
+export interface WaitlistEntry {
+  id: string;
+  business_id: string;
+  customer_id: string;
+  service_id: string | null;
+  date_from: string | null;  // DATE, business-local
+  date_to: string | null;
+  time_from: string | null;  // "HH:MM"
+  time_to: string | null;
+  status: WaitlistStatus;
+  notified_at: string | null;
+  expires_at: string | null;
   created_at: string;
   updated_at: string;
 }

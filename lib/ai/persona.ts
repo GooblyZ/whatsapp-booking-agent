@@ -24,6 +24,12 @@ export interface PersonaInput {
   bookingBlock?: string;         // working memory render (+ existing appointments)
   stuckTurns?: number;
   replyGuidance?: string;
+  /**
+   * PLATFORM MODE (TRANSITION_PLAN.md): scheduling lives on the booking page,
+   * not in chat. The persona drops all conversational-scheduling behavior; the
+   * SYSTEM attaches booking/self-service links after the reply.
+   */
+  platformMode?: boolean;
 }
 
 // Behavioral tone profiles + a fact-free style exemplar (few-shot moves style far
@@ -99,27 +105,43 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `FACTS & HONESTY:`,
     `- Everything you state about the business comes ONLY from the facts below. If it's not there — say you don't have it and offer the business's contact. Accuracy beats helpfulness.`,
     `- If asked WHY you said or offered something earlier ("למה הצעת שעות אחרות?") — answer from the conversation's actual facts (e.g. the time was taken when checked, and may have freed up since). NEVER invent motives like "I thought it would suit you better". Such questions are QUESTIONS — not a request to change anything (no changeRequest). This fact-honesty applies to questions about the PAST only: when the customer CORRECTS a current detail, follow the corrections rule — switch, never argue.`,
-    `- Opening hours ≠ free slots. Free slots come ONLY from the AVAILABILITY block; if it evaluated the customer's requested time, relay that verdict exactly (available / taken + alternatives / outside hours / closed that day). If availability wasn't checked, find out the day — never guess slots.`,
-    `- Offer times like a person: which parts of the day have room, plus 2-3 concrete options. No list dumps.`,
+    p.platformMode
+      ? `- Opening hours ≠ free slots. Never state, guess, or imply which times are free — live availability lives on the booking page only.`
+      : `- Opening hours ≠ free slots. Free slots come ONLY from the AVAILABILITY block; if it evaluated the customer's requested time, relay that verdict exactly (available / taken + alternatives / outside hours / closed that day). If availability wasn't checked, find out the day — never guess slots.`,
+    p.platformMode ? `` : `- Offer times like a person: which parts of the day have room, plus 2-3 concrete options. No list dumps.`,
     ``,
     `APPOINTMENTS:`,
-    p.caps.canStartBooking
-      ? `- New booking: collect service + day + time in whatever order they come — but ask about ONE detail at a time ("איזה שירות?" first), never service+day+time bundled into a single message. When all three are set AND the availability block says the time is AVAILABLE — summarize warmly and ask them to reply *כן*; the system performs the booking only after that. Never claim anything was booked or changed before the system did it.`
-      : `- Booking isn't available right now — refer to the business if asked.`,
-    `- DRAFT vs EXISTING — critical distinction: changing a detail of the booking you are building RIGHT NOW ("בוא נחשוב על יום אחר", "בעצם שעה אחרת", rejecting the offered times) is normal conversation — set understanding.changeRequest to that field ("day"/"time"/"service"), keep appointmentIntent=BOOK, accept the change graciously ("סבבה, אז לא שלישי — איזה יום כן נוח לך?") and NEVER push to confirm the old detail. RESCHEDULE/CANCEL refer ONLY to appointments already in the EXISTING APPOINTMENTS list.`,
-    `- The EXISTING APPOINTMENTS list in working memory is system-checked truth: none → say you don't see an active appointment; several → ask which one they mean.`,
-    `- Moving/cancelling/changing an existing appointment is NOT possible in this chat yet — say so kindly and point to the business. A request to move an existing appointment is never a new booking.`,
-    `- Once a booking is completed, it's done — back to normal conversation.`,
+    ...(p.platformMode
+      ? [
+          `- Booking, changing and cancelling appointments happen on the business's BOOKING PAGE — never inside this chat. When the customer wants to book: react warmly, answer anything they actually asked, and let them know the booking link is attached right below your message — the SYSTEM adds the link automatically. NEVER write a URL yourself.`,
+          `- NEVER collect booking details (service/day/time), never offer time slots, and never say whether a specific time is free — the booking page shows live availability. If asked "is X free?", say the page shows exactly what's open right now.`,
+          `- The EXISTING APPOINTMENTS list in working memory is system-checked truth: none → say you don't see an active appointment; several → ask which one they mean.`,
+          `- Changing or cancelling an existing appointment works the same way — the system attaches a self-service link below your reply.`,
+          `- Never claim a booking, change or cancellation happened — only the booking page performs those.`,
+        ]
+      : [
+          p.caps.canStartBooking
+            ? `- New booking: collect service + day + time in whatever order they come — but ask about ONE detail at a time ("איזה שירות?" first), never service+day+time bundled into a single message. When all three are set AND the availability block says the time is AVAILABLE — summarize warmly and ask them to reply *כן*; the system performs the booking only after that. Never claim anything was booked or changed before the system did it.`
+            : `- Booking isn't available right now — refer to the business if asked.`,
+          `- DRAFT vs EXISTING — critical distinction: changing a detail of the booking you are building RIGHT NOW ("בוא נחשוב על יום אחר", "בעצם שעה אחרת", rejecting the offered times) is normal conversation — set understanding.changeRequest to that field ("day"/"time"/"service"), keep appointmentIntent=BOOK, accept the change graciously ("סבבה, אז לא שלישי — איזה יום כן נוח לך?") and NEVER push to confirm the old detail. RESCHEDULE/CANCEL refer ONLY to appointments already in the EXISTING APPOINTMENTS list.`,
+          `- The EXISTING APPOINTMENTS list in working memory is system-checked truth: none → say you don't see an active appointment; several → ask which one they mean.`,
+          `- Moving/cancelling/changing an existing appointment is NOT possible in this chat yet — say so kindly and point to the business. A request to move an existing appointment is never a new booking.`,
+          `- Once a booking is completed, it's done — back to normal conversation.`,
+        ]),
     p.caps.canAnswer ? `` : `- Do not answer detailed informational questions; refer to the business politely.`,
     ``,
     `=== BUSINESS FACTS (source of truth) ===`,
     p.factsBlock,
     `=== END FACTS ===`,
     ``,
-    `=== AVAILABILITY (system-checked; the only source of free slots) ===`,
-    (p.availabilityBlock ?? "").trim().length > 0 ? (p.availabilityBlock as string) : "Availability was not checked this turn (no concrete day known yet).",
-    `=== END AVAILABILITY ===`,
-    ``,
+    ...(p.platformMode
+      ? []
+      : [
+          `=== AVAILABILITY (system-checked; the only source of free slots) ===`,
+          (p.availabilityBlock ?? "").trim().length > 0 ? (p.availabilityBlock as string) : "Availability was not checked this turn (no concrete day known yet).",
+          `=== END AVAILABILITY ===`,
+          ``,
+        ]),
     p.nativeHistory
       ? `The conversation so far is provided as real chat turns before the current message. If older replies have a different style than YOUR VOICE above — the settings changed; follow the settings. Older turns may also predate changes to hours/services/prices — the BUSINESS FACTS and AVAILABILITY blocks always outrank anything claimed in history.`
       : [

@@ -202,9 +202,9 @@ CREATE TABLE IF NOT EXISTS appointments (
   status      TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'confirmed', 'cancelled', 'completed', 'no_show')),
 
-  -- whatsapp | dashboard | manual | system
+  -- whatsapp | dashboard | manual | system | platform (booking platform — migration 007)
   source      TEXT NOT NULL DEFAULT 'whatsapp'
-    CHECK (source IN ('whatsapp', 'dashboard', 'manual', 'system')),
+    CHECK (source IN ('whatsapp', 'dashboard', 'manual', 'system', 'platform')),
 
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -521,7 +521,52 @@ ALTER TABLE messages
 ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS wa_timestamp TIMESTAMPTZ;
 
--- 5. WhatsApp integration health (migration 006)
+-- 5. Booking platform events + waitlist (migration 007)
+--    The system DETECTS events; the AI COMMUNICATES them (TRANSITION_PLAN.md).
+CREATE TABLE IF NOT EXISTS events (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id    UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  customer_id    UUID REFERENCES customers(id) ON DELETE SET NULL,
+  appointment_id UUID REFERENCES appointments(id) ON DELETE SET NULL,
+  type TEXT NOT NULL CHECK (type IN (
+    'appointment_booked', 'appointment_cancelled', 'appointment_rescheduled',
+    'reminder_due', 'waitlist_opportunity', 'abandoned_booking', 'customer_inactive'
+  )),
+  payload      JSONB NOT NULL DEFAULT '{}',
+  status       TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'processed', 'skipped')),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_business_id    ON events(business_id);
+CREATE INDEX IF NOT EXISTS idx_events_pending        ON events(business_id, status, created_at)
+  WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_events_appointment_id ON events(appointment_id)
+  WHERE appointment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS waitlist_entries (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  service_id  UUID REFERENCES services(id) ON DELETE SET NULL,
+  date_from   DATE,
+  date_to     DATE,
+  time_from   TEXT,
+  time_to     TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'notified', 'converted', 'expired', 'cancelled')),
+  notified_at TIMESTAMPTZ,
+  expires_at  TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_business_id ON waitlist_entries(business_id);
+CREATE INDEX IF NOT EXISTS idx_waitlist_active      ON waitlist_entries(business_id, status)
+  WHERE status = 'active';
+
+-- 6. WhatsApp integration health (migration 006)
 --    Per-business delivery health; auth_failed suspends AI replies until the
 --    Meta token is reconnected (dashboard surfaces the alert).
 ALTER TABLE business_settings
