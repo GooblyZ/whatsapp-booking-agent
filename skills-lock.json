@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "skills": {
+    "code-review-skill": {
+      "source": "awesome-skills/code-review-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "4843230203c4da5f55a90ed9a67fe395688ae73d89f0a1b5e51f003b10418d13"
+    },
+    "differential-review": {
+      "source": "trailofbits/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/differential-review/skills/differential-review/SKILL.md",
+      "computedHash": "cf5156b1138aa3304d69189d922dae5def51dcf12900a1c518f00bd821a3e0c6"
+    },
+    "insecure-defaults": {
+      "source": "trailofbits/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/insecure-defaults/skills/insecure-defaults/SKILL.md",
+      "computedHash": "420c8a4a1979d5d0989248bd433f1770d7a8f463ae0efd42313e2d285057b476"
+    },
+    "make-interfaces-feel-better": {
+      "source": "jakubkrehel/make-interfaces-feel-better",
+      "sourceType": "github",
+      "skillPath": "skills/make-interfaces-feel-better/SKILL.md",
+      "computedHash": "2c3576e63d8c39d75ed327f1dcf6aab7aec0edf293a55f6cb3f7b8571974a01c"
+    },
+    "ss-a11y": {
+      "source": "bitjaru/styleseed",
+      "sourceType": "github",
+      "skillPath": "engine/.claude/skills/ss-a11y/SKILL.md",
+      "computedHash": "9327df02a08ba4089e90f5e4dd0cb876bc10b26a1b575054c2b3728bfcdd9741"
+    },
+    "ss-audit": {
+      "source": "bitjaru/styleseed",
+      "sourceType": "github",
+      "skillPath": "engine/.claude/skills/ss-audit/SKILL.md",
+      "computedHash": "65886afb601f27fcb15aa61d25812cb4d7b612c43b57f2947050cee792d847be"
+    },
+    "ss-copy": {
+      "source": "bitjaru/styleseed",
+      "sourceType": "github",
+      "skillPath": "engine/.claude/skills/ss-copy/SKILL.md",
+      "computedHash": "2511aeb7fcf5bf9b4e18c7ca01dbc86858fce38c93914dfe2526d90b1c84e8c8"
+    },
+    "ss-feedback": {
+      "source": "bitjaru/styleseed",
+      "sourceType": "github",
+      "skillPath": "engine/.claude/skills/ss-feedback/SKILL.md",
+      "computedHash": "feb2c590fb405b6151d8d780a4f641dcf6b0816fee99e02f171320ef4e69e62b"
+    },
+    "ss-flow": {
+      "source": "bitjaru/styleseed",
+      "sourceType": "github",
+      "skillPath": "engine/.claude/skills/ss-flow/SKILL.md",
+      "computedHash": "3c055a9b618a6721429d48f8e85777f54ccfe59bcfab539dfa33bf9b736ae472"
+    },
+    "supabase": {
+      "source": "supabase/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/supabase/SKILL.md",
+      "computedHash": "61638e85394d2e39d1109cbf607593afb9733e0de19cdf0b52ec9bc32d95ea74"
+    },
+    "supabase-postgres-best-practices": {
+      "source": "supabase/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/supabase-postgres-best-practices/SKILL.md",
+      "computedHash": "3639bed1f40b3fbadae79fee631c42c89b2d1f5c30b05d5aa3cca06422a6bbbc"
+    },
+    "typescript-react-patterns": {
+      "source": "leejpsd/typescript-react-patterns",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "ac6d15b3b7da79e54f63191a405eaabe0cdf02109f780b40edffea0dd788cd49"
+    },
+    "vercel-composition-patterns": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/composition-patterns/SKILL.md",
+      "computedHash": "575757e3e25761c8c562d6e395d29f0b76c98b1273c0bd72d88e6ab1bc9c7d42"
+    },
+    "vercel-react-best-practices": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/react-best-practices/SKILL.md",
+      "computedHash": "ca7b0c0c6e5f2750043f7f0cd72d16ac4e2abc48f9b5500d047a4b77a2506212"
+    },
+    "vercel-react-view-transitions": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/react-view-transitions/SKILL.md",
+      "computedHash": "c8952fc9127fa0564d0cb71dccb4215a5608ac933b5831104f09173a97a46f85"
+    },
+    "web-design-guidelines": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/web-design-guidelines/SKILL.md",
+      "computedHash": "f3bc47f890f42a44db1007ab390709ec368e4b8c089baee6b0007182236ac474"
+    }
+  }
+}
