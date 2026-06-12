@@ -19,7 +19,7 @@
 
 import type { DB } from "@/lib/booking/helpers";
 import type { BusinessAIContext } from "@/types/database";
-import { getAvailableSlots, isIntervalFree } from "@/lib/booking/availability";
+import { getAvailableSlots, isIntervalFree, todayInTZ } from "@/lib/booking/availability";
 import { dayNameHe, missingFields, type BookingSession } from "./booking-session";
 
 const MAX_SLOTS_IN_FACTS = 12;
@@ -29,6 +29,8 @@ export type RequestCategory = "closed_day" | "outside_hours" | "taken" | "availa
 export interface AvailabilityInfo {
   dateISO: string;
   dayName: string;                  // Hebrew day name
+  /** Today in the business timezone — lets guards resolve "היום"/"מחר" references. */
+  todayISO?: string;
   durationUsedMin: number;
   slots: string[];                  // open slots (capped)
   truncated: boolean;
@@ -86,6 +88,7 @@ export async function buildAvailabilityInfo(
     return {
       dateISO,
       dayName: dayNameHe(dateISO),
+      todayISO: todayInTZ(timezone),
       durationUsedMin: duration,
       slots: allSlots.slice(0, MAX_SLOTS_IN_FACTS),
       truncated: allSlots.length > MAX_SLOTS_IN_FACTS,

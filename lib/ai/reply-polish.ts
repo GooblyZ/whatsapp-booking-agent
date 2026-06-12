@@ -122,15 +122,33 @@ export function lacksUnavailabilityMarker(reply: string): boolean {
 
 /**
  * True when the reply claims the given (OPEN) day is closed — same-sentence
- * co-occurrence of the day name and a closed-word. (Live: "יום חמישי... אנחנו
+ * co-occurrence of a day reference and a closed-word. (Live: "יום חמישי... אנחנו
  * סגורים בו" while Thursday was open 09:00-18:00 with the availability block in
  * the prompt.) Sentence-scoped so "בשבת סגור, אבל שישי פתוח" never false-hits
- * for Friday.
+ * for Friday. Accepts multiple references so relative phrasings ("היום", "מחר")
+ * are caught when the session day IS today/tomorrow — the live miss the original
+ * weekday-only match allowed.
  */
-export function falseClosedClaim(reply: string, openDayName: string): boolean {
+export function falseClosedClaim(reply: string, openDayRefs: string | string[]): boolean {
+  const refs = (Array.isArray(openDayRefs) ? openDayRefs : [openDayRefs]).filter(Boolean);
   return reply
     .split(/[.!?\n]/)
-    .some((sentence) => sentence.includes(openDayName) && /סגור/.test(sentence));
+    .some((sentence) => /סגור/.test(sentence) && refs.some((r) => sentence.includes(r)));
+}
+
+/**
+ * How the customer may refer to this date: weekday name + "היום"/"מחר" when the
+ * date IS today/tomorrow (relative phrasings the weekday-only match missed live).
+ */
+export function dayRefsFor(dateISO: string, todayISO: string | undefined): string[] {
+  const refs = [dayNameHe(dateISO)];
+  if (todayISO) {
+    if (dateISO === todayISO) refs.push("היום");
+    const t = new Date(todayISO + "T12:00:00Z");
+    t.setUTCDate(t.getUTCDate() + 1);
+    if (dateISO === t.toISOString().split("T")[0]) refs.push("מחר");
+  }
+  return refs;
 }
 
 /**
@@ -193,7 +211,7 @@ export function applyVerdictAlignment(
   }
 
   if (!availability.hours.closed && session.dateISO === availability.dateISO &&
-      falseClosedClaim(replyText, dayNameHe(session.dateISO))) {
+      falseClosedClaim(replyText, dayRefsFor(session.dateISO, availability.todayISO))) {
     const [, m, d] = availability.dateISO.split("-");
     return {
       replyText: `יום ${availability.dayName} (${d}/${m}) דווקא פתוח אצלנו (${availability.hours.opens}-${availability.hours.closes}). ${nextStepQuestion(session) ?? ""}`.trim(),

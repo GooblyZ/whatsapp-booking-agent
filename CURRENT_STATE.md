@@ -60,13 +60,16 @@ conversational-machinery removal) are scoped in TRANSITION_PLAN.md.
 - **Degraded-mode FAQ** — during a 503 cooldown, FAQs get the "leave me details" notice
   instead of a real answer (facts exist; deterministic FAQ answering not built).
 
-## What is broken (known, reproduced, NOT yet fixed — owner asked for review first)
+## What is broken (known, reproduced — status as of 2026-06-12 post-pivot session)
 See PROJECT_CONTEXT.md "Known bugs" for the full list with fix ideas. Headlines:
-1. No "today is…" anchor in the prompt → model misstates today/tomorrow weekday facts.
-2. Past times today are offered/bookable (no now-filter in slot computation).
-3. Past DD/MM silently books NEXT YEAR (no year in echo).
-4. `falseClosedClaim` misses "היום/מחר" phrasing.
-5. Junk live data (services "בדיקה"/"שד", parking="שד") actively causes hallucinations.
+1. ~~No "today is…" anchor in the prompt~~ **FIXED** — persona now carries a per-turn
+   "TODAY/TOMORROW is…" anchor (both modes; sim scenario 23).
+2. Past times today offered/bookable — **fixed on the PLATFORM path** (+15-min lead);
+   still present in conversational-mode slot prompts (`getAvailableSlots` itself).
+3. Past DD/MM silently books NEXT YEAR (no year in echo) — open (conversational only).
+4. ~~`falseClosedClaim` misses "היום/מחר"~~ **FIXED** — relative day refs via
+   `dayRefsFor` + `AvailabilityInfo.todayISO` (sim scenario 23).
+5. Junk live data (services "בדיקה"/"שד", parking="שד") — open; clean via dashboard.
 
 ## What needs validation
 - A full clean live WhatsApp run on the CURRENT code (the last live sessions ran older

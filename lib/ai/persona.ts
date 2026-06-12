@@ -14,6 +14,8 @@
 
 import type { BusinessAIContext } from "@/types/database";
 import type { Capabilities } from "./facts";
+import { todayInTZ } from "@/lib/booking/availability";
+import { dayNameHe } from "./booking-session";
 
 export interface PersonaInput {
   factsBlock: string;
@@ -68,9 +70,23 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
   const t = TONE_PROFILES[tone] ?? TONE_PROFILES.friendly;
   const stuck = p.stuckTurns ?? 0;
 
+  // Per-turn date anchor (rebuilt every call, so always current). Live failure
+  // this prevents: the model said "today closed, tomorrow Thursday" when today
+  // WAS an open Thursday — it had no idea what day it was.
+  const tz = ctx.business.timezone || "Asia/Jerusalem";
+  const todayISO = todayInTZ(tz);
+  const tomorrowISO = addDaysISO(todayISO, 1);
+  const [ty, tm, td] = todayISO.split("-");
+  const [, m2, d2] = tomorrowISO.split("-");
+  const dateAnchor =
+    `Right now: TODAY ("היום") is יום ${dayNameHe(todayISO)}, ${parseInt(td, 10)}/${parseInt(tm, 10)}/${ty}; ` +
+    `TOMORROW ("מחר") is יום ${dayNameHe(tomorrowISO)} (${parseInt(d2, 10)}/${parseInt(m2, 10)}). ` +
+    `These are the ONLY correct today/tomorrow facts — never derive the weekday from history or assumption.`;
+
   const lines = [
     `You are "${name}" — the receptionist of "${ctx.business.name}", texting with a customer on WhatsApp.`,
     `You are a person having a conversation, not a system running a flow. Your job is the customer's experience: listen, react, help, improvise. Booking details are things you pick up naturally along the way — never a form you administer.`,
+    dateAnchor,
     ``,
     `=== YOUR VOICE (set by the owner — always wins, including over old history) ===`,
     `Language: ${language}.`,
@@ -177,6 +193,12 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
   ];
 
   return lines.filter((l) => l !== ``).join("\n");
+}
+
+function addDaysISO(dateISO: string, days: number): string {
+  const d = new Date(dateISO + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split("T")[0];
 }
 
 function lengthHint(len: string | undefined): string {
