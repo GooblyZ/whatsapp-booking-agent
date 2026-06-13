@@ -63,7 +63,9 @@ export interface AppointmentView {
   dateISO: string;       // business-local YYYY-MM-DD
   time: string;          // business-local HH:MM
   durationMinutes: number;
+  serviceId: string | null;
   serviceName: string | null;
+  customerId: string | null;
   business: PlatformBusiness;
   customerName: string | null;
   isFuture: boolean;
@@ -147,7 +149,7 @@ export function normalizePhone(input: string): string | null {
 }
 
 /** Finds or creates the customer; fills in the name when we learn it. */
-async function upsertPlatformCustomer(
+export async function ensurePlatformCustomer(
   db: DB, businessId: string, phone: string, name: string
 ): Promise<string | null> {
   const { data: existing } = await db
@@ -222,7 +224,7 @@ export async function createPlatformBooking(db: DB, input: CreateBookingInput): 
     return { ok: false, reason: "slot_taken", freshSlots: offered };
   }
 
-  const customerId = await upsertPlatformCustomer(db, input.businessId, input.phone, input.name);
+  const customerId = await ensurePlatformCustomer(db, input.businessId, input.phone, input.name);
   if (!customerId) return { ok: false, reason: "db_error" };
 
   const startTime = businessTimeToUTC(input.dateISO, input.time, timezone);
@@ -278,7 +280,7 @@ export async function createPlatformBooking(db: DB, input: CreateBookingInput): 
 export async function getAppointmentView(db: DB, appointmentId: string): Promise<AppointmentView | null> {
   const { data } = await db
     .from("appointments")
-    .select("id, status, start_time, end_time, business_id, customer_id, services(name), businesses(id, name, slug, timezone), customers(name)")
+    .select("id, status, start_time, end_time, business_id, customer_id, service_id, services(name), businesses(id, name, slug, timezone), customers(name)")
     .eq("id", appointmentId)
     .maybeSingle();
   if (!data) return null;
@@ -296,7 +298,9 @@ export async function getAppointmentView(db: DB, appointmentId: string): Promise
     dateISO,
     time: formatTimeInTZ(start, timezone),
     durationMinutes: Math.max(5, Math.round((end.getTime() - start.getTime()) / 60_000)),
+    serviceId: (data.service_id as string | null) ?? null,
     serviceName: (data.services as unknown as { name: string } | null)?.name ?? null,
+    customerId: (data.customer_id as string | null) ?? null,
     business: { id: biz.id, name: biz.name, slug: biz.slug, timezone },
     customerName: (data.customers as unknown as { name: string | null } | null)?.name ?? null,
     isFuture: start.getTime() > Date.now(),
@@ -319,9 +323,14 @@ export async function cancelPlatformAppointment(db: DB, appointmentId: string): 
     .in("status", ["pending", "confirmed"]);
   if (error) return { ok: false, reason: "db_error" };
 
+  // Freed-slot payload feeds the waitlist matcher (the runner detects matches).
   await emitEvent(db, view.business.id, "appointment_cancelled", {
+    customerId: view.customerId,
     appointmentId,
-    payload: { dateISO: view.dateISO, time: view.time, source: "platform" },
+    payload: {
+      dateISO: view.dateISO, time: view.time, source: "platform",
+      serviceId: view.serviceId, durationMinutes: view.durationMinutes,
+    },
   });
   return { ok: true };
 }
@@ -363,9 +372,14 @@ export async function reschedulePlatformAppointment(
     return { ok: false, reason: "db_error" };
   }
 
+  // The OLD slot is now free → feed the waitlist matcher with it.
   await emitEvent(db, view.business.id, "appointment_rescheduled", {
+    customerId: view.customerId,
     appointmentId,
-    payload: { fromDateISO: view.dateISO, fromTime: view.time, toDateISO: dateISO, toTime: time, source: "platform" },
+    payload: {
+      fromDateISO: view.dateISO, fromTime: view.time, toDateISO: dateISO, toTime: time,
+      source: "platform", serviceId: view.serviceId, durationMinutes: view.durationMinutes,
+    },
   });
   return { ok: true };
 }

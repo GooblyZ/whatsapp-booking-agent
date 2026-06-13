@@ -721,6 +721,26 @@ async function main() {
     console.log("  [pure] things_to_avoid becomes a hard guardrail:", inst.includes("HARD GUARDRAILS") && inst.includes("ייעוץ רפואי") ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 26: waitlist window matching (pure) ================");
+  {
+    const { withinWindow } = await import("../lib/booking/waitlist");
+    const slot = { dateISO: "2026-06-20", time: "14:30", serviceId: "svc1" };
+    // Unbounded entry matches anything.
+    console.log("  [pure] unbounded entry matches any slot:",
+      withinWindow(slot, { date_from: null, date_to: null, time_from: null, time_to: null }) ? "PASS ✓" : "FAIL ✗");
+    // In-window (inclusive bounds).
+    console.log("  [pure] slot inside date+time window matches:",
+      withinWindow(slot, { date_from: "2026-06-18", date_to: "2026-06-22", time_from: "12:00", time_to: "16:00" }) ? "PASS ✓" : "FAIL ✗");
+    // Out of date range / out of time range rejected.
+    console.log("  [pure] slot outside date window rejected:",
+      !withinWindow(slot, { date_from: "2026-06-21", date_to: "2026-06-25", time_from: null, time_to: null }) ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] slot outside time window rejected:",
+      !withinWindow(slot, { date_from: null, date_to: null, time_from: "15:00", time_to: "18:00" }) ? "PASS ✓" : "FAIL ✗");
+    // Boundary inclusive.
+    console.log("  [pure] window bounds are inclusive:",
+      withinWindow({ ...slot, time: "12:00" }, { date_from: "2026-06-20", date_to: "2026-06-20", time_from: "12:00", time_to: "14:00" }) ? "PASS ✓" : "FAIL ✗");
+  }
+
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");
   // LAST in the suite — it manipulates the process-global gemini health state.
   resetGeminiHealth();

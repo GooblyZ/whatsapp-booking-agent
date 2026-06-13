@@ -3,7 +3,7 @@
 import { useCallback, useState, useTransition } from "react";
 import type { PlatformService } from "@/lib/booking/platform";
 import type { DayOption } from "@/lib/booking/day-options";
-import { fetchDaySlotsAction, createBookingAction } from "./actions";
+import { fetchDaySlotsAction, createBookingAction, joinWaitlistAction } from "./actions";
 import styles from "./booking.module.css";
 
 interface Props {
@@ -172,9 +172,10 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
             )}
 
             {!loadingSlots && slots !== null && slots.length === 0 && (
-              <p className={styles.emptyState}>
-                אין שעות פנויות ביום הזה.<br />אפשר לבחור יום אחר מהרשימה למעלה.
-              </p>
+              <div className={styles.emptyState}>
+                <p>אין שעות פנויות ביום הזה.<br />אפשר לבחור יום אחר מהרשימה למעלה — או להישמר לתור שמתפנה.</p>
+                <WaitlistJoin slug={slug} serviceId={service.id} dateISO={dateISO} dayLabel={dayLabel?.label ?? ""} initialPhone={phone} />
+              </div>
             )}
 
             {!loadingSlots && slots !== null && slots.length > 0 && (
@@ -245,6 +246,65 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
         </section>
       )}
     </div>
+  );
+}
+
+/** Waitlist join — shown when a chosen day is fully booked. */
+function WaitlistJoin({
+  slug, serviceId, dateISO, dayLabel, initialPhone,
+}: { slug: string; serviceId: string; dateISO: string; dayLabel: string; initialPhone: string }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState(initialPhone);
+  const [state, setState] = useState<"idle" | "joined" | "already" | "error">("idle");
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, start] = useTransition();
+
+  if (state === "joined" || state === "already") {
+    return (
+      <p className={styles.waitlistDone} role="status">
+        {state === "already" ? "כבר שמרנו לך מקום ברשימת ההמתנה ליום הזה." : "מצוין! נעדכן אותך בוואטסאפ ברגע שמתפנה תור."}
+      </p>
+    );
+  }
+
+  if (!open) {
+    return (
+      <button type="button" className={styles.secondaryBtn} onClick={() => setOpen(true)}>
+        עדכנו אותי כשמתפנה תור{dayLabel ? ` ל${dayLabel}` : ""}
+      </button>
+    );
+  }
+
+  const submit = () => {
+    setErr(null);
+    start(async () => {
+      const res = await joinWaitlistAction({ slug, serviceId, dateISO, name, phone });
+      if (res.ok) { setState(res.alreadyActive ? "already" : "joined"); return; }
+      switch (res.code) {
+        case "invalid_name": setErr("אפשר לכתוב שם בעברית או באנגלית (2 תווים לפחות)."); break;
+        case "invalid_phone": setErr("מספר הטלפון לא נראה תקין."); break;
+        case "unavailable": setErr("רשימת ההמתנה לא זמינה כרגע — אפשר ליצור קשר עם העסק."); break;
+        default: setErr("משהו השתבש. אפשר לנסות שוב.");
+      }
+    });
+  };
+
+  return (
+    <form className={styles.waitlistForm} onSubmit={(e) => { e.preventDefault(); submit(); }}>
+      <input
+        className={styles.input} value={name} onChange={(e) => setName(e.target.value)}
+        placeholder="שם מלא" autoComplete="name" required minLength={2} maxLength={50} aria-label="שם מלא"
+      />
+      <input
+        className={styles.input} value={phone} onChange={(e) => setPhone(e.target.value)}
+        placeholder="050-1234567" type="tel" inputMode="tel" autoComplete="tel" dir="ltr" required aria-label="טלפון נייד"
+      />
+      {err && <p className={styles.errorNote} role="alert">{err}</p>}
+      <button type="submit" className={styles.primaryBtn} disabled={busy}>
+        {busy ? "שומרים מקום…" : "שמרו לי מקום ברשימת ההמתנה"}
+      </button>
+    </form>
   );
 }
 

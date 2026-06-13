@@ -1,14 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabase/server";
+import { processPendingEvents } from "@/lib/events/process";
 
-// Event-processing runner (TRANSITION_PLAN.md phase 3 skeleton).
+// Event-processing runner (TRANSITION_PLAN.md phases 4–5).
 //
-// Invoked manually or by an external scheduler (cron / Task Scheduler):
+// Invoked by an external scheduler (cron / Windows Task Scheduler / Vercel cron):
 //   POST /api/jobs/process  with  Authorization: Bearer ${JOBS_SECRET}
 //
-// Today it only REPORTS pending events — the reminder and waitlist
-// communicators plug in here (phases 4–5). Designed so adding a processor is
-// a switch-case, not an architecture change.
+// Each run:
+//   1. enqueues reminder_due events for appointments entering the reminder window
+//   2. processes pending events — waitlist opportunities (on freed slots) and
+//      reminders are sent through the outbound layer
+//
+// Fail-soft: before migration 007 the events/waitlist tables don't exist, so the
+// processor reports zero work instead of erroring.
 
 export async function POST(req: NextRequest) {
   const secret = process.env.JOBS_SECRET;
@@ -20,24 +25,6 @@ export async function POST(req: NextRequest) {
   }
 
   const db = supabaseServer();
-  const { data, error } = await db
-    .from("events")
-    .select("id, type")
-    .eq("status", "pending")
-    .order("created_at", { ascending: true })
-    .limit(200);
-
-  if (error) {
-    // Table missing until migration 007 — report instead of failing.
-    return NextResponse.json({ ok: true, pending: 0, note: `events table unavailable: ${error.message}` });
-  }
-
-  const byType: Record<string, number> = {};
-  for (const e of data ?? []) {
-    byType[e.type as string] = (byType[e.type as string] ?? 0) + 1;
-  }
-
-  // Future processors dispatch here (reminder_due → WhatsApp reminder,
-  // waitlist_opportunity → booking-opportunity message, …).
-  return NextResponse.json({ ok: true, pending: data?.length ?? 0, byType, processed: 0 });
+  const summary = await processPendingEvents(db);
+  return NextResponse.json({ ok: true, ...summary });
 }

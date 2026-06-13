@@ -5,8 +5,10 @@ import {
   getBusinessBySlug,
   getPlatformDaySlots,
   createPlatformBooking,
+  ensurePlatformCustomer,
   normalizePhone,
 } from "@/lib/booking/platform";
+import { joinWaitlist } from "@/lib/booking/waitlist";
 import { buildAppointmentLink } from "@/lib/config";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -72,4 +74,46 @@ export async function createBookingAction(input: {
     return { ok: false, code: "slot_taken", freshSlots: result.freshSlots };
   }
   return { ok: false, code: "error" };
+}
+
+export type JoinWaitlistActionResult =
+  | { ok: true; alreadyActive: boolean }
+  | { ok: false; code: "invalid_name" | "invalid_phone" | "invalid_input" | "unavailable" };
+
+/** Join the waitlist for a specific service on a specific (fully-booked) day. */
+export async function joinWaitlistAction(input: {
+  slug: string; serviceId: string; dateISO: string; name: string; phone: string;
+}): Promise<JoinWaitlistActionResult> {
+  const name = (input.name ?? "").trim();
+  if (!NAME_RE.test(name)) return { ok: false, code: "invalid_name" };
+  const phone = normalizePhone(input.phone ?? "");
+  if (!phone) return { ok: false, code: "invalid_phone" };
+  if (!DATE_RE.test(input.dateISO)) return { ok: false, code: "invalid_input" };
+
+  const db = supabaseServer();
+  const business = await getBusinessBySlug(db, input.slug);
+  if (!business) return { ok: false, code: "invalid_input" };
+
+  // Confirm the service belongs to the business (avoid cross-tenant ids).
+  const { data: service } = await db
+    .from("services")
+    .select("id")
+    .eq("id", input.serviceId)
+    .eq("business_id", business.id)
+    .eq("active", true)
+    .maybeSingle();
+  if (!service) return { ok: false, code: "invalid_input" };
+
+  const customerId = await ensurePlatformCustomer(db, business.id, phone, name);
+  if (!customerId) return { ok: false, code: "unavailable" };
+
+  const res = await joinWaitlist(db, {
+    businessId: business.id,
+    customerId,
+    serviceId: input.serviceId,
+    dateFrom: input.dateISO,
+    dateTo: input.dateISO,
+  });
+  if (res.ok) return { ok: true, alreadyActive: res.alreadyActive };
+  return { ok: false, code: "unavailable" };
 }

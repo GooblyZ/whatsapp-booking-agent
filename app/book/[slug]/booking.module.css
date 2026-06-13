@@ -267,6 +267,27 @@
 .detailKey { font-size: 13px; color: #6b7280; }
 .detailVal { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; text-align: end; }
 
+/* ── Waitlist (shown on a fully-booked day) ─────────────────── */
+
+.waitlistForm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-block-start: 12px;
+  text-align: start;
+}
+
+.waitlistDone {
+  margin-block-start: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #047857;
+  font-size: 14px;
+  font-weight: 600;
+}
+
 /* Screen-reader-only live announcements. */
 .srOnly {
   position: absolute;
