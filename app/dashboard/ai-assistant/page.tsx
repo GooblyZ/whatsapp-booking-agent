@@ -47,7 +47,7 @@ const LANGUAGES = [
 export default async function AIAssistantPage({
   searchParams,
 }: {
-  searchParams: Promise<{ saved?: string }>;
+  searchParams: Promise<{ saved?: string; persona?: string }>;
 }) {
   const businessId = getDefaultBusinessId();
   const [aiSettings, params] = await Promise.all([getAISettings(businessId), searchParams]);
@@ -56,12 +56,22 @@ export default async function AIAssistantPage({
     <div>
       <h1>הגדרות AI</h1>
       <p style={{ color: "#666", marginTop: "4px", marginBottom: "20px", fontSize: "14px" }}>
-        קבע כיצד הבוט מתקשר עם לקוחות.
-        מידע על העסק (חניה, FAQ, מדיניות) מנוהל ב
+        כאן מעצבים את הדמות של הקבלן הווירטואלי של העסק — איך הוא מדבר, מה האישיות שלו, ומה מותר ואסור לו.
+        מידע עובדתי (חניה, FAQ, מדיניות) מנוהל ב
         <a href="/dashboard/knowledge-base" style={{ color: "#0070f3" }}> בסיס הידע</a>.
       </p>
 
       <SaveBanner saved={params.saved} />
+
+      {params.persona === "deferred" && (
+        <div style={{
+          background: "#fff7ed", border: "1px solid #fed7aa", color: "#9a3412",
+          borderRadius: "8px", padding: "10px 14px", marginBottom: "16px", fontSize: "13px",
+        }}>
+          ההגדרות הבסיסיות נשמרו. שדות האישיות המתקדמים (סוג העסק, אופי, מה להימנע) יישמרו לאחר
+          הרצת מיגרציה <code>008_ai_settings_persona_depth.sql</code> ב-Supabase.
+        </div>
+      )}
 
       <form
         action={saveAISettingsAction}
@@ -145,6 +155,57 @@ export default async function AIAssistantPage({
           />
           <span style={hint}>השם שהבוט משתמש בו כשהוא מציג את עצמו.</span>
         </label>
+
+        {/* Business personality (migration 008) */}
+        <fieldset
+          style={{
+            border: "1px solid #e0e0e0", borderRadius: "8px", padding: "12px 16px",
+            margin: 0, display: "flex", flexDirection: "column", gap: "12px",
+          }}
+        >
+          <legend style={{ fontWeight: "600", fontSize: "14px", padding: "0 6px" }}>אישיות העסק</legend>
+          <p style={{ ...hint, margin: 0 }}>
+            ככל שתמלא יותר, כך הבוט ירגיש פחות כמו צ&apos;אטבוט גנרי ויותר כמו הקבלן/ית של העסק שלך.
+          </p>
+
+          <label style={fieldWrap}>
+            <span style={fieldLabel}>סוג העסק</span>
+            <input
+              name="business_type"
+              defaultValue={aiSettings?.business_type ?? ""}
+              placeholder="לדוגמה: מספרה, מרפאת שיניים, סטודיו לפילאטיס"
+              maxLength={120}
+              style={inputStyle}
+            />
+            <span style={hint}>ממסגר את כל אופי השיחה — קבלן של מרפאה מדבר אחרת מקבלן של מספרה.</span>
+          </label>
+
+          <label style={fieldWrap}>
+            <span style={fieldLabel}>אופי ודמות</span>
+            <textarea
+              name="persona_voice"
+              defaultValue={aiSettings?.persona_voice ?? ""}
+              rows={3}
+              placeholder="לדוגמה: חם ואישי, זוכר לקוחות קבועים, אוהב לפרגן, מדבר בגובה העיניים בלי רשמיות."
+              maxLength={1000}
+              style={{ ...inputStyle, resize: "vertical" }}
+            />
+            <span style={hint}>תיאור חופשי של האישיות — גובר על הטון הכללי שנבחר למטה.</span>
+          </label>
+
+          <label style={fieldWrap}>
+            <span style={fieldLabel}>דברים שאסור לעשות</span>
+            <textarea
+              name="things_to_avoid"
+              defaultValue={aiSettings?.things_to_avoid ?? ""}
+              rows={2}
+              placeholder="לדוגמה: אל תבטיח תור באותו היום; אל תדון במחירי מתחרים."
+              maxLength={1000}
+              style={{ ...inputStyle, resize: "vertical" }}
+            />
+            <span style={hint}>גבולות נוקשים שהבוט לעולם לא יחצה.</span>
+          </label>
+        </fieldset>
 
         {/* Customer communication language */}
         <label style={fieldWrap}>

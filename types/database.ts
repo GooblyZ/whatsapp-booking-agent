@@ -191,6 +191,11 @@ export interface AISettings {
   emoji_usage: AISettingsEmojiUsage;
   language: string;
   custom_instructions: string | null;
+  // Persona depth (migration 008 — optional until applied). Absent on read when
+  // the columns don't yet exist; the persona defaults gracefully.
+  business_type?: string | null;
+  persona_voice?: string | null;
+  things_to_avoid?: string | null;
   // AI control toggles — all default true. Disabling never affects bookings.
   ai_enabled: boolean;
   faq_enabled: boolean;

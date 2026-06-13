@@ -404,6 +404,11 @@ CREATE TABLE IF NOT EXISTS ai_settings (
 
   custom_instructions TEXT,
 
+  -- Persona depth (migration 008) — each business shapes its own receptionist.
+  business_type       TEXT,   -- "מספרה", "מרפאת שיניים", … frames the persona
+  persona_voice       TEXT,   -- richer free-text personality beyond the tone preset
+  things_to_avoid     TEXT,   -- explicit guardrails the receptionist must respect
+
   -- AI control toggles (see migration 005). Disabling AI never affects bookings.
   ai_enabled               BOOLEAN NOT NULL DEFAULT TRUE,  -- master switch for the Gemini layer
   faq_enabled              BOOLEAN NOT NULL DEFAULT TRUE,  -- answer FAQ questions

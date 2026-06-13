@@ -602,10 +602,13 @@ async function main() {
     const u22 = d22.turn?.understanding;
     const intentDetected = u22?.appointmentIntent === "BOOK" || u22?.intent === "booking";
     console.log(`  [live] booking intent detected for routing: ${intentDetected ? "PASS ✓" : `FAIL ✗ (intent=${u22?.intent} appt=${u22?.appointmentIntent})`}`);
-    // Opening-hours mentions are legitimate facts; what platform mode forbids is
-    // offering bookable SLOTS (a list of times, or "free at" claims).
+    // Opening-hours mentions and "see the available times on the page" are fine;
+    // what platform mode forbids is OFFERING bookable slots in chat — a list of
+    // times, or binding a concrete time to a free/taken claim ("16:00 פנוי").
     const timeTokens = d22.replyText.match(/\d{1,2}:\d{2}/g) ?? [];
-    const offersSlots = timeTokens.length >= 3 || /פנוי|התפנה|זמין/.test(d22.replyText);
+    const slotList = timeTokens.length >= 3;
+    const claimsSpecificFree = /\d{1,2}:\d{2}[^.!?\n]{0,12}(פנוי|זמין|מתאים|תפוס)|(פנוי|זמין|תפוס)[^.!?\n]{0,12}\d{1,2}:\d{2}/.test(d22.replyText);
+    const offersSlots = slotList || claimsSpecificFree;
     console.log(`  [live] reply offers no bookable slots: ${!offersSlots ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
     console.log(`  [live] reply claims no completed booking: ${!claimsBookingCompleted(d22.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
   }
@@ -691,6 +694,31 @@ async function main() {
       conversationContext: "", message: "אתם עושים גם החלקות קראטין?", bookingBlock: "", platformMode: true,
     });
     console.log(`  [soft] unknown service → no invented yes: ${!/בטח שכן|כן, אנחנו עושים|בהחלט עושים/.test(dEsc.replyText) ? "YES ✓" : `no ("${dEsc.replyText}")`}`);
+  }
+
+  console.log("\n================ SCENARIO 25: AI Settings persona depth (migration 008) ================");
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const caps = { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false };
+
+    // Unset → persona degrades gracefully (no orphan labels, no business-type clause).
+    const bare = buildReceptionistInstruction(makeCtx(), { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] persona omits depth fields when unset:",
+      !bare.includes("a , texting") && !bare.includes("HARD GUARDRAILS") && !bare.includes("How the owner describes")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // Set → all three shape the prompt.
+    const rich = makeCtx();
+    rich.aiSettings = {
+      ...rich.aiSettings!,
+      business_type: "מרפאת שיניים",
+      persona_voice: "רגוע ומרגיע, מסביר בסבלנות, אף פעם לא לוחץ",
+      things_to_avoid: "אל תיתן ייעוץ רפואי; אל תבטיח שאין כאב",
+    };
+    const inst = buildReceptionistInstruction(rich, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] business_type frames identity:", inst.includes("a מרפאת שיניים, texting") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] persona_voice injected (outranks preset):", inst.includes("How the owner describes this receptionist") && inst.includes("מסביר בסבלנות") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] things_to_avoid becomes a hard guardrail:", inst.includes("HARD GUARDRAILS") && inst.includes("ייעוץ רפואי") ? "PASS ✓" : "FAIL ✗");
   }
 
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");
