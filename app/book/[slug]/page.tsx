@@ -37,6 +37,10 @@ export default async function BookingPage({ params, searchParams }: PageProps) {
         <header className={styles.header}>
           <h1 className={styles.businessName}>{business.name}</h1>
           <p className={styles.subtitle}>קביעת תור אונליין</p>
+          <ul className={styles.trustChips} aria-label="יתרונות">
+            <li className={styles.trustChip}>אישור מיידי בוואטסאפ</li>
+            <li className={styles.trustChip}>שינוי וביטול בקליק</li>
+          </ul>
         </header>
         {services.length === 0 ? (
           <p className={styles.emptyState}>

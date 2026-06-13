@@ -83,20 +83,25 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
   };
 
   const dayLabel = days.find((d) => d.dateISO === dateISO);
-  const summary = service && time && dayLabel
-    ? `${service.name} · ${dayLabel.label} ${dayLabel.sub} · ${time}`
-    : "";
+  const detailRows: Array<[string, string]> = service && time && dayLabel
+    ? [
+        ["שירות", service.name],
+        ["מתי", `${dayLabel.label}, ${dayLabel.sub}`],
+        ["שעה", time],
+        ...(service.price != null ? [["מחיר", `₪${Number(service.price).toFixed(0)}`] as [string, string]] : []),
+      ]
+    : [];
 
   if (step === "done") {
     return (
       <div className={styles.success} role="status">
         <div className={styles.successIcon} aria-hidden>✓</div>
         <h2 className={styles.successTitle}>התור נקבע!</h2>
-        <p className={styles.successText}>{summary}</p>
+        <DetailCard rows={detailRows} />
         <p className={styles.successHint}>שלחנו אישור בוואטסאפ עם כל הפרטים.</p>
         {manageUrl && (
           <a className={styles.secondaryBtn} href={manageUrl}>
-            צפייה או שינוי התור
+            צפייה, שינוי או ביטול
           </a>
         )}
       </div>
@@ -114,12 +119,15 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
             {services.map((s) => (
               <li key={s.id}>
                 <button type="button" className={styles.serviceCard} onClick={() => pickService(s)}>
-                  <span className={styles.serviceName}>{s.name}</span>
-                  <span className={styles.serviceMeta}>
-                    {s.duration_minutes} דק׳
-                    {s.price != null && ` · ₪${Number(s.price).toFixed(0)}`}
+                  <span className={styles.serviceMain}>
+                    <span className={styles.serviceName}>{s.name}</span>
+                    <span className={styles.serviceMeta}>
+                      {s.duration_minutes} דק׳
+                      {s.price != null && ` · ₪${Number(s.price).toFixed(0)}`}
+                    </span>
+                    {s.description && <span className={styles.serviceDesc}>{s.description}</span>}
                   </span>
-                  {s.description && <span className={styles.serviceDesc}>{s.description}</span>}
+                  <span className={styles.chevron} aria-hidden>‹</span>
                 </button>
               </li>
             ))}
@@ -152,30 +160,38 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
 
           {error && <p className={styles.errorNote} role="alert">{error}</p>}
 
-          {loadingSlots && (
-            <div className={styles.slotGrid} aria-hidden>
-              {Array.from({ length: 8 }).map((_, i) => <span key={i} className={styles.slotSkeleton} />)}
-            </div>
-          )}
+          <div aria-live="polite" aria-busy={loadingSlots}>
+            <span className={styles.srOnly}>
+              {loadingSlots ? "טוען שעות פנויות" : slots === null ? "" : slots.length === 0 ? "אין שעות פנויות ביום שנבחר" : `${slots.length} שעות פנויות`}
+            </span>
 
-          {!loadingSlots && slots !== null && slots.length === 0 && (
-            <p className={styles.emptyState}>אין שעות פנויות ביום הזה — אפשר לבחור יום אחר.</p>
-          )}
+            {loadingSlots && (
+              <div className={styles.slotGrid} aria-hidden>
+                {Array.from({ length: 8 }).map((_, i) => <span key={i} className={styles.slotSkeleton} />)}
+              </div>
+            )}
 
-          {!loadingSlots && slots !== null && slots.length > 0 && (
-            <div className={styles.slotGrid}>
-              {slots.map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  className={t === time ? styles.slotChipActive : styles.slotChip}
-                  onClick={() => { setTime(t); setError(null); setStep("details"); }}
-                >
-                  {t}
-                </button>
-              ))}
-            </div>
-          )}
+            {!loadingSlots && slots !== null && slots.length === 0 && (
+              <p className={styles.emptyState}>
+                אין שעות פנויות ביום הזה.<br />אפשר לבחור יום אחר מהרשימה למעלה.
+              </p>
+            )}
+
+            {!loadingSlots && slots !== null && slots.length > 0 && (
+              <div className={styles.slotGrid} role="group" aria-label="שעות פנויות">
+                {slots.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    className={t === time ? styles.slotChipActive : styles.slotChip}
+                    onClick={() => { setTime(t); setError(null); setStep("details"); }}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
       )}
 
@@ -186,7 +202,7 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
           </button>
           <h2 className={styles.stepTitle}>כמעט סיימנו</h2>
 
-          <p className={styles.summaryBox}>{summary}</p>
+          <DetailCard rows={detailRows} />
 
           <form
             className={styles.form}
@@ -224,11 +240,26 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
             <button type="submit" className={styles.primaryBtn} disabled={submitting}>
               {submitting ? "קובעים את התור…" : "אישור וקביעת התור"}
             </button>
-            <p className={styles.finePrint}>נשלח אישור והתזכורות בוואטסאפ למספר הזה.</p>
+            <p className={styles.finePrint}>אישור והתזכורות יישלחו בוואטסאפ למספר הזה.</p>
           </form>
         </section>
       )}
     </div>
+  );
+}
+
+/** Labeled, tabular detail rows — used in both the confirm step and success. */
+function DetailCard({ rows }: { rows: Array<[string, string]> }) {
+  if (rows.length === 0) return null;
+  return (
+    <dl className={styles.detailCard}>
+      {rows.map(([k, v]) => (
+        <div key={k} className={styles.detailRow}>
+          <dt className={styles.detailKey}>{k}</dt>
+          <dd className={styles.detailVal}>{v}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
