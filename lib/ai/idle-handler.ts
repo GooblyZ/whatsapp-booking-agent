@@ -24,6 +24,7 @@ import { upsertConversationState } from "@/lib/booking/helpers";
 import { getBusinessAIContext } from "./context";
 import {
   getConversationContext, findTimeInHistory, didLastReplyFailToSend, renderUpcomingAppointments,
+  renderCustomerState,
 } from "./conversation";
 import { isGeminiCoolingDown, geminiCooldownRemainingMs } from "./gemini";
 import {
@@ -129,9 +130,10 @@ export async function runConversationTurn(
   if (rejection.unrejected.length > 0) {
     console.log(`[engine] customer reconsidered: [${rejection.unrejected.join(",")}] removed from rejected`);
   }
-  const [memory, upcomingBlock, lastSendFailed] = await Promise.all([
+  const [memory, upcomingBlock, customerBlock, lastSendFailed] = await Promise.all([
     getConversationContext(db, businessId, customerId),
     renderUpcomingAppointments(db, businessId, customerId, timezone),
+    renderCustomerState(db, businessId, customerId, timezone),
     didLastReplyFailToSend(db, businessId, customerId),
   ]);
 
@@ -152,7 +154,7 @@ export async function runConversationTurn(
   // 4. PREVIEW session for the prompt: prior session + this message's probe — so
   //    Gemini's working memory is never one turn behind what was just said.
   const preview = overlayProbe(prevSession, probe);
-  const bookingBlock = [renderSession(preview), upcomingBlock].filter(Boolean).join("\n\n");
+  const bookingBlock = [customerBlock, renderSession(preview), upcomingBlock].filter(Boolean).join("\n\n");
   let replyGuidance = buildReplyGuidance(preview, availability);
   if (lastSendFailed) {
     // Meta delivery failure recovery: the customer never received our last reply.

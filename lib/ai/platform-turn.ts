@@ -12,7 +12,7 @@ import type { DB } from "@/lib/booking/helpers";
 import { upsertConversationState } from "@/lib/booking/helpers";
 import { getBusinessAIContext } from "./context";
 import {
-  getConversationContext, renderUpcomingAppointments, didLastReplyFailToSend,
+  getConversationContext, renderUpcomingAppointments, renderCustomerState, didLastReplyFailToSend,
 } from "./conversation";
 import { isGeminiCoolingDown, geminiCooldownRemainingMs } from "./gemini";
 import {
@@ -63,12 +63,14 @@ export async function runPlatformTurn(
   }
 
   const timezone = ctx.business.timezone || "Asia/Jerusalem";
-  const [memory, upcomingBlock, lastSendFailed] = await Promise.all([
+  const [memory, upcomingBlock, customerBlock, lastSendFailed] = await Promise.all([
     getConversationContext(db, businessId, customerId),
     renderUpcomingAppointments(db, businessId, customerId, timezone),
+    renderCustomerState(db, businessId, customerId, timezone),
     didLastReplyFailToSend(db, businessId, customerId),
   ]);
   const lastAssistant = lastAssistantLine(memory.transcript);
+  const bookingBlock = [customerBlock, upcomingBlock].filter(Boolean).join("\n\n");
 
   // DEGRADED MODE: during a Gemini overload cooldown the platform story is
   // simple — the booking page IS the deterministic path. Route to it directly.
@@ -92,7 +94,7 @@ export async function runPlatformTurn(
     historyTurns: memory.turns,
     conversationContext: memory.transcript,
     message: messageText,
-    bookingBlock: upcomingBlock,
+    bookingBlock,
     replyGuidance,
     platformMode: true,
   });

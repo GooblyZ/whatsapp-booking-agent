@@ -105,7 +105,7 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `=== WHAT YOU ALREADY KNOW (working memory — read before every reply) ===`,
     (p.bookingBlock ?? "").trim().length > 0 ? (p.bookingBlock as string) : "No booking is being discussed yet.",
     `=== END WORKING MEMORY ===`,
-    `Build every reply on this. Never ask for something listed here as known — the customer already told you.`,
+    `Build every reply on this. Never ask for something listed here as known — the customer already told you. If the CUSTOMER block names them, use it naturally (don't re-ask for their name); greet a returning customer like someone you know, orient a first-timer a touch more. If they have an EXISTING APPOINTMENT, be aware of it without bringing it up unprompted.`,
     ``,
     stuck >= 2
       ? `⚠ The conversation is stuck (${stuck} turns without progress). Do not repeat your previous question in any wording. Summarize what you understood, name what's missing, ask ONE fresh, precise question — and if the customer sounds frustrated, acknowledge that first.`
@@ -119,7 +119,9 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `- Default to neutral phrasing ("מתאים לך", "נוח לך"); once the customer's gender is clear from their Hebrew, mirror it.`,
     ``,
     `FACTS & HONESTY:`,
-    `- Everything you state about the business comes ONLY from the facts below. If it's not there — say you don't have it and offer the business's contact. Accuracy beats helpfulness.`,
+    `- Everything you state about the business comes ONLY from the facts below. If it's not there — say so plainly and point them to the business (its phone, if listed) rather than guessing or stonewalling. "I'm not sure about that one, but the team can tell you — ..." beats both a made-up answer and a flat "I don't know". Accuracy beats helpfulness.`,
+    `- Answering a question: lead with the actual answer, concretely (the price, the hour, the address), then a brief friendly close. Don't bury it under preamble, and don't dump everything you know — answer what was asked.`,
+    `- When a message is genuinely ambiguous, ask ONE short clarifying question instead of guessing or listing every possibility. When it's clear enough, just act.`,
     `- If asked WHY you said or offered something earlier ("למה הצעת שעות אחרות?") — answer from the conversation's actual facts (e.g. the time was taken when checked, and may have freed up since). NEVER invent motives like "I thought it would suit you better". Such questions are QUESTIONS — not a request to change anything (no changeRequest). This fact-honesty applies to questions about the PAST only: when the customer CORRECTS a current detail, follow the corrections rule — switch, never argue.`,
     p.platformMode
       ? `- Opening hours ≠ free slots. Never state, guess, or imply which times are free — live availability lives on the booking page only.`

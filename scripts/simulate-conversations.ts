@@ -666,6 +666,33 @@ async function main() {
         ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 24: receptionist quality (customer-state, FAQ, escalation) ================");
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const inst24 = buildReceptionistInstruction(ctx, {
+      factsBlock: "facts", caps: { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false },
+      conversationContext: "",
+    });
+    // Pure: the persona instructs use of customer state + escalation + answer-first.
+    console.log("  [pure] persona has customer-state + escalation + answer-first guidance:",
+      inst24.includes("CUSTOMER block") && inst24.includes("point them to the business") && inst24.includes("lead with the actual answer")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // Live (soft): a returning customer named in the CUSTOMER block is greeted by name.
+    const dName = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "היי, מה שלומך?",
+      bookingBlock: "CUSTOMER (system-checked):\nName: דנה (use it naturally — don't ask for it again).\nReturning customer — 3 previous visits, most recent around 01/06. Treat them as someone who already knows the place; warmth over orientation.",
+      platformMode: true,
+    });
+    console.log(`  [soft] returning customer greeted by name: ${dName.replyText.includes("דנה") ? "YES ✓" : `no ("${dName.replyText}") — prompt-level, non-blocking`}`);
+
+    // Live: a fact the business doesn't have → honest escalation, no invention.
+    const dEsc = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "אתם עושים גם החלקות קראטין?", bookingBlock: "", platformMode: true,
+    });
+    console.log(`  [soft] unknown service → no invented yes: ${!/בטח שכן|כן, אנחנו עושים|בהחלט עושים/.test(dEsc.replyText) ? "YES ✓" : `no ("${dEsc.replyText}")`}`);
+  }
+
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");
   // LAST in the suite — it manipulates the process-global gemini health state.
   resetGeminiHealth();
