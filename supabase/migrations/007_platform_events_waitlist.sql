@@ -75,3 +75,13 @@ DROP TRIGGER IF EXISTS trg_updated_at ON waitlist_entries;
 CREATE TRIGGER trg_updated_at
   BEFORE UPDATE ON waitlist_entries
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- 4. Grants — the app connects as service_role. The base schema.sql GRANT only
+--    covered tables that existed at the time; tables created by this migration
+--    need their own grant or the server gets "permission denied" (42501) and the
+--    whole event/waitlist layer fails soft. ALTER DEFAULT PRIVILEGES prevents this
+--    class of bug for any future tables created by the current role.
+GRANT ALL ON public.events            TO service_role;
+GRANT ALL ON public.waitlist_entries  TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;

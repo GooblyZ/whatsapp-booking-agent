@@ -571,6 +571,15 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_business_id ON waitlist_entries(business
 CREATE INDEX IF NOT EXISTS idx_waitlist_active      ON waitlist_entries(business_id, status)
   WHERE status = 'active';
 
+-- The app connects as service_role. The GRANT ALL near the top of this file ran
+-- before events/waitlist_entries existed, so they need an explicit grant here
+-- (without it: "permission denied for table events", and the whole event/waitlist
+-- layer fails soft). ALTER DEFAULT PRIVILEGES stops this recurring for new tables.
+GRANT ALL ON public.events            TO service_role;
+GRANT ALL ON public.waitlist_entries  TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;
+
 -- 6. WhatsApp integration health (migration 006)
 --    Per-business delivery health; auth_failed suspends AI replies until the
 --    Meta token is reconnected (dashboard surfaces the alert).
