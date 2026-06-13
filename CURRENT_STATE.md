@@ -24,6 +24,26 @@ Founder checkpoints before flipping: set `PUBLIC_BASE_URL`, apply migrations 006
 manual phone walkthrough of both pages. Phases 4–6 (waitlist e2e, reminders,
 conversational-machinery removal) are scoped in TRANSITION_PLAN.md.
 
+### Phase 4+ progress (2026-06-13)
+- **Receptionist quality (both modes)**: per-turn CUSTOMER block (new/returning, name,
+  visit history — `renderCustomerState`); persona uses it (greet regulars by name);
+  sharper FAQ (answer-first), honest escalation, one-question ambiguity handling.
+- **Booking UX polish**: trust chips, structured detail card (confirm + success),
+  `aria-live` slot states, RTL/a11y, service-card affordances.
+- **AI Settings product area**: migration 008 (`business_type`/`persona_voice`/
+  `things_to_avoid`, NOT applied), strangler-safe `updateAISettings` (saves core if
+  the columns are missing), dashboard "אישיות העסק" section + deferred notice.
+- **Waitlist vertical slice**: join on fully-booked days; freed-slot matcher
+  (`lib/booking/waitlist.ts`); cancel/reschedule (platform + dashboard) emit freed
+  slots; `lib/events/process.ts` notifies the earliest waitlist match (FIFO, cap 1).
+- **Reminders**: `enqueueDueReminders` (24h window, idempotent) + reminder processor;
+  driven by `POST /api/jobs/process` (JOBS_SECRET-gated; 503 until set).
+- **Audit**: confirmed all appointment writes are deterministic (`flow.ts` +
+  `platform.ts`); `lib/ai/` never mutates appointments.
+- Sim scenarios added: 24 (receptionist quality), 25 (persona depth), 26 (waitlist
+  windows). Lint+build+full suite green.
+- New founder checkpoints: apply migration 008; set JOBS_SECRET + schedule the runner.
+
 ## What currently works (validated live and/or in sims)
 - End-to-end WhatsApp booking in Hebrew: greeting → any-order field collection →
   real availability check → deterministic "כן" confirmation → DB INSERT → receipt.

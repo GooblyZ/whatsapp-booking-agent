@@ -10,13 +10,19 @@ executes."* Next.js 16 + Supabase + Meta WhatsApp Cloud API + gemini-2.5-flash-l
 (single model, single call per turn).
 
 ## Current status
-- Phase 1–3 of the transition are BUILT and validated: booking page, self-service
+- Phase 1–4 of the transition are BUILT and validated: booking page + self-service
   page, `BOOKING_MODE` flag + AI intent routing, event/waitlist schema (migration 007,
-  NOT yet applied), fail-open event emitter, jobs-runner skeleton.
-- Lint ✅ Build ✅ — full sim suite green incl. new **scenario 22 (platform mode)**.
+  NOT applied), fail-open emitter + **event processor** (`lib/events/process.ts`),
+  jobs runner (`POST /api/jobs/process`).
+- Phase-4+ adds: **customer-state-aware persona** (greets regulars by name, sharper
+  FAQ/escalation), **polished booking UX** (trust chips, structured detail card,
+  a11y), **AI Settings product area** (migration 008 persona depth, strangler-safe),
+  and a **waitlist + reminder vertical slice** (fail-soft until 007 + JOBS_SECRET).
+- Lint ✅ Build ✅ — full sim suite green incl. scenarios 22–26.
 - **Live behavior is UNCHANGED**: `BOOKING_MODE` defaults to `conversational`.
   Flipping to `platform` is a founder action (requires `PUBLIC_BASE_URL`).
-- Battle-tested conversational stack remains intact as the fallback.
+- Audit confirmed: the AI never writes appointments — all writes are deterministic
+  (`flow.ts` + `platform.ts`).
 
 ## Biggest risks / founder checkpoints
 1. **Flip `BOOKING_MODE=platform`** only after setting `PUBLIC_BASE_URL` (ngrok URL)

@@ -54,11 +54,15 @@ and removed in a later cleanup phase once the platform path is live-proven.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Booking platform MVP: /book/[slug] (mobile-first RTL wizard), /appointment/[id] self-service | this transition |
-| 2 | BOOKING_MODE flag + AI intent-routing (platform persona, link appending), WhatsApp booking confirmations | this transition |
-| 3 | Event architecture: migration 007 (events, waitlist, source='platform'), fail-open emitter, /api/jobs/process runner skeleton | this transition |
-| 4 | Waitlist end-to-end (join via page, watcher on cancellation, AI outreach) | next |
-| 5 | Reminders (WhatsApp first; SMS/email via channel abstraction in events payload), calendar files (.ics generation → Google/Apple/Outlook) | next |
+| 1 | Booking platform MVP: /book/[slug] (mobile-first RTL wizard), /appointment/[id] self-service | ✅ done |
+| 2 | BOOKING_MODE flag + AI intent-routing (platform persona, link appending), WhatsApp booking confirmations | ✅ done |
+| 3 | Event architecture: migration 007 (events, waitlist, source='platform'), fail-open emitter, /api/jobs/process runner | ✅ done |
+| 4a | Receptionist quality: customer-state awareness (new/returning/name), sharper FAQ/escalation/ambiguity in the persona | ✅ done (cycle 1) |
+| 4b | Booking platform UX polish: trust chips, structured detail card, aria-live states, RTL/a11y | ✅ done (cycle 2) |
+| 4c | AI Settings product area: migration 008 (business_type/persona_voice/things_to_avoid), strangler-safe writes, dashboard | ✅ done (cycle 3) |
+| 4d | Waitlist vertical slice (join on full days, freed-slot matcher, FIFO notify) + reminder processor in the job runner | ✅ done (cycle 4) |
+| 5 | SMS/email reminder channels (channel abstraction in events payload), calendar files (.ics → Google/Apple/Outlook) | next |
+| 5b | Abandonment + inactivity re-engagement (needs start-tracking / inactivity scan — cadence + privacy is a founder decision) | foundation only |
 | 6 | Conversational-machinery removal + sim-suite rewrite around platform flows | after platform mode is live-proven |
 | 7 | AI settings deepening (per-business behavior packs, richer KB tooling) | continuous |
 
@@ -68,7 +72,13 @@ and removed in a later cleanup phase once the platform path is live-proven.
    (ngrok or deployed) URL so links resolve; a quick manual run through /book/[slug].
 2. **Apply migration `007_platform_events_waitlist.sql`** in the Supabase SQL editor
    (manual, like all migrations). Until applied: bookings still work — the code
-   fails soft (source falls back, events are skipped with a log line).
+   fails soft (source falls back, events/waitlist are skipped with a log line).
+2b. **Apply migration `008_ai_settings_persona_depth.sql`** to enable the advanced
+   AI-settings fields (business_type / persona_voice / things_to_avoid). Until then
+   the dashboard saves core settings and shows a notice; the persona omits them.
+2c. **Set `JOBS_SECRET`** and schedule `POST /api/jobs/process` (cron / Task Scheduler /
+   Vercel cron, e.g. every 15 min) to drive reminders + waitlist notifications.
+   Without it the runner returns 503 and nothing is sent.
 3. **Phone verification policy** for public bookings (MVP ships without OTP; appointment
    links are unguessable uuids; consider WhatsApp-code verification before real launch).
 4. **Deleting the conversational machinery** (phase 6) once satisfied with platform mode.
