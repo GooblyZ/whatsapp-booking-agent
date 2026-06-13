@@ -183,18 +183,33 @@ export function extractTimeTokens(text: string): Set<string> {
   return out;
 }
 
+/** Digit runs (>= 9 digits) that look like phone numbers, in any text. */
+export function extractPhoneDigits(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of (text ?? "").matchAll(PHONE_RE)) {
+    const digits = m[0].replace(/\D/g, "");
+    if (digits.length >= 9) out.add(digits);
+  }
+  return out;
+}
+
 /**
  * Returns ok=false (with reasons) if the reply quotes any unverifiable price,
  * time, or phone number. In strict mode the caller discards the reply on failure.
  *
  * `allowedTimes` — extra exact times provided as facts this turn (open slots,
  * nearest alternatives). `echoTimes` — times the customer mentioned themselves.
+ * `allowedPhones` — phone numbers that are legitimately quotable even though they
+ * aren't the business phone: the CUSTOMER's own number (it identifies them, it is
+ * not a "contact us" claim) and any phone the customer typed themselves. The fence
+ * still catches an INVENTED/wrong business number — its real job.
  */
 export function verifyGrounding(
   reply: string,
   index: FactIndex,
   allowedTimes: Set<string> = new Set(),
-  echoTimes: Set<string> = new Set()
+  echoTimes: Set<string> = new Set(),
+  allowedPhones: Set<string> = new Set()
 ): GroundingResult {
   const violations: string[] = [];
   const kinds = new Set<"price" | "time" | "phone">();
@@ -224,15 +239,19 @@ export function verifyGrounding(
     kinds.add("time");
   }
 
-  // 3. Phone — any phone-like run must match the real business phone.
+  // 3. Phone — a phone-like run must match the business phone OR an explicitly
+  //    allowed number (the customer's own phone identifies them; it is not a
+  //    "contact us" claim). An invented/other business number still fails — that
+  //    is the fence's real purpose.
   if (index.phoneDigits) {
+    const matchesEither = (a: string, b: string) => a === b || a.endsWith(b) || b.endsWith(a);
     for (const m of text.matchAll(PHONE_RE)) {
       const digits = m[0].replace(/\D/g, "");
       if (digits.length < 9) continue;
-      if (digits !== index.phoneDigits && !index.phoneDigits.endsWith(digits) && !digits.endsWith(index.phoneDigits)) {
-        violations.push(`phone ${digits} does not match business phone`);
-        kinds.add("phone");
-      }
+      if (matchesEither(digits, index.phoneDigits)) continue;
+      if ([...allowedPhones].some((p) => p.length >= 9 && matchesEither(digits, p))) continue;
+      violations.push(`phone ${digits} does not match business phone`);
+      kinds.add("phone");
     }
   }
 

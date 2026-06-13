@@ -97,6 +97,7 @@ export async function runPlatformTurn(
     bookingBlock,
     replyGuidance,
     platformMode: true,
+    customerPhone,
   });
 
   let replyText = decision.replyText;

@@ -18,7 +18,7 @@ import type { GeminiTurn, GeminiUsage } from "./gemini";
 import { geminiGenerateConversation } from "./gemini";
 import { buildFacts, formatFacts, buildFactIndex, type BusinessFacts, type Capabilities } from "./facts";
 import { buildReceptionistInstruction } from "./persona";
-import { verifyGrounding, extractTimeTokens } from "./grounding";
+import { verifyGrounding, extractTimeTokens, extractPhoneDigits } from "./grounding";
 import { buildContextReply, type BookingSession } from "./booking-session";
 import { renderVerdictReplyHe, type AvailabilityInfo } from "./availability-facts";
 import type { AIEventResponseType } from "./events";
@@ -76,6 +76,9 @@ export interface TurnInput {
   replyGuidance?: string;        // system-computed next-step hint for this reply
   /** Platform mode: scheduling happens on the booking page; persona drops it. */
   platformMode?: boolean;
+  /** The customer's own phone — exempt from the business-phone grounding fence
+   *  (it identifies the customer; it is not a business-contact claim). */
+  customerPhone?: string;
 }
 
 export interface ReceptionistDecision {
@@ -267,8 +270,17 @@ export async function runReceptionistTurn(
   const index = buildFactIndex(facts);
   const allowedTimes = new Set(input.allowedTimes ?? []);
   const echoTimes = extractTimeTokens(input.message);
+  // The customer's own number + any phone they typed are quotable (not a business
+  // claim). Live bug: in platform mode the booking link carries ?p=<customerPhone>,
+  // so the customer's phone landed in history → the model echoed it → the fence
+  // wrongly flagged it as a non-business phone and suppressed the booking link.
+  const allowedPhones = extractPhoneDigits(input.message);
+  if (input.customerPhone) {
+    const d = input.customerPhone.replace(/\D/g, "");
+    if (d.length >= 9) allowedPhones.add(d);
+  }
 
-  const grounding = verifyGrounding(turn.reply, index, allowedTimes, echoTimes);
+  const grounding = verifyGrounding(turn.reply, index, allowedTimes, echoTimes, allowedPhones);
   if (!grounding.ok) {
     console.warn(`[ai] grounding failed: ${grounding.violations.join("; ")}`);
     return fallback(groundingFallback(facts, grounding.kinds), "grounding_failed", "grounding_failed", {

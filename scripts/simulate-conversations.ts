@@ -31,7 +31,8 @@ import {
 import { isIntervalFree, todayInTZ } from "../lib/booking/availability";
 import { supabaseServer } from "../lib/supabase/server";
 import { renderAvailabilityInfo, renderVerdictReplyHe, type AvailabilityInfo } from "../lib/ai/availability-facts";
-import { extractExplicitTime, extractTimeTokens } from "../lib/ai/grounding";
+import { extractExplicitTime, extractTimeTokens, verifyGrounding } from "../lib/ai/grounding";
+import { buildFacts, buildFactIndex } from "../lib/ai/facts";
 import { findTimeInHistory, applyConversationGap, type ConversationTurn } from "../lib/ai/conversation";
 import { isCancelIntent, parseYesNo } from "../lib/booking/flow";
 
@@ -696,7 +697,7 @@ async function main() {
     console.log(`  [soft] unknown service → no invented yes: ${!/בטח שכן|כן, אנחנו עושים|בהחלט עושים/.test(dEsc.replyText) ? "YES ✓" : `no ("${dEsc.replyText}")`}`);
   }
 
-  console.log("\n================ SCENARIO 25: AI Settings persona depth (migration 008) ================");
+  console.log("\n================ SCENARIO 25: AI Settings persona axes + precedence (redesign) ================");
   {
     const { buildReceptionistInstruction } = await import("../lib/ai/persona");
     const caps = { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false };
@@ -704,21 +705,33 @@ async function main() {
     // Unset → persona degrades gracefully (no orphan labels, no business-type clause).
     const bare = buildReceptionistInstruction(makeCtx(), { factsBlock: "facts", caps, conversationContext: "" });
     console.log("  [pure] persona omits depth fields when unset:",
-      !bare.includes("a , texting") && !bare.includes("HARD GUARDRAILS") && !bare.includes("How the owner describes")
+      !bare.includes("a , texting") && !bare.includes("HARD RULES") && !bare.includes("in the owner's own words")
         ? "PASS ✓" : "FAIL ✗");
+    // Format axis is ALWAYS present (it owns length/emoji unconditionally).
+    console.log("  [pure] format block always present (length/emoji own their axis):",
+      bare.includes("HOW YOU WRITE") && bare.includes("these limits ALWAYS hold") ? "PASS ✓" : "FAIL ✗");
 
-    // Set → all three shape the prompt.
+    // Set → identity, the single personality authority, and hard rules all shape the prompt.
     const rich = makeCtx();
     rich.aiSettings = {
       ...rich.aiSettings!,
       business_type: "מרפאת שיניים",
-      persona_voice: "רגוע ומרגיע, מסביר בסבלנות, אף פעם לא לוחץ",
+      custom_instructions: "רגוע ומרגיע, מסביר בסבלנות, אף פעם לא לוחץ",
       things_to_avoid: "אל תיתן ייעוץ רפואי; אל תבטיח שאין כאב",
     };
     const inst = buildReceptionistInstruction(rich, { factsBlock: "facts", caps, conversationContext: "" });
     console.log("  [pure] business_type frames identity:", inst.includes("a מרפאת שיניים, texting") ? "PASS ✓" : "FAIL ✗");
-    console.log("  [pure] persona_voice injected (outranks preset):", inst.includes("How the owner describes this receptionist") && inst.includes("מסביר בסבלנות") ? "PASS ✓" : "FAIL ✗");
-    console.log("  [pure] things_to_avoid becomes a hard guardrail:", inst.includes("HARD GUARDRAILS") && inst.includes("ייעוץ רפואי") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] personality is THE character authority (owner's words lead):",
+      inst.includes("This is who you are, in the owner's own words") && inst.includes("מסביר בסבלנות") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] things_to_avoid becomes a hard rule that overrides everything:",
+      inst.includes("HARD RULES") && inst.includes("ייעוץ רפואי") ? "PASS ✓" : "FAIL ✗");
+
+    // PRECEDENCE: the headline conflict (short length vs a wordy character) resolves
+    // deterministically in the prompt — format is stated to win on its own axis.
+    const shortRich = makeCtx({ length: "short", custom: "תמיד מסביר בפירוט רב ובאריכות" });
+    const shortInst = buildReceptionistInstruction(shortRich, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] length wins over a 'be detailed' personality (format precedence stated):",
+      shortInst.includes("ONE short sentence") && shortInst.includes("these limits ALWAYS hold") ? "PASS ✓" : "FAIL ✗");
   }
 
   console.log("\n================ SCENARIO 26: waitlist window matching (pure) ================");
@@ -739,6 +752,43 @@ async function main() {
     // Boundary inclusive.
     console.log("  [pure] window bounds are inclusive:",
       withinWindow({ ...slot, time: "12:00" }, { date_from: "2026-06-20", date_to: "2026-06-20", time_from: "12:00", time_to: "14:00" }) ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 27: platform link not blocked by customer phone (grounding) ================");
+  {
+    // Business phone from makeCtx is "03-1234567" → digits "031234567".
+    const idx = buildFactIndex(buildFacts(makeCtx()));
+    const customerPhone = "972502201340";          // the live customer's number
+    const allowed = new Set([customerPhone]);
+    // A platform-mode reply that echoes the customer's own number (as happened
+    // live, where the booking link carried ?p=<phone> into history).
+    const replyWithCustomerPhone = "בטח! שלחתי לך קישור לקביעת תור. אם תרצה, נעדכן את 972502201340.";
+
+    // (a) Customer's own phone is allowed → grounded → no fallback → link can attach.
+    console.log("  [pure] customer's own phone does NOT fail grounding:",
+      verifyGrounding(replyWithCustomerPhone, idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (b) Root-cause proof: WITHOUT the allowance the same reply was being rejected
+    //     (this is the live bug — fence flagged the customer phone).
+    console.log("  [pure] (root cause) same reply WAS rejected before the fix:",
+      !verifyGrounding(replyWithCustomerPhone, idx).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (c) Protection preserved: an INVENTED/other number (not business, not allowed)
+    //     still fails — the fence still catches wrong-business contact claims.
+    console.log("  [pure] invented/other phone STILL fails (wrong-business protection):",
+      !verifyGrounding("תתקשרו אלינו למספר 0509999999 לפרטים.", idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (d) The real business phone is still quotable.
+    console.log("  [pure] business phone still passes grounding:",
+      verifyGrounding("אפשר להתקשר אלינו: 03-1234567", idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (e) customerPhone threads to the brain without breaking normal platform routing.
+    const dPlat = await runReceptionistTurn(makeCtx(), {
+      conversationContext: "", message: "אפשר לקבוע תור לתספורת?", bookingBlock: "",
+      platformMode: true, customerPhone,
+    });
+    const uPlat = dPlat.turn?.understanding;
+    console.log(`  [live] booking intent still detected with customerPhone set: ${dPlat.ok && (uPlat?.appointmentIntent === "BOOK" || uPlat?.intent === "booking") ? "PASS ✓" : `FAIL ✗ (ok=${dPlat.ok} intent=${uPlat?.intent})`}`);
   }
 
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");
