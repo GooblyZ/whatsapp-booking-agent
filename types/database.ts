@@ -178,24 +178,40 @@ export interface KnowledgeBaseItem {
   updated_at: string;
 }
 
+/** @deprecated Replaced by the free-text personality description (custom_instructions).
+ *  Retained only as a READ-ONLY back-compat fallback for configs that never set one. */
 export type AISettingsTone = "friendly" | "professional" | "luxury" | "casual";
 export type AISettingsResponseLength = "short" | "medium" | "long";
 export type AISettingsEmojiUsage = "none" | "low" | "medium";
+/** Assistant's own grammatical gender for Hebrew self-reference. Default neutral. */
+export type AISettingsGender = "neutral" | "female" | "male";
 
 export interface AISettings {
   id: string;
   business_id: string;
+  // IDENTITY
   assistant_name: string;
-  tone: AISettingsTone;
+  /** Assistant self-reference gender (Hebrew is gendered). Optional until migration 010. */
+  assistant_gender?: AISettingsGender;
+  // WRITING STYLE (format) — independent of personality.
   response_length: AISettingsResponseLength;
   emoji_usage: AISettingsEmojiUsage;
   language: string;
+  // PERSONALITY — ONE natural-language description is the entire voice authority.
+  // The owner describes the receptionist; the persona scaffold translates it into
+  // behavior. No competing personality control, so precedence is never ambiguous.
   custom_instructions: string | null;
-  // Persona depth (migration 008 — optional until applied). Absent on read when
-  // the columns don't yet exist; the persona defaults gracefully.
-  business_type?: string | null;
-  persona_voice?: string | null;
+  // HARD RULES — guardrails that override personality.
   things_to_avoid?: string | null;
+  /**
+   * @deprecated Replaced by custom_instructions. READ-ONLY back-compat fallbacks so
+   * older configs keep working with no data migration; never written by the UI.
+   */
+  tone?: AISettingsTone;
+  /** @deprecated Dropped from UI/persona (the AI knows the business from facts/KB). */
+  business_type?: string | null;
+  /** @deprecated Merged into custom_instructions by migration 009. READ-ONLY fallback. */
+  persona_voice?: string | null;
   // AI control toggles — all default true. Disabling never affects bookings.
   ai_enabled: boolean;
   faq_enabled: boolean;

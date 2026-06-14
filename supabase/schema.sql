@@ -386,28 +386,37 @@ CREATE TABLE IF NOT EXISTS ai_settings (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   business_id         UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
 
+  -- IDENTITY
   assistant_name      TEXT NOT NULL DEFAULT 'Assistant',
+  -- Assistant's own grammatical gender for Hebrew SELF-reference (migration 010).
+  -- "neutral" = pre-existing behavior. Does NOT change phrasing toward the customer.
+  assistant_gender    TEXT NOT NULL DEFAULT 'neutral'
+    CHECK (assistant_gender IN ('neutral', 'female', 'male')),
 
-  -- friendly | professional | luxury | casual
-  tone                TEXT NOT NULL DEFAULT 'friendly'
-    CHECK (tone IN ('friendly', 'professional', 'luxury', 'casual')),
-
+  -- WRITING STYLE (format) — independent of personality.
   -- short | medium | long
   response_length     TEXT NOT NULL DEFAULT 'medium'
     CHECK (response_length IN ('short', 'medium', 'long')),
-
   -- none | low | medium
   emoji_usage         TEXT NOT NULL DEFAULT 'low'
     CHECK (emoji_usage IN ('none', 'low', 'medium')),
-
   language            TEXT NOT NULL DEFAULT 'en',
 
+  -- PERSONALITY: ONE natural-language description is the entire voice authority.
+  -- The owner describes the receptionist; the persona scaffold translates it into
+  -- behavior. Loses only to format limits (length/emoji) and to things_to_avoid.
   custom_instructions TEXT,
 
-  -- Persona depth (migration 008) — each business shapes its own receptionist.
-  business_type       TEXT,   -- "מספרה", "מרפאת שיניים", … frames the persona
-  persona_voice       TEXT,   -- richer free-text personality beyond the tone preset
-  things_to_avoid     TEXT,   -- explicit guardrails the receptionist must respect
+  -- HARD RULES: guardrails that override personality.
+  things_to_avoid     TEXT,
+
+  -- DEPRECATED (retained for back-compat only; retired from UI + persona):
+  --   tone          — legacy 4-way preset; persona reads it as a silent fallback
+  --                   for older configs that never set a description.
+  --   business_type — the AI now learns the business from facts/services/KB instead.
+  tone                TEXT NOT NULL DEFAULT 'friendly'
+    CHECK (tone IN ('friendly', 'professional', 'luxury', 'casual')),
+  business_type       TEXT,
 
   -- AI control toggles (see migration 005). Disabling AI never affects bookings.
   ai_enabled               BOOLEAN NOT NULL DEFAULT TRUE,  -- master switch for the Gemini layer

@@ -39,7 +39,7 @@ import { isCancelIntent, parseYesNo } from "../lib/booking/flow";
 const TZ = "Asia/Jerusalem";
 
 function makeCtx(overrides: Partial<{
-  tone: string; emoji: string; length: string; custom: string | null;
+  tone: string; emoji: string; length: string; custom: string | null; gender: string;
 }> = {}): BusinessAIContext {
   return {
     business: {
@@ -58,6 +58,7 @@ function makeCtx(overrides: Partial<{
       response_length: (overrides.length ?? "medium") as never,
       emoji_usage: (overrides.emoji ?? "low") as never,
       language: "he", custom_instructions: overrides.custom ?? null,
+      assistant_gender: (overrides.gender ?? "neutral") as never,
       ai_enabled: true, faq_enabled: true, intent_detection_enabled: true,
       created_at: "", updated_at: "",
     },
@@ -697,41 +698,64 @@ async function main() {
     console.log(`  [soft] unknown service → no invented yes: ${!/בטח שכן|כן, אנחנו עושים|בהחלט עושים/.test(dEsc.replyText) ? "YES ✓" : `no ("${dEsc.replyText}")`}`);
   }
 
-  console.log("\n================ SCENARIO 25: AI Settings persona axes + precedence (redesign) ================");
+  console.log("\n================ SCENARIO 25: 'Define your receptionist' — one description + axes ================");
   {
     const { buildReceptionistInstruction } = await import("../lib/ai/persona");
     const caps = { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false };
 
-    // Unset → persona degrades gracefully (no orphan labels, no business-type clause).
-    const bare = buildReceptionistInstruction(makeCtx(), { factsBlock: "facts", caps, conversationContext: "" });
-    console.log("  [pure] persona omits depth fields when unset:",
-      !bare.includes("a , texting") && !bare.includes("HARD RULES") && !bare.includes("in the owner's own words")
+    // New business: tone column defaults to 'friendly', no description → sensible
+    // persona via the back-compat path. No orphan labels; format always present.
+    const bare = buildReceptionistInstruction(makeCtx({ custom: null }), { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] new business (no description) → sensible persona, no hard rules:",
+      bare.includes("genuinely likes people") && !bare.includes("HARD RULES")
         ? "PASS ✓" : "FAIL ✗");
-    // Format axis is ALWAYS present (it owns length/emoji unconditionally).
     console.log("  [pure] format block always present (length/emoji own their axis):",
       bare.includes("HOW YOU WRITE") && bare.includes("these limits ALWAYS hold") ? "PASS ✓" : "FAIL ✗");
 
-    // Set → identity, the single personality authority, and hard rules all shape the prompt.
+    // Truly empty config (no description AND no legacy tone) → built-in default character.
+    const emptyCtx = makeCtx({ custom: null });
+    emptyCtx.aiSettings = { ...emptyCtx.aiSettings!, tone: undefined as never };
+    const empty = buildReceptionistInstruction(emptyCtx, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] empty config (no tone either) → built-in default persona:",
+      empty.includes("warm, helpful and professional") ? "PASS ✓" : "FAIL ✗");
+
+    // The description is the SINGLE voice authority; hard rules override; identity has
+    // NO business-type clause anymore (the AI learns the business from facts/KB).
     const rich = makeCtx();
     rich.aiSettings = {
       ...rich.aiSettings!,
-      business_type: "מרפאת שיניים",
+      business_type: "מרפאת שיניים", // set but must NOT leak into identity now
       custom_instructions: "רגוע ומרגיע, מסביר בסבלנות, אף פעם לא לוחץ",
       things_to_avoid: "אל תיתן ייעוץ רפואי; אל תבטיח שאין כאב",
     };
     const inst = buildReceptionistInstruction(rich, { factsBlock: "facts", caps, conversationContext: "" });
-    console.log("  [pure] business_type frames identity:", inst.includes("a מרפאת שיניים, texting") ? "PASS ✓" : "FAIL ✗");
-    console.log("  [pure] personality is THE character authority (owner's words lead):",
+    console.log("  [pure] business_type no longer leaks into identity:",
+      !inst.includes("מרפאת שיניים") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] description is THE character authority (owner's words lead):",
       inst.includes("This is who you are, in the owner's own words") && inst.includes("מסביר בסבלנות") ? "PASS ✓" : "FAIL ✗");
     console.log("  [pure] things_to_avoid becomes a hard rule that overrides everything:",
       inst.includes("HARD RULES") && inst.includes("ייעוץ רפואי") ? "PASS ✓" : "FAIL ✗");
 
-    // PRECEDENCE: the headline conflict (short length vs a wordy character) resolves
-    // deterministically in the prompt — format is stated to win on its own axis.
-    const shortRich = makeCtx({ length: "short", custom: "תמיד מסביר בפירוט רב ובאריכות" });
-    const shortInst = buildReceptionistInstruction(shortRich, { factsBlock: "facts", caps, conversationContext: "" });
-    console.log("  [pure] length wins over a 'be detailed' personality (format precedence stated):",
+    // PRECEDENCE: short length still wins over a wordy character (format owns its axis).
+    const shortInst = buildReceptionistInstruction(
+      makeCtx({ length: "short", custom: "תמיד מסביר בפירוט רב ובאריכות" }),
+      { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] length wins over a 'be detailed' personality:",
       shortInst.includes("ONE short sentence") && shortInst.includes("these limits ALWAYS hold") ? "PASS ✓" : "FAIL ✗");
+
+    // Assistant gender drives Hebrew SELF-reference only (default neutral = no line).
+    const fem = buildReceptionistInstruction(makeCtx({ gender: "female" }), { factsBlock: "facts", caps, conversationContext: "" });
+    const masc = buildReceptionistInstruction(makeCtx({ gender: "male" }), { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] gender self-reference: female→feminine, male→masculine, neutral→none:",
+      fem.includes("feminine Hebrew") && masc.includes("masculine Hebrew") && !bare.includes("Hebrew (\"אני")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // Back-compat: a config with ONLY a legacy tone (no description) still gets a character.
+    const legacy = makeCtx({ custom: null });
+    legacy.aiSettings = { ...legacy.aiSettings!, tone: "luxury" as never };
+    const legacyInst = buildReceptionistInstruction(legacy, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] legacy tone-only config still yields a persona (back-compat):",
+      legacyInst.includes("high-end concierge") ? "PASS ✓" : "FAIL ✗");
   }
 
   console.log("\n================ SCENARIO 26: waitlist window matching (pure) ================");

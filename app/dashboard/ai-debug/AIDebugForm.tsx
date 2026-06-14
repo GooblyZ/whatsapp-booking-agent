@@ -204,7 +204,7 @@ export function AIDebugForm() {
               >
                 <div>שם: <strong>{state.appliedSettings.assistantName}</strong></div>
                 <div>שפה: <strong>{state.appliedSettings.language}</strong></div>
-                <div>טון: <strong>{state.appliedSettings.tone}</strong></div>
+                <div>מין הדמות: <strong>{state.appliedSettings.gender}</strong></div>
                 <div>אורך: <strong>{state.appliedSettings.responseLength}</strong></div>
                 <div>אמוג&#39;י: <strong>{state.appliedSettings.emojiUsage}</strong></div>
                 <div>הוראות מיוחדות: <strong>{state.appliedSettings.hasCustomInstructions ? "כן" : "לא"}</strong></div>

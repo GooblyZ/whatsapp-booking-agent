@@ -1,9 +1,9 @@
 import { supabaseServer } from "@/lib/supabase/server";
 import type {
   AISettings,
-  AISettingsTone,
   AISettingsResponseLength,
   AISettingsEmojiUsage,
+  AISettingsGender,
 } from "@/types/database";
 
 export async function getAISettings(businessId: string): Promise<AISettings | null> {
@@ -17,67 +17,74 @@ export async function getAISettings(businessId: string): Promise<AISettings | nu
 }
 
 export interface UpdateAISettingsInput {
+  // IDENTITY
   assistant_name?: string;
-  tone?: AISettingsTone;
+  assistant_gender?: AISettingsGender;
+  // WRITING STYLE (format)
   response_length?: AISettingsResponseLength;
   emoji_usage?: AISettingsEmojiUsage;
   language?: string;
+  // PERSONALITY — the single natural-language voice authority.
   custom_instructions?: string | null;
-  // Persona depth (migration 008) — may not exist in the DB yet.
-  business_type?: string | null;
-  persona_voice?: string | null;
+  // HARD RULES
   things_to_avoid?: string | null;
   // AI control toggles — disabling never affects the booking flow.
   ai_enabled?: boolean;
   faq_enabled?: boolean;
   intent_detection_enabled?: boolean;
+  // NOTE: `tone` and `business_type` are intentionally NOT writable — they are
+  // retired from the UI/persona (read-only back-compat columns only).
 }
 
-/** Columns that have existed since before the persona-depth migration. */
-const CORE_KEYS = [
-  "assistant_name", "tone", "response_length", "emoji_usage", "language",
-  "custom_instructions", "ai_enabled", "faq_enabled", "intent_detection_enabled",
-] as const;
-
-/** Columns added by migration 008 — absent until the owner applies it. */
-const EXTENDED_KEYS = ["business_type", "persona_voice", "things_to_avoid"] as const;
-
-/** True when the DB rejected an unknown column (migration 008 not applied yet). */
+/** Recognizes a Postgres/PostgREST "unknown column" rejection (migration not applied). */
 function isMissingColumnError(error: { code?: string; message?: string }): boolean {
   if (error.code === "PGRST204" || error.code === "42703") return true;
   const msg = error.message ?? "";
   return /column/i.test(msg) && /(schema cache|does not exist)/i.test(msg);
 }
 
+/** Extracts the offending column name from a missing-column error, when present. */
+function missingColumnName(error: { message?: string }): string | null {
+  const msg = error.message ?? "";
+  // PostgREST: Could not find the 'assistant_gender' column of 'ai_settings' …
+  const a = msg.match(/find the '([^']+)' column/i);
+  if (a) return a[1];
+  // Postgres 42703: column "assistant_gender" of relation "ai_settings" does not exist
+  const b = msg.match(/column "([^"]+)"/i);
+  if (b) return b[1];
+  return null;
+}
+
 /**
- * Upserts AI settings. Strangler-safe: attempts the full payload, and if the DB
- * rejects an unknown persona-depth column (migration 008 not yet applied),
- * retries with only the core columns so the dashboard never breaks. Returns
- * whether the extended persona fields were actually persisted.
+ * Upserts AI settings. Strangler-safe across partially-migrated databases: it sends
+ * the full payload, and on an "unknown column" rejection it drops ONLY the offending
+ * column and retries (so e.g. a not-yet-applied `assistant_gender` never blocks a
+ * `things_to_avoid` that does have a column). Returns whether everything persisted.
  */
 export async function updateAISettings(
   businessId: string,
   data: UpdateAISettingsInput
-): Promise<{ extendedPersisted: boolean }> {
+): Promise<{ fullyPersisted: boolean; droppedColumns: string[] }> {
   const db = supabaseServer();
-  const sentExtended = EXTENDED_KEYS.some((k) => k in data);
+  const payload: Record<string, unknown> = { business_id: businessId, ...data };
+  const dropped: string[] = [];
 
-  const { error } = await db
-    .from("ai_settings")
-    .upsert({ business_id: businessId, ...data }, { onConflict: "business_id" });
+  // At most a few rounds — one per missing column. Bounded to avoid any loop.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const { error } = await db.from("ai_settings").upsert(payload, { onConflict: "business_id" });
+    if (!error) return { fullyPersisted: dropped.length === 0, droppedColumns: dropped };
 
-  if (!error) return { extendedPersisted: sentExtended };
+    if (!isMissingColumnError(error)) throw new Error(error.message);
 
-  if (sentExtended && isMissingColumnError(error)) {
-    const core: Record<string, unknown> = { business_id: businessId };
-    for (const k of CORE_KEYS) if (k in data) core[k] = (data as Record<string, unknown>)[k];
-    const { error: retryError } = await db
-      .from("ai_settings")
-      .upsert(core, { onConflict: "business_id" });
-    if (retryError) throw new Error(retryError.message);
-    console.warn("[ai-settings] persona-depth columns not present — saved core settings only (apply migration 008)");
-    return { extendedPersisted: false };
+    const col = missingColumnName(error);
+    if (col && col !== "business_id" && col in payload) {
+      delete payload[col];
+      dropped.push(col);
+      console.warn(`[ai-settings] column '${col}' not present — saved without it (apply the pending migration)`);
+      continue;
+    }
+    // Missing-column error we couldn't pin to a name: nothing safe left to strip.
+    throw new Error(error.message);
   }
-
-  throw new Error(error.message);
+  throw new Error("[ai-settings] upsert still failing after dropping unknown columns");
 }
