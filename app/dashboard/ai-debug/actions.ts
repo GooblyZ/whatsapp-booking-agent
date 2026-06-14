@@ -56,7 +56,7 @@ export interface AIDebugState {
   systemPrompt?: string;
   appliedSettings?: {
     assistantName: string;
-    tone: string;
+    gender: string;
     language: string;
     responseLength: string;
     emojiUsage: string;
@@ -176,7 +176,7 @@ export async function runAIDebug(_prev: AIDebugState, formData: FormData): Promi
       }),
       appliedSettings: {
         assistantName: ai?.assistant_name?.trim() || "Assistant",
-        tone: ai?.tone || "friendly",
+        gender: ai?.assistant_gender || "neutral",
         language: ai?.language?.trim() || "he",
         responseLength: ai?.response_length || "medium",
         emojiUsage: ai?.emoji_usage || "low",

@@ -1,0 +1,636 @@
+/* ============================================================================
+   Booking platform stylesheet  —  shared by /book/[slug] and /appointment/[id]
+   Mobile-first, RTL Hebrew, customer-facing.
+
+   Design goals: clear hierarchy, obvious touch targets, premium-but-calm.
+   Cross-browser invariants baked in here (learned from real iOS Safari testing):
+     1. The page forces a LIGHT color-scheme. The app-global dark-mode variables
+        (globals.css) must never turn a customer's booking link dark — that made
+        chip text white-on-white ("empty"-looking, still clickable).
+     2. EVERY control resets -webkit-appearance and inherits font + color, so iOS
+        Safari can't paint its native button/input chrome over our chips.
+     3. Colors are explicit on every interactive element — never inherited — so a
+        device theme can't wash anything out.
+   ========================================================================== */
+
+.page {
+  /* ── scoped design tokens ─────────────────────────────────────────── */
+  --bg: #f4f5f8;
+  --surface: #ffffff;
+  --surface-2: #f6f7f9;
+  --ink: #14161b;
+  --ink-soft: #5a6270;
+  --ink-faint: #949aa6;
+  --line: #e7e9ef;
+  --line-strong: #d7dbe2;
+  --brand: #15171c;
+  --brand-hover: #2c2f37;
+  --on-brand: #ffffff;
+  --accent: #0f7a55;
+  --accent-bg: #e9f8f1;
+  --accent-line: #b4e5d0;
+  --danger: #b42318;
+  --danger-bg: #fef3f2;
+  --danger-line: #fca99f;
+
+  --r-sm: 10px;
+  --r: 14px;
+  --r-lg: 18px;
+  --r-pill: 999px;
+
+  --shadow-card: 0 1px 3px rgba(20, 22, 27, 0.06), 0 10px 28px -14px rgba(20, 22, 27, 0.18);
+  --shadow-pop: 0 6px 18px -6px rgba(20, 22, 27, 0.4);
+  --tap: 160ms cubic-bezier(0.2, 0.7, 0.3, 1);
+
+  /* Theme-stable: ignore the device's dark mode for this customer surface. */
+  color-scheme: light;
+  font-family: var(--font-heebo), -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  padding: max(16px, env(safe-area-inset-top)) 14px max(20px, env(safe-area-inset-bottom));
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page ::selection {
+  background: rgba(21, 23, 28, 0.12);
+}
+
+.card {
+  width: 100%;
+  max-width: 460px;
+  margin-block-start: clamp(8px, 4vh, 40px);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 22px 18px 24px;
+  box-shadow: var(--shadow-card);
+}
+
+/* ── Header / branding ─────────────────────────────────────────────── */
+
+.header {
+  text-align: center;
+  margin-block-end: 22px;
+}
+
+.monogram {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 12px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-pill);
+  background: var(--brand);
+  color: var(--on-brand);
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1;
+  user-select: none;
+}
+
+.businessName {
+  font-size: 23px;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}
+
+.subtitle {
+  margin-block-start: 4px;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+
+.trustChips {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-block-start: 14px;
+}
+
+.trustChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-pill);
+  padding: 5px 11px;
+}
+
+.trustChip::before {
+  content: "✓";
+  font-size: 11px;
+}
+
+.footer {
+  margin-block-start: 18px;
+  font-size: 12px;
+  color: var(--ink-faint);
+  text-align: center;
+}
+
+/* ── Step indicator ────────────────────────────────────────────────── */
+
+.steps {
+  display: flex;
+  gap: 6px;
+  list-style: none;
+  margin-block-end: 22px;
+}
+
+.steps li {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  transition: color var(--tap);
+}
+
+.steps li::before {
+  content: "";
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--line);
+  transition: background-color var(--tap);
+}
+
+.stepActive { color: var(--ink); }
+.stepActive::before { background: var(--brand); }
+.stepDone { color: var(--accent); }
+.stepDone::before { background: var(--accent); }
+.stepIdle {}
+
+.stepTitle {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-block-end: 14px;
+}
+
+/* ── Shared control reset (kills iOS Safari native chrome) ──────────── */
+
+.serviceCard,
+.dayChip,
+.dayChipActive,
+.slotChip,
+.slotChipActive,
+.primaryBtn,
+.secondaryBtn,
+.backLink,
+.input {
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: inherit;
+  font-size: 100%;
+  color: var(--ink);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.serviceCard,
+.dayChip,
+.dayChipActive,
+.slotChip,
+.slotChipActive,
+.primaryBtn,
+.secondaryBtn {
+  cursor: pointer;
+  user-select: none;
+}
+
+/* ── Back link ─────────────────────────────────────────────────────── */
+
+.backLink {
+  border: none;
+  background: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  padding: 6px 2px;
+  margin-block-end: 8px;
+  transition: color var(--tap);
+}
+.backLink:hover { color: var(--ink); }
+.backLink:active { color: var(--ink); }
+
+/* ── Service step ──────────────────────────────────────────────────── */
+
+.serviceList {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.serviceCard {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: start;
+  padding: 15px 16px;
+  min-height: 60px;
+  background: var(--surface);
+  border: 1.5px solid var(--line);
+  border-radius: var(--r);
+  transition: border-color var(--tap), background-color var(--tap), transform var(--tap), box-shadow var(--tap);
+}
+.serviceCard:hover { border-color: var(--line-strong); box-shadow: var(--shadow-card); }
+.serviceCard:active { background: var(--surface-2); transform: scale(0.99); }
+
+.serviceMain { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.serviceName { font-size: 16px; font-weight: 700; line-height: 1.25; }
+.serviceMeta {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.serviceDesc {
+  font-size: 13px;
+  color: var(--ink-soft);
+  margin-block-start: 3px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Drill-in affordance. RTL: inline-end is visually the left edge. */
+.chevron {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  font-size: 24px;
+  line-height: 1;
+}
+
+/* ── Day picker ────────────────────────────────────────────────────── */
+
+.dayScroller {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-block-end: 10px;
+  margin-block-end: 16px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+  /* Fade the inline-end edge to signal "more days →" */
+  -webkit-mask-image: linear-gradient(to left, transparent 0, #000 28px);
+  mask-image: linear-gradient(to left, transparent 0, #000 28px);
+}
+.dayScroller::-webkit-scrollbar { display: none; }
+
+.dayChip,
+.dayChipActive {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+  min-width: 66px;
+  min-height: 62px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 9px 11px;
+  border-radius: var(--r);
+  border: 1.5px solid var(--line);
+  background: var(--surface);
+  transition: border-color var(--tap), background-color var(--tap), color var(--tap), transform var(--tap), box-shadow var(--tap);
+}
+.dayChip:active { transform: scale(0.97); }
+
+.dayChipActive {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: var(--on-brand);
+  box-shadow: var(--shadow-pop);
+}
+
+.dayChipLabel { font-size: 13px; font-weight: 700; }
+.dayChipSub { font-size: 12px; opacity: 0.72; font-variant-numeric: tabular-nums; }
+.dayChipActive .dayChipSub { opacity: 0.85; }
+
+/* ── Slot grid ─────────────────────────────────────────────────────── */
+
+.slotGrid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+@media (max-width: 360px) {
+  .slotGrid { grid-template-columns: repeat(3, 1fr); }
+}
+
+.slotChip,
+.slotChipActive {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 0 4px;
+  border-radius: var(--r-sm);
+  border: 1.5px solid var(--line);
+  background: var(--surface);
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  transition: border-color var(--tap), background-color var(--tap), color var(--tap), transform var(--tap), box-shadow var(--tap);
+}
+.slotChip:hover { border-color: var(--line-strong); }
+.slotChip:active { transform: scale(0.96); }
+
+.slotChipActive {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: var(--on-brand);
+  box-shadow: var(--shadow-pop);
+}
+
+.slotSkeleton {
+  min-height: 48px;
+  border-radius: var(--r-sm);
+  background: linear-gradient(90deg, #eef0f3 25%, #e4e7ec 50%, #eef0f3 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.2s linear infinite;
+}
+
+@keyframes shimmer {
+  to { background-position: -200% 0; }
+}
+
+/* ── Details / form ────────────────────────────────────────────────── */
+
+.summaryBox {
+  padding: 13px 15px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-size: 14px;
+  font-weight: 600;
+  margin-block-end: 16px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
+/* Labeled, tabular detail rows — confirm step + success + manage. */
+.detailCard {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  overflow: hidden;
+  margin-block-end: 18px;
+  width: 100%;
+  background: var(--surface);
+}
+
+.detailRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 15px;
+  border-block-end: 1px solid var(--line);
+}
+.detailRow:nth-child(even) { background: var(--surface-2); }
+.detailRow:last-child { border-block-end: none; }
+
+.detailKey { font-size: 13px; font-weight: 600; color: var(--ink-soft); white-space: nowrap; }
+.detailVal {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.form { display: flex; flex-direction: column; gap: 15px; }
+
+.label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.input {
+  width: 100%;
+  min-height: 50px;
+  padding: 0 14px;
+  border-radius: var(--r-sm);
+  border: 1.5px solid var(--line-strong);
+  font-size: 16px; /* ≥16px prevents iOS focus zoom */
+  font-weight: 500;
+  background: var(--surface);
+  color: var(--ink);
+  transition: border-color var(--tap), box-shadow var(--tap);
+}
+.input::placeholder { color: var(--ink-faint); font-weight: 400; }
+.input:focus-visible {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(21, 23, 28, 0.12);
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────── */
+
+.primaryBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 54px;
+  border: none;
+  border-radius: var(--r);
+  background: var(--brand);
+  color: var(--on-brand);
+  font-size: 16px;
+  font-weight: 700;
+  box-shadow: var(--shadow-pop);
+  transition: background-color var(--tap), transform var(--tap), opacity var(--tap);
+}
+.primaryBtn:hover { background: var(--brand-hover); }
+.primaryBtn:active { transform: scale(0.99); }
+.primaryBtn:disabled { opacity: 0.55; box-shadow: none; cursor: default; }
+
+.secondaryBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 50px;
+  padding-inline: 20px;
+  border-radius: var(--r);
+  border: 1.5px solid var(--line-strong);
+  background: var(--surface);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+  transition: border-color var(--tap), background-color var(--tap), transform var(--tap);
+}
+.secondaryBtn:hover { border-color: var(--ink-faint); background: var(--surface-2); }
+.secondaryBtn:active { transform: scale(0.99); }
+
+.finePrint {
+  font-size: 12px;
+  color: var(--ink-soft);
+  text-align: center;
+  line-height: 1.5;
+}
+
+.errorNote {
+  padding: 11px 13px;
+  border-radius: var(--r-sm);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-line);
+  color: var(--danger);
+  font-size: 14px;
+  font-weight: 600;
+  margin-block-end: 12px;
+}
+
+.emptyState {
+  padding: 22px 14px;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* ── Success / terminal states ─────────────────────────────────────── */
+
+.success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+  padding-block: 16px 8px;
+  animation: rise 320ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+.successIcon {
+  width: 62px;
+  height: 62px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-pill);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-line);
+  color: var(--accent);
+  font-size: 30px;
+  font-weight: 700;
+  animation: pop 360ms cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+}
+
+.successTitle { font-size: 21px; font-weight: 800; letter-spacing: -0.01em; }
+.successHint { font-size: 14px; color: var(--ink-soft); line-height: 1.5; max-width: 36ch; }
+.success .secondaryBtn { margin-block-start: 4px; }
+
+/* ── Waitlist (fully-booked day; styles ready for the next phase) ───── */
+
+.waitlistForm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-block-start: 12px;
+  text-align: start;
+}
+
+.waitlistDone {
+  margin-block-start: 12px;
+  padding: 12px 14px;
+  border-radius: var(--r-sm);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-line);
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* ── Step transition wrapper ───────────────────────────────────────── */
+
+.pane {
+  animation: fadeIn 260ms ease both;
+}
+
+/* ── Accessibility helpers ─────────────────────────────────────────── */
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.serviceCard:focus-visible,
+.dayChip:focus-visible,
+.dayChipActive:focus-visible,
+.slotChip:focus-visible,
+.slotChipActive:focus-visible,
+.primaryBtn:focus-visible,
+.secondaryBtn:focus-visible,
+.backLink:focus-visible {
+  outline: 2.5px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* ── Motion ────────────────────────────────────────────────────────── */
+
+@keyframes pop {
+  from { transform: scale(0.6); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes rise {
+  from { transform: translateY(8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slotSkeleton { animation: none; }
+  .success,
+  .successIcon,
+  .pane { animation: none; }
+  .serviceCard,
+  .dayChip,
+  .dayChipActive,
+  .slotChip,
+  .slotChipActive,
+  .primaryBtn,
+  .secondaryBtn,
+  .input,
+  .backLink { transition: none; }
+}

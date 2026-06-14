@@ -1,8 +1,63 @@
-# CURRENT_STATE — receptionist-core (as of 2026-06-12)
+# CURRENT_STATE — receptionist-core (as of 2026-06-12, post-pivot)
 
-Git: `main` @ `7df3fbc` (= code of `f5ff9ce` "Add Gemini-powered AI receptionist…").
-Lint ✅ · Build ✅ · Simulation suite: 20/20 scenarios green (numbered 1–19 and 21 — there
-is no #20; last full run 2026-06-11).
+Lint ✅ · Build ✅ · Simulation suite green (scenarios 1–19, 21, 22 — there is no #20;
+last full run 2026-06-12, includes the new platform-mode scenario 22).
+
+## PRODUCT TRANSITION (owner decision 2026-06-12 — see TRANSITION_PLAN.md)
+Scheduling moves OUT of the AI conversation into the **booking platform**. Built and
+validated this session (live behavior unchanged until the owner flips the flag):
+- **`/book/[slug]`** — public mobile-first RTL booking wizard (service → day → visual
+  slot grid → details → deterministic booking + WhatsApp confirmation with manage link).
+  Past times today are filtered (+15-min lead) — the old bug #3 never reaches this path.
+- **`/appointment/[id]`** — self-service view / cancel / reschedule (uuid link).
+- **`lib/booking/platform.ts`** — deterministic platform service layer (shares
+  getAvailableSlots / isIntervalFree / collision handling with the chat path).
+- **`BOOKING_MODE` flag** — `conversational` (default, exact pre-pivot behavior) |
+  `platform` (AI detects BOOK/CANCEL/RESCHEDULE intent → system attaches links;
+  `lib/ai/platform-turn.ts`; persona drops all scheduling machinery).
+- **Event layer** — migration `007_platform_events_waitlist.sql` (events + waitlist
+  tables + source='platform'; NOT yet applied), fail-open emitter (`lib/events/emit.ts`),
+  jobs-runner skeleton (`POST /api/jobs/process`, JOBS_SECRET-gated).
+- **`lib/booking/outbound.ts`** — single outbound chokepoint shared by chat + platform.
+
+Founder checkpoints before flipping: set `PUBLIC_BASE_URL`, apply migrations 006+007,
+manual phone walkthrough of both pages. Phases 4–6 (waitlist e2e, reminders,
+conversational-machinery removal) are scoped in TRANSITION_PLAN.md.
+
+### Phase 4+ progress (2026-06-13)
+- **Receptionist quality (both modes)**: per-turn CUSTOMER block (new/returning, name,
+  visit history — `renderCustomerState`); persona uses it (greet regulars by name);
+  sharper FAQ (answer-first), honest escalation, one-question ambiguity handling.
+- **Booking UX polish**: trust chips, structured detail card (confirm + success),
+  `aria-live` slot states, RTL/a11y, service-card affordances.
+- **AI Settings = "Define your receptionist"** (SIMPLIFIED 2026-06-13, latest):
+  the form is now five plain sections (Capabilities / Identity / Personality /
+  Writing style / Hard rules). `tone` presets and `business_type` were RETIRED from
+  the UI + persona (the AI learns the business from facts/services/KB; both columns
+  kept dormant as read-only back-compat — persona still reads `tone` as a silent
+  fallback for configs that only set one). Personality is ONE natural-language field
+  (`custom_instructions`) + an optional **✨ enhance** button (`lib/ai/persona-enhance.ts`,
+  `enhancePersonaAction`) that rewrites the description via one fail-soft, settings-time
+  Gemini call — NOT on the customer-turn path (`brain.ts` is still the only per-turn
+  call site). Added **`assistant_gender`** (Identity) for Hebrew self-reference
+  ("אני שמחה" vs "אני שמח"); default neutral; does not change customer-directed phrasing.
+  Predefined starter templates were REMOVED (user-owned named profiles are the next
+  pass). `updateAISettings` is now precise-strangler-safe (drops only the offending
+  unknown column on a missing-column error). Migrations 008 + 009 applied; **migration
+  010 (`assistant_gender`) is NEW and not yet applied** — until then the strangler
+  drops the column on save and reads default to neutral (no behavior gap).
+- **Waitlist vertical slice**: join on fully-booked days; freed-slot matcher
+  (`lib/booking/waitlist.ts`); cancel/reschedule (platform + dashboard) emit freed
+  slots; `lib/events/process.ts` notifies the earliest waitlist match (FIFO, cap 1).
+- **Reminders**: `enqueueDueReminders` (24h window, idempotent) + reminder processor;
+  driven by `POST /api/jobs/process` (JOBS_SECRET-gated; 503 until set).
+- **Audit**: confirmed all appointment writes are deterministic (`flow.ts` +
+  `platform.ts`); `lib/ai/` never mutates appointments.
+- Sim scenarios: 24 (receptionist quality), 25 (rewritten → "Define your receptionist":
+  one description, gender self-reference, format precedence, legacy back-compat),
+  26 (waitlist windows). Lint+build+full suite green.
+- New founder checkpoints: **apply migration 010** (`assistant_gender`) to enable the
+  gender field (the code is fail-soft until then); set JOBS_SECRET + schedule the runner.
 
 ## What currently works (validated live and/or in sims)
 - End-to-end WhatsApp booking in Hebrew: greeting → any-order field collection →
@@ -40,13 +95,16 @@ is no #20; last full run 2026-06-11).
 - **Degraded-mode FAQ** — during a 503 cooldown, FAQs get the "leave me details" notice
   instead of a real answer (facts exist; deterministic FAQ answering not built).
 
-## What is broken (known, reproduced, NOT yet fixed — owner asked for review first)
+## What is broken (known, reproduced — status as of 2026-06-12 post-pivot session)
 See PROJECT_CONTEXT.md "Known bugs" for the full list with fix ideas. Headlines:
-1. No "today is…" anchor in the prompt → model misstates today/tomorrow weekday facts.
-2. Past times today are offered/bookable (no now-filter in slot computation).
-3. Past DD/MM silently books NEXT YEAR (no year in echo).
-4. `falseClosedClaim` misses "היום/מחר" phrasing.
-5. Junk live data (services "בדיקה"/"שד", parking="שד") actively causes hallucinations.
+1. ~~No "today is…" anchor in the prompt~~ **FIXED** — persona now carries a per-turn
+   "TODAY/TOMORROW is…" anchor (both modes; sim scenario 23).
+2. Past times today offered/bookable — **fixed on the PLATFORM path** (+15-min lead);
+   still present in conversational-mode slot prompts (`getAvailableSlots` itself).
+3. Past DD/MM silently books NEXT YEAR (no year in echo) — open (conversational only).
+4. ~~`falseClosedClaim` misses "היום/מחר"~~ **FIXED** — relative day refs via
+   `dayRefsFor` + `AvailabilityInfo.todayISO` (sim scenario 23).
+5. Junk live data (services "בדיקה"/"שד", parking="שד") — open; clean via dashboard.
 
 ## What needs validation
 - A full clean live WhatsApp run on the CURRENT code (the last live sessions ran older

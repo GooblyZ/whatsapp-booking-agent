@@ -8,13 +8,22 @@ what's next) → `PROJECT_CONTEXT.md` (full background) → `REPOSITORY_MAP.md` 
 
 ## Project goals
 A customer texts the business on WhatsApp in messy natural Hebrew; the bot answers,
-collects booking details conversationally, checks REAL availability, and books — feeling
-like a reliable human receptionist. Core law:
+helps, and gets appointments booked reliably. Core law:
 
 > **Gemini understands. Gemini speaks. The system validates and executes.**
 
 The AI must NEVER write to the DB, never create/cancel/change appointments, and never
-claim a booking happened unless the deterministic INSERT ran.
+claim a booking happened unless the deterministic write ran.
+
+> **PRODUCT PIVOT (2026-06-12, owner decision — see `TRANSITION_PLAN.md`):**
+> scheduling is moving OUT of the AI conversation into the web **booking platform**
+> (`/book/[slug]`, `/appointment/[id]`, `lib/booking/platform.ts`). Target: the AI does
+> conversation, FAQ, personalization and intent DETECTION; the platform owns booking /
+> cancellation / rescheduling / waitlists deterministically; the system detects events
+> (`events` table, migration 007) and the AI communicates them. The transition is
+> governed by `BOOKING_MODE` (`conversational` = legacy default, `platform` = new path).
+> The conversational machinery stays intact until the owner flips the flag and
+> approves its removal.
 
 ## Architectural rules (do not violate)
 1. **One Gemini call per customer turn** (`lib/ai/brain.ts` is the only runtime call
@@ -22,17 +31,19 @@ claim a booking happened unless the deterministic INSERT ran.
 2. **Model is `gemini-2.5-flash-lite`** via `GEMINI_MODEL` env — do not change without
    the owner's explicit request. Keep `thinkingBudget: 0` + `maxOutputTokens: 4096`
    (removing them re-breaks JSON on thinking models).
-3. **Booking-critical actions stay deterministic**: the confirmation step
-   (`flow.ts handleConfirmation`), availability verdicts, and every guard in
-   `lib/ai/reply-polish.ts`. New AI failure modes get deterministic fences, not prompts.
+3. **Booking-critical actions stay deterministic**: every appointment write
+   (`flow.ts handleConfirmation` in conversational mode, `lib/booking/platform.ts` in
+   platform mode), availability verdicts, link attachment (the model never writes URLs),
+   and every guard in `lib/ai/reply-polish.ts`. New AI failure modes get deterministic
+   fences, not prompts.
 4. **Owner AI settings are the style authority** (tone/length/emoji/custom instructions)
    — never weaken `custom_instructions` priority; history never outranks settings/facts.
 5. **Don't optimize cost** unless asked — the owner explicitly prioritizes quality.
 6. Prefer **contained fixes** over refactors; keep files under ~500 lines by extracting
    cohesive modules (`reply-polish.ts` is the pattern to follow).
 7. Every live bug fix gets a **simulation scenario** in
-   `scripts/simulate-conversations.ts` (currently 20 scenarios replaying real incidents;
-   numbering runs 1–19 then 21 — there is no #20).
+   `scripts/simulate-conversations.ts` (scenarios replay real incidents; numbering runs
+   1–19, 21, 22 — there is no #20; #22 covers platform mode).
 
 ## Things NOT to change without owner review
 - The Gemini model / generation config (rule 2).
@@ -50,8 +61,9 @@ claim a booking happened unless the deterministic INSERT ran.
 - **Logging hygiene**: never log secrets/API keys, full prompts, message bodies, or
   phone numbers (mask to last 4). Token counts, char sizes, intents = fine.
 - Hebrew customer-facing strings: gender-neutral phrasing ("כתוב/כתבי", "נוח לך"),
-  no emojis hardcoded into strings that bypass the settings chokepoint (all outbound
-  goes through `flow.ts reply()` which enforces emoji_usage=none).
+  no emojis hardcoded into strings that bypass the settings chokepoint (ALL outbound
+  WhatsApp goes through `lib/booking/outbound.ts sendOutbound()` — chat router and
+  booking platform alike — which enforces emoji_usage=none).
 - Comments explain constraints the code can't show, in the file's existing voice.
 
 ## Common commands

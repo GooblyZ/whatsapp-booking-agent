@@ -202,9 +202,9 @@ CREATE TABLE IF NOT EXISTS appointments (
   status      TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'confirmed', 'cancelled', 'completed', 'no_show')),
 
-  -- whatsapp | dashboard | manual | system
+  -- whatsapp | dashboard | manual | system | platform (booking platform — migration 007)
   source      TEXT NOT NULL DEFAULT 'whatsapp'
-    CHECK (source IN ('whatsapp', 'dashboard', 'manual', 'system')),
+    CHECK (source IN ('whatsapp', 'dashboard', 'manual', 'system', 'platform')),
 
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -386,23 +386,37 @@ CREATE TABLE IF NOT EXISTS ai_settings (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   business_id         UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
 
+  -- IDENTITY
   assistant_name      TEXT NOT NULL DEFAULT 'Assistant',
+  -- Assistant's own grammatical gender for Hebrew SELF-reference (migration 010).
+  -- "neutral" = pre-existing behavior. Does NOT change phrasing toward the customer.
+  assistant_gender    TEXT NOT NULL DEFAULT 'neutral'
+    CHECK (assistant_gender IN ('neutral', 'female', 'male')),
 
-  -- friendly | professional | luxury | casual
-  tone                TEXT NOT NULL DEFAULT 'friendly'
-    CHECK (tone IN ('friendly', 'professional', 'luxury', 'casual')),
-
+  -- WRITING STYLE (format) — independent of personality.
   -- short | medium | long
   response_length     TEXT NOT NULL DEFAULT 'medium'
     CHECK (response_length IN ('short', 'medium', 'long')),
-
   -- none | low | medium
   emoji_usage         TEXT NOT NULL DEFAULT 'low'
     CHECK (emoji_usage IN ('none', 'low', 'medium')),
-
   language            TEXT NOT NULL DEFAULT 'en',
 
+  -- PERSONALITY: ONE natural-language description is the entire voice authority.
+  -- The owner describes the receptionist; the persona scaffold translates it into
+  -- behavior. Loses only to format limits (length/emoji) and to things_to_avoid.
   custom_instructions TEXT,
+
+  -- HARD RULES: guardrails that override personality.
+  things_to_avoid     TEXT,
+
+  -- DEPRECATED (retained for back-compat only; retired from UI + persona):
+  --   tone          — legacy 4-way preset; persona reads it as a silent fallback
+  --                   for older configs that never set a description.
+  --   business_type — the AI now learns the business from facts/services/KB instead.
+  tone                TEXT NOT NULL DEFAULT 'friendly'
+    CHECK (tone IN ('friendly', 'professional', 'luxury', 'casual')),
+  business_type       TEXT,
 
   -- AI control toggles (see migration 005). Disabling AI never affects bookings.
   ai_enabled               BOOLEAN NOT NULL DEFAULT TRUE,  -- master switch for the Gemini layer
@@ -521,7 +535,61 @@ ALTER TABLE messages
 ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS wa_timestamp TIMESTAMPTZ;
 
--- 5. WhatsApp integration health (migration 006)
+-- 5. Booking platform events + waitlist (migration 007)
+--    The system DETECTS events; the AI COMMUNICATES them (TRANSITION_PLAN.md).
+CREATE TABLE IF NOT EXISTS events (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id    UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  customer_id    UUID REFERENCES customers(id) ON DELETE SET NULL,
+  appointment_id UUID REFERENCES appointments(id) ON DELETE SET NULL,
+  type TEXT NOT NULL CHECK (type IN (
+    'appointment_booked', 'appointment_cancelled', 'appointment_rescheduled',
+    'reminder_due', 'waitlist_opportunity', 'abandoned_booking', 'customer_inactive'
+  )),
+  payload      JSONB NOT NULL DEFAULT '{}',
+  status       TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'processed', 'skipped')),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_business_id    ON events(business_id);
+CREATE INDEX IF NOT EXISTS idx_events_pending        ON events(business_id, status, created_at)
+  WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_events_appointment_id ON events(appointment_id)
+  WHERE appointment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS waitlist_entries (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  service_id  UUID REFERENCES services(id) ON DELETE SET NULL,
+  date_from   DATE,
+  date_to     DATE,
+  time_from   TEXT,
+  time_to     TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'notified', 'converted', 'expired', 'cancelled')),
+  notified_at TIMESTAMPTZ,
+  expires_at  TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_business_id ON waitlist_entries(business_id);
+CREATE INDEX IF NOT EXISTS idx_waitlist_active      ON waitlist_entries(business_id, status)
+  WHERE status = 'active';
+
+-- The app connects as service_role. The GRANT ALL near the top of this file ran
+-- before events/waitlist_entries existed, so they need an explicit grant here
+-- (without it: "permission denied for table events", and the whole event/waitlist
+-- layer fails soft). ALTER DEFAULT PRIVILEGES stops this recurring for new tables.
+GRANT ALL ON public.events            TO service_role;
+GRANT ALL ON public.waitlist_entries  TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;
+
+-- 6. WhatsApp integration health (migration 006)
 --    Per-business delivery health; auth_failed suspends AI replies until the
 --    Meta token is reconnected (dashboard surfaces the alert).
 ALTER TABLE business_settings
@@ -533,3 +601,31 @@ ALTER TABLE business_settings
   ADD COLUMN IF NOT EXISTS last_whatsapp_error_at TIMESTAMPTZ;
 ALTER TABLE business_settings
   ADD COLUMN IF NOT EXISTS whatsapp_consecutive_failures INTEGER NOT NULL DEFAULT 0;
+
+-- ============================================================
+-- Row Level Security (migration 011)
+--
+-- The app connects ONLY as service_role (lib/supabase/server.ts), which has
+-- BYPASSRLS — so RLS never affects any server flow. The anon key is never used
+-- to query the DB (lib/supabase/client.ts has no importers). Enabling RLS with
+-- NO policies denies the public anon/authenticated roles all access while the
+-- service_role keeps working. This is the strictest safe posture; permissive
+-- anon policies are intentionally omitted (they would re-expose customer data).
+-- Idempotent: ENABLE on an already-enabled table is a no-op.
+-- ============================================================
+ALTER TABLE public.businesses           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_settings    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff_members        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_hours       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff_working_hours  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.service_categories   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.services             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customers            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.appointments         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.messages             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conversation_states  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.knowledge_base_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ai_settings          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ai_events            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.events               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.waitlist_entries     ENABLE ROW LEVEL SECURITY;

@@ -8,7 +8,7 @@ export type AppointmentStatus =
   | "completed"
   | "no_show";
 
-export type AppointmentSource = "whatsapp" | "dashboard" | "manual" | "system";
+export type AppointmentSource = "whatsapp" | "dashboard" | "manual" | "system" | "platform";
 
 export type MessageDirection = "inbound" | "outbound";
 
@@ -178,23 +178,85 @@ export interface KnowledgeBaseItem {
   updated_at: string;
 }
 
+/** @deprecated Replaced by the free-text personality description (custom_instructions).
+ *  Retained only as a READ-ONLY back-compat fallback for configs that never set one. */
 export type AISettingsTone = "friendly" | "professional" | "luxury" | "casual";
 export type AISettingsResponseLength = "short" | "medium" | "long";
 export type AISettingsEmojiUsage = "none" | "low" | "medium";
+/** Assistant's own grammatical gender for Hebrew self-reference. Default neutral. */
+export type AISettingsGender = "neutral" | "female" | "male";
 
 export interface AISettings {
   id: string;
   business_id: string;
+  // IDENTITY
   assistant_name: string;
-  tone: AISettingsTone;
+  /** Assistant self-reference gender (Hebrew is gendered). Optional until migration 010. */
+  assistant_gender?: AISettingsGender;
+  // WRITING STYLE (format) — independent of personality.
   response_length: AISettingsResponseLength;
   emoji_usage: AISettingsEmojiUsage;
   language: string;
+  // PERSONALITY — ONE natural-language description is the entire voice authority.
+  // The owner describes the receptionist; the persona scaffold translates it into
+  // behavior. No competing personality control, so precedence is never ambiguous.
   custom_instructions: string | null;
+  // HARD RULES — guardrails that override personality.
+  things_to_avoid?: string | null;
+  /**
+   * @deprecated Replaced by custom_instructions. READ-ONLY back-compat fallbacks so
+   * older configs keep working with no data migration; never written by the UI.
+   */
+  tone?: AISettingsTone;
+  /** @deprecated Dropped from UI/persona (the AI knows the business from facts/KB). */
+  business_type?: string | null;
+  /** @deprecated Merged into custom_instructions by migration 009. READ-ONLY fallback. */
+  persona_voice?: string | null;
   // AI control toggles — all default true. Disabling never affects bookings.
   ai_enabled: boolean;
   faq_enabled: boolean;
   intent_detection_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// ── Booking platform event layer (migration 007) ────────────────────────────
+
+export type PlatformEventStatus = "pending" | "processed" | "skipped";
+
+export interface PlatformEvent {
+  id: string;
+  business_id: string;
+  customer_id: string | null;
+  appointment_id: string | null;
+  type:
+    | "appointment_booked"
+    | "appointment_cancelled"
+    | "appointment_rescheduled"
+    | "reminder_due"
+    | "waitlist_opportunity"
+    | "abandoned_booking"
+    | "customer_inactive";
+  payload: Record<string, unknown>;
+  status: PlatformEventStatus;
+  created_at: string;
+  processed_at: string | null;
+}
+
+export type WaitlistStatus = "active" | "notified" | "converted" | "expired" | "cancelled";
+
+export interface WaitlistEntry {
+  id: string;
+  business_id: string;
+  customer_id: string;
+  service_id: string | null;
+  date_from: string | null;  // DATE, business-local
+  date_to: string | null;
+  time_from: string | null;  // "HH:MM"
+  time_to: string | null;
+  status: WaitlistStatus;
+  notified_at: string | null;
+  expires_at: string | null;
   created_at: string;
   updated_at: string;
 }

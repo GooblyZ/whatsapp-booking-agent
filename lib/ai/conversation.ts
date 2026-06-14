@@ -122,6 +122,58 @@ export async function renderUpcomingAppointments(
 }
 
 /**
+ * Renders a CUSTOMER block for the persona's working memory: who the system
+ * already knows this person to be (name, new vs returning, visit history). This
+ * is what lets the receptionist greet a regular by name and treat a first-timer
+ * with a touch more orientation — the difference between "a real receptionist"
+ * and "a generic bot". Derived entirely from existing tables (customers +
+ * appointments); contains NO phone number or message content. Fail-open: returns
+ * "" on any error so it can never block a reply.
+ */
+export async function renderCustomerState(
+  db: DB, businessId: string, customerId: string, timezone: string
+): Promise<string> {
+  try {
+    const [{ data: cust }, { data: past }] = await Promise.all([
+      db.from("customers").select("name, created_at").eq("id", customerId).maybeSingle(),
+      db
+        .from("appointments")
+        .select("start_time, status")
+        .eq("business_id", businessId)
+        .eq("customer_id", customerId)
+        .in("status", ["completed", "confirmed", "cancelled"])
+        .lt("start_time", new Date().toISOString())
+        .order("start_time", { ascending: false })
+        .limit(20),
+    ]);
+
+    const name = (cust?.name as string | null)?.trim() || null;
+    const rows = (past ?? []) as Array<{ start_time: string; status: string }>;
+    const kept = rows.filter((r) => r.status === "completed" || r.status === "confirmed");
+    const visits = kept.length;
+
+    const parts: string[] = [];
+    parts.push(name ? `Name: ${name} (use it naturally — don't ask for it again).` : `Name: unknown.`);
+
+    if (visits > 0) {
+      const last = kept[0];
+      const lastStr = new Intl.DateTimeFormat("he-IL", { timeZone: timezone, day: "2-digit", month: "2-digit" }).format(new Date(last.start_time));
+      parts.push(
+        `Returning customer — ${visits} previous visit${visits > 1 ? "s" : ""}, most recent around ${lastStr}. ` +
+        `Treat them as someone who already knows the place; warmth over orientation.`
+      );
+    } else {
+      parts.push(`Likely a first-time customer here — a touch more orientation is welcome, no assumptions about familiarity.`);
+    }
+
+    return `CUSTOMER (system-checked):\n${parts.join("\n")}`;
+  } catch (err) {
+    console.error("[ai-memory] customer-state fetch failed:", err instanceof Error ? err.message : String(err));
+    return "";
+  }
+}
+
+/**
  * Stuck-recovery helper: scans the customer's recent messages (newest first) for
  * a concrete clock time that earlier turns failed to parse — used when the
  * customer insists "אמרתי כבר" while the session's time is still missing.

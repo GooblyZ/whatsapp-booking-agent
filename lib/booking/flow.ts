@@ -1,19 +1,18 @@
-import { sendWhatsAppTextMessage } from "@/lib/whatsapp";
 import {
   type DB,
   getConversationState,
   upsertConversationState,
-  saveOutboundMessage,
   loadActiveServices,
   getBusinessTimezone,
   updateCustomerName,
   isBookingEnabled,
 } from "./helpers";
 import { getAvailableSlots, isIntervalFree, parseHebrewDate, businessTimeToUTC, todayInTZ } from "./availability";
+import { sendOutbound } from "./outbound";
 import { runConversationTurn } from "@/lib/ai/idle-handler";
+import { runPlatformTurn } from "@/lib/ai/platform-turn";
 import { loadBookingSession } from "@/lib/ai/booking-session";
-import { stripEmojis } from "@/lib/ai/reply-polish";
-import { recordWhatsAppSendResult } from "@/lib/integration-health";
+import { getBookingMode } from "@/lib/config";
 
 // Conversation states that mean "a booking is in progress, missing field X".
 // These are CONTEXT for the AI receptionist, not menus that own the conversation.
@@ -37,55 +36,14 @@ export function isCancelIntent(text: string): boolean {
   return CANCEL_COMMANDS.has(t);
 }
 
-/**
- * AI-settings enforcement at the SINGLE outbound chokepoint: owner settings
- * (emoji_usage=none) apply to EVERY reply — model-written, guard, and the
- * deterministic strings in this file alike (live: the cancel notice carried 😊
- * and the success message 🎉😊 under emoji=none + luxury tone). Fail-open: if
- * settings can't be read, the text is sent unmodified.
- */
-async function applyOutboundSettings(db: DB, businessId: string, text: string): Promise<string> {
-  try {
-    const { data } = await db
-      .from("ai_settings")
-      .select("emoji_usage")
-      .eq("business_id", businessId)
-      .maybeSingle();
-    if (data?.emoji_usage === "none") return stripEmojis(text);
-  } catch {
-    // settings unavailable → send as-is
-  }
-  return text;
-}
-
+// Outbound sending (settings enforcement, health recording, persistence) lives
+// in ./outbound.ts — the SAME chokepoint serves this router and the booking
+// platform, so owner settings can never diverge between the two paths.
 // TODO: future — add a retry queue for failed WhatsApp sends (e.g. SQS, BullMQ).
 async function reply(
   db: DB, businessId: string, customerId: string, toPhone: string, rawText: string
 ): Promise<void> {
-  const text = await applyOutboundSettings(db, businessId, rawText);
-  let sendStatus: "sent" | "failed" = "sent";
-  console.log(`[booking] reply → "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}"`);
-
-  const result = await sendWhatsAppTextMessage(toPhone, text);
-  if (!result.success) {
-    sendStatus = "failed";
-    console.error(`[booking] WhatsApp send failed: ${result.error}`);
-  }
-
-  // Integration health: auth failures suspend AI for this business (nothing can
-  // be delivered); successes reset the state. Never blocks the message save.
-  try {
-    await recordWhatsAppSendResult(db, businessId, result);
-  } catch (err) {
-    console.error("[booking] failed to record send health:", err instanceof Error ? err.message : String(err));
-  }
-
-  // Always save the outbound message regardless of send outcome so no reply is lost.
-  try {
-    await saveOutboundMessage(db, businessId, customerId, toPhone, text, sendStatus);
-  } catch (err) {
-    console.error("[booking] failed to save outbound message:", err instanceof Error ? err.message : String(err));
-  }
+  await sendOutbound(db, businessId, customerId, toPhone, rawText);
 }
 
 /**
@@ -119,6 +77,22 @@ export async function handleBookingFlow(
   }
 
   const replyFn = (text: string) => reply(db, businessId, customerId, fromPhone, text);
+
+  // PLATFORM MODE (TRANSITION_PLAN.md): conversational scheduling is OFF — the
+  // AI converses + detects intent; links route to the booking platform. The
+  // entire conversational-booking pipeline below is bypassed.
+  if (getBookingMode() === "platform") {
+    console.log(`[router] mode=platform state="${state}" → platform turn`);
+    const turnAnchor = await latestInboundAt(db, businessId, customerId);
+    const outcome = await runPlatformTurn(db, businessId, customerId, fromPhone, messageText, state);
+    if (await hasNewerInbound(db, businessId, customerId, turnAnchor)) {
+      console.log(`[router] superseded by newer inbound message — reply skipped`);
+      return;
+    }
+    await replyFn(outcome.replyText);
+    return;
+  }
+
   const isMenuState = BOOKING_STATES.has(state);
   const session = loadBookingSession(context);
   const bookingActive = isMenuState || state === "booking_confirm" || session.active;

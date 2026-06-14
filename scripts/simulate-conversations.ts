@@ -20,24 +20,26 @@ import {
   detectRedundantQuestion, missingFields, applyChangeRequests,
   applyOfferRejection, captureOfferedSlots, detectOfferRejection,
   resolveDateText, buildContextReply, matchService,
-  nextStepQuestion, protectArmedDraft, isCredibleChangeRequest,
+  nextStepQuestion, protectArmedDraft, isCredibleChangeRequest, dayNameHe,
   type BookingSession, type ServiceLite,
 } from "../lib/ai/booking-session";
 import {
   ensureDateEcho, ensureConfirmCta, stripEmojis, sameOutboundText, nearDuplicateText,
   alignAvailableReply, claimsBookingCompleted, lacksUnavailabilityMarker, falseClosedClaim,
+  dayRefsFor,
 } from "../lib/ai/reply-polish";
-import { isIntervalFree } from "../lib/booking/availability";
+import { isIntervalFree, todayInTZ } from "../lib/booking/availability";
 import { supabaseServer } from "../lib/supabase/server";
 import { renderAvailabilityInfo, renderVerdictReplyHe, type AvailabilityInfo } from "../lib/ai/availability-facts";
-import { extractExplicitTime, extractTimeTokens } from "../lib/ai/grounding";
+import { extractExplicitTime, extractTimeTokens, verifyGrounding } from "../lib/ai/grounding";
+import { buildFacts, buildFactIndex } from "../lib/ai/facts";
 import { findTimeInHistory, applyConversationGap, type ConversationTurn } from "../lib/ai/conversation";
 import { isCancelIntent, parseYesNo } from "../lib/booking/flow";
 
 const TZ = "Asia/Jerusalem";
 
 function makeCtx(overrides: Partial<{
-  tone: string; emoji: string; length: string; custom: string | null;
+  tone: string; emoji: string; length: string; custom: string | null; gender: string;
 }> = {}): BusinessAIContext {
   return {
     business: {
@@ -56,6 +58,7 @@ function makeCtx(overrides: Partial<{
       response_length: (overrides.length ?? "medium") as never,
       emoji_usage: (overrides.emoji ?? "low") as never,
       language: "he", custom_instructions: overrides.custom ?? null,
+      assistant_gender: (overrides.gender ?? "neutral") as never,
       ai_enabled: true, faq_enabled: true, intent_detection_enabled: true,
       created_at: "", updated_at: "",
     },
@@ -578,6 +581,239 @@ async function main() {
   await turn(ctx, st21, "לא יודע, מה אתה מציע ?");
   const r21 = st21.turns[st21.turns.length - 1].text;
   console.log(`   [soft] recommendation names real services: ${/פן|פנים|תספור|צביע/.test(r21) ? "YES ✓" : `no ("${r21}") — prompt-level, non-blocking`}`);
+
+  console.log("\n================ SCENARIO 22: PLATFORM MODE (intent routing, no chat scheduling) ================");
+  // Pure: the platform persona drops every conversational-scheduling instruction.
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const inst = buildReceptionistInstruction(ctx, {
+      factsBlock: "facts", caps: { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false },
+      conversationContext: "", platformMode: true,
+    });
+    console.log("  [pure] platform persona has no detail-collection instructions:",
+      !inst.includes("collect service + day + time") && !inst.includes("AVAILABILITY block says the time is AVAILABLE") &&
+      inst.includes("BOOKING PAGE") && inst.includes("NEVER write a URL")
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  // Live: booking intent detected; reply collects nothing and offers no times.
+  {
+    const d22 = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "היי, אפשר לקבוע תור לתספורת למחר?", bookingBlock: "", platformMode: true,
+    });
+    const u22 = d22.turn?.understanding;
+    const intentDetected = u22?.appointmentIntent === "BOOK" || u22?.intent === "booking";
+    console.log(`  [live] booking intent detected for routing: ${intentDetected ? "PASS ✓" : `FAIL ✗ (intent=${u22?.intent} appt=${u22?.appointmentIntent})`}`);
+    // Opening-hours mentions and "see the available times on the page" are fine;
+    // what platform mode forbids is OFFERING bookable slots in chat — a list of
+    // times, or binding a concrete time to a free/taken claim ("16:00 פנוי").
+    const timeTokens = d22.replyText.match(/\d{1,2}:\d{2}/g) ?? [];
+    const slotList = timeTokens.length >= 3;
+    const claimsSpecificFree = /\d{1,2}:\d{2}[^.!?\n]{0,12}(פנוי|זמין|מתאים|תפוס)|(פנוי|זמין|תפוס)[^.!?\n]{0,12}\d{1,2}:\d{2}/.test(d22.replyText);
+    const offersSlots = slotList || claimsSpecificFree;
+    console.log(`  [live] reply offers no bookable slots: ${!offersSlots ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
+    console.log(`  [live] reply claims no completed booking: ${!claimsBookingCompleted(d22.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
+  }
+
+  // Live: cancellation request → manage-intent detected (routes to self-service link).
+  {
+    const d22b = await runReceptionistTurn(ctx, {
+      conversationContext: "",
+      message: "אני רוצה לבטל את התור שלי",
+      bookingBlock: "EXISTING APPOINTMENTS (system-checked) for this customer:\n• 20/06 בשעה 16:00 — תספורת (confirmed)",
+      platformMode: true,
+    });
+    const u22b = d22b.turn?.understanding;
+    const manageIntent = u22b?.appointmentIntent === "CANCEL" || u22b?.intent === "cancel_request";
+    console.log(`  [live] cancel intent detected for routing: ${manageIntent ? "PASS ✓" : `FAIL ✗ (intent=${u22b?.intent} appt=${u22b?.appointmentIntent})`}`);
+  }
+
+  // Live: FAQ still answered from facts in platform mode (conversation quality intact).
+  {
+    const d22c = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "יש אצלכם חניה?", bookingBlock: "", platformMode: true,
+    });
+    console.log(`  [live] FAQ answered from facts: ${/חניה|בניין/.test(d22c.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22c.replyText}")`}`);
+  }
+
+  console.log("\n================ SCENARIO 23: today-anchor + relative-day closed claims (pure) ================");
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const todayISO = todayInTZ(TZ);
+    const tomorrow = new Date(todayISO + "T12:00:00Z");
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const tomorrowISO = tomorrow.toISOString().split("T")[0];
+
+    // The persona always carries a correct, current date anchor.
+    const inst23 = buildReceptionistInstruction(ctx, {
+      factsBlock: "facts", caps: { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false },
+      conversationContext: "",
+    });
+    console.log("  [pure] persona anchors today's weekday:",
+      inst23.includes(`TODAY ("היום") is יום ${dayNameHe(todayISO)}`) ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] persona anchors tomorrow's weekday:",
+      inst23.includes(`TOMORROW ("מחר") is יום ${dayNameHe(tomorrowISO)}`) ? "PASS ✓" : "FAIL ✗");
+
+    // dayRefsFor: relative references resolve only when the date IS today/tomorrow.
+    console.log("  [pure] day refs include היום for today / מחר for tomorrow / neither for far dates:",
+      dayRefsFor(todayISO, todayISO).includes("היום") &&
+      dayRefsFor(tomorrowISO, todayISO).includes("מחר") &&
+      !dayRefsFor("2026-07-06", todayISO).some((r) => r === "היום" || r === "מחר")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // The live miss: "מחר אנחנו סגורים" about an OPEN tomorrow is now caught.
+    // Explicit ref arrays keep these date-independent (dayRefsFor correctness is
+    // asserted separately above).
+    console.log("  [pure] relative closed-claims caught (היום/מחר):",
+      falseClosedClaim("מחר אנחנו סגורים, מצטערת.", ["שני", "מחר"]) &&
+      falseClosedClaim("היום סגור אצלנו.", ["שני", "היום"]) &&
+      !falseClosedClaim("ביום ראשון אנחנו סגורים. מחר יש מקום.", ["מחר"])
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 24: receptionist quality (customer-state, FAQ, escalation) ================");
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const inst24 = buildReceptionistInstruction(ctx, {
+      factsBlock: "facts", caps: { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false },
+      conversationContext: "",
+    });
+    // Pure: the persona instructs use of customer state + escalation + answer-first.
+    console.log("  [pure] persona has customer-state + escalation + answer-first guidance:",
+      inst24.includes("CUSTOMER block") && inst24.includes("point them to the business") && inst24.includes("lead with the actual answer")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // Live (soft): a returning customer named in the CUSTOMER block is greeted by name.
+    const dName = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "היי, מה שלומך?",
+      bookingBlock: "CUSTOMER (system-checked):\nName: דנה (use it naturally — don't ask for it again).\nReturning customer — 3 previous visits, most recent around 01/06. Treat them as someone who already knows the place; warmth over orientation.",
+      platformMode: true,
+    });
+    console.log(`  [soft] returning customer greeted by name: ${dName.replyText.includes("דנה") ? "YES ✓" : `no ("${dName.replyText}") — prompt-level, non-blocking`}`);
+
+    // Live: a fact the business doesn't have → honest escalation, no invention.
+    const dEsc = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "אתם עושים גם החלקות קראטין?", bookingBlock: "", platformMode: true,
+    });
+    console.log(`  [soft] unknown service → no invented yes: ${!/בטח שכן|כן, אנחנו עושים|בהחלט עושים/.test(dEsc.replyText) ? "YES ✓" : `no ("${dEsc.replyText}")`}`);
+  }
+
+  console.log("\n================ SCENARIO 25: 'Define your receptionist' — one description + axes ================");
+  {
+    const { buildReceptionistInstruction } = await import("../lib/ai/persona");
+    const caps = { canAnswer: true, canStartBooking: true, canCancel: false, canReschedule: false };
+
+    // New business: tone column defaults to 'friendly', no description → sensible
+    // persona via the back-compat path. No orphan labels; format always present.
+    const bare = buildReceptionistInstruction(makeCtx({ custom: null }), { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] new business (no description) → sensible persona, no hard rules:",
+      bare.includes("genuinely likes people") && !bare.includes("HARD RULES")
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] format block always present (length/emoji own their axis):",
+      bare.includes("HOW YOU WRITE") && bare.includes("these limits ALWAYS hold") ? "PASS ✓" : "FAIL ✗");
+
+    // Truly empty config (no description AND no legacy tone) → built-in default character.
+    const emptyCtx = makeCtx({ custom: null });
+    emptyCtx.aiSettings = { ...emptyCtx.aiSettings!, tone: undefined as never };
+    const empty = buildReceptionistInstruction(emptyCtx, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] empty config (no tone either) → built-in default persona:",
+      empty.includes("warm, helpful and professional") ? "PASS ✓" : "FAIL ✗");
+
+    // The description is the SINGLE voice authority; hard rules override; identity has
+    // NO business-type clause anymore (the AI learns the business from facts/KB).
+    const rich = makeCtx();
+    rich.aiSettings = {
+      ...rich.aiSettings!,
+      business_type: "מרפאת שיניים", // set but must NOT leak into identity now
+      custom_instructions: "רגוע ומרגיע, מסביר בסבלנות, אף פעם לא לוחץ",
+      things_to_avoid: "אל תיתן ייעוץ רפואי; אל תבטיח שאין כאב",
+    };
+    const inst = buildReceptionistInstruction(rich, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] business_type no longer leaks into identity:",
+      !inst.includes("מרפאת שיניים") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] description is THE character authority (owner's words lead):",
+      inst.includes("This is who you are, in the owner's own words") && inst.includes("מסביר בסבלנות") ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] things_to_avoid becomes a hard rule that overrides everything:",
+      inst.includes("HARD RULES") && inst.includes("ייעוץ רפואי") ? "PASS ✓" : "FAIL ✗");
+
+    // PRECEDENCE: short length still wins over a wordy character (format owns its axis).
+    const shortInst = buildReceptionistInstruction(
+      makeCtx({ length: "short", custom: "תמיד מסביר בפירוט רב ובאריכות" }),
+      { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] length wins over a 'be detailed' personality:",
+      shortInst.includes("ONE short sentence") && shortInst.includes("these limits ALWAYS hold") ? "PASS ✓" : "FAIL ✗");
+
+    // Assistant gender drives Hebrew SELF-reference only (default neutral = no line).
+    const fem = buildReceptionistInstruction(makeCtx({ gender: "female" }), { factsBlock: "facts", caps, conversationContext: "" });
+    const masc = buildReceptionistInstruction(makeCtx({ gender: "male" }), { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] gender self-reference: female→feminine, male→masculine, neutral→none:",
+      fem.includes("feminine Hebrew") && masc.includes("masculine Hebrew") && !bare.includes("Hebrew (\"אני")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // Back-compat: a config with ONLY a legacy tone (no description) still gets a character.
+    const legacy = makeCtx({ custom: null });
+    legacy.aiSettings = { ...legacy.aiSettings!, tone: "luxury" as never };
+    const legacyInst = buildReceptionistInstruction(legacy, { factsBlock: "facts", caps, conversationContext: "" });
+    console.log("  [pure] legacy tone-only config still yields a persona (back-compat):",
+      legacyInst.includes("high-end concierge") ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 26: waitlist window matching (pure) ================");
+  {
+    const { withinWindow } = await import("../lib/booking/waitlist");
+    const slot = { dateISO: "2026-06-20", time: "14:30", serviceId: "svc1" };
+    // Unbounded entry matches anything.
+    console.log("  [pure] unbounded entry matches any slot:",
+      withinWindow(slot, { date_from: null, date_to: null, time_from: null, time_to: null }) ? "PASS ✓" : "FAIL ✗");
+    // In-window (inclusive bounds).
+    console.log("  [pure] slot inside date+time window matches:",
+      withinWindow(slot, { date_from: "2026-06-18", date_to: "2026-06-22", time_from: "12:00", time_to: "16:00" }) ? "PASS ✓" : "FAIL ✗");
+    // Out of date range / out of time range rejected.
+    console.log("  [pure] slot outside date window rejected:",
+      !withinWindow(slot, { date_from: "2026-06-21", date_to: "2026-06-25", time_from: null, time_to: null }) ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] slot outside time window rejected:",
+      !withinWindow(slot, { date_from: null, date_to: null, time_from: "15:00", time_to: "18:00" }) ? "PASS ✓" : "FAIL ✗");
+    // Boundary inclusive.
+    console.log("  [pure] window bounds are inclusive:",
+      withinWindow({ ...slot, time: "12:00" }, { date_from: "2026-06-20", date_to: "2026-06-20", time_from: "12:00", time_to: "14:00" }) ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 27: platform link not blocked by customer phone (grounding) ================");
+  {
+    // Business phone from makeCtx is "03-1234567" → digits "031234567".
+    const idx = buildFactIndex(buildFacts(makeCtx()));
+    const customerPhone = "972502201340";          // the live customer's number
+    const allowed = new Set([customerPhone]);
+    // A platform-mode reply that echoes the customer's own number (as happened
+    // live, where the booking link carried ?p=<phone> into history).
+    const replyWithCustomerPhone = "בטח! שלחתי לך קישור לקביעת תור. אם תרצה, נעדכן את 972502201340.";
+
+    // (a) Customer's own phone is allowed → grounded → no fallback → link can attach.
+    console.log("  [pure] customer's own phone does NOT fail grounding:",
+      verifyGrounding(replyWithCustomerPhone, idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (b) Root-cause proof: WITHOUT the allowance the same reply was being rejected
+    //     (this is the live bug — fence flagged the customer phone).
+    console.log("  [pure] (root cause) same reply WAS rejected before the fix:",
+      !verifyGrounding(replyWithCustomerPhone, idx).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (c) Protection preserved: an INVENTED/other number (not business, not allowed)
+    //     still fails — the fence still catches wrong-business contact claims.
+    console.log("  [pure] invented/other phone STILL fails (wrong-business protection):",
+      !verifyGrounding("תתקשרו אלינו למספר 0509999999 לפרטים.", idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (d) The real business phone is still quotable.
+    console.log("  [pure] business phone still passes grounding:",
+      verifyGrounding("אפשר להתקשר אלינו: 03-1234567", idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (e) customerPhone threads to the brain without breaking normal platform routing.
+    const dPlat = await runReceptionistTurn(makeCtx(), {
+      conversationContext: "", message: "אפשר לקבוע תור לתספורת?", bookingBlock: "",
+      platformMode: true, customerPhone,
+    });
+    const uPlat = dPlat.turn?.understanding;
+    console.log(`  [live] booking intent still detected with customerPhone set: ${dPlat.ok && (uPlat?.appointmentIntent === "BOOK" || uPlat?.intent === "booking") ? "PASS ✓" : `FAIL ✗ (ok=${dPlat.ok} intent=${uPlat?.intent})`}`);
+  }
 
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");
   // LAST in the suite — it manipulates the process-global gemini health state.
