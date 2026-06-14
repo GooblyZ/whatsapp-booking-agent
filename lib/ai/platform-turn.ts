@@ -112,7 +112,15 @@ export async function runPlatformTurn(
     replyText = "אני כאן 🙂 אפשר לשאול אותי הכל על העסק, או לקבוע תור בקישור למטה.";
   }
 
-  // ── Deterministic intent routing — the system attaches links, never the model.
+  // ── Deterministic intent routing — the system ALWAYS attaches the link for a
+  //    booking/manage intent. Platform mode never books in chat, so the CTA must
+  //    appear on EVERY booking-intent turn; the model can neither omit nor
+  //    override it.
+  //    (Previously gated by `!lastAssistant?.includes(url)`, which SUPPRESSED the
+  //    link on follow-up turns once a prior reply already carried the same URL —
+  //    so while the model kept asking conversational questions, booking intent
+  //    was detected but the link went missing. The link IS the answer here, so
+  //    repeating it is correct, not spam.)
   const u = decision.turn?.understanding;
   let linkAttached: PlatformLink = null;
   if (decision.ok && u) {
@@ -124,16 +132,14 @@ export async function runPlatformTurn(
     if (wantsManage) {
       const apptId = await nearestUpcomingAppointmentId(db, businessId, customerId);
       const url = apptId ? buildAppointmentLink(apptId) : buildBookingLink(ctx.business.slug, customerPhone);
-      if (!lastAssistant?.includes(url)) {
-        replyText = `${replyText}\n\n${apptId ? MANAGE_LINE : BOOK_LINE}\n${url}`;
-        linkAttached = apptId ? "manage" : "booking";
-      }
+      replyText = `${replyText}\n\n${apptId ? MANAGE_LINE : BOOK_LINE}\n${url}`;
+      linkAttached = apptId ? "manage" : "booking";
+      logPlatformLink(linkAttached, url);
     } else if (wantsBooking) {
       const url = buildBookingLink(ctx.business.slug, customerPhone);
-      if (!lastAssistant?.includes(url)) {
-        replyText = `${replyText}\n\n${BOOK_LINE}\n${url}`;
-        linkAttached = "booking";
-      }
+      replyText = `${replyText}\n\n${BOOK_LINE}\n${url}`;
+      linkAttached = "booking";
+      logPlatformLink(linkAttached, url);
     }
   }
 
@@ -173,6 +179,26 @@ function lastAssistantLine(transcript: string): string | null {
   const lines = transcript.split("\n").filter((l) => l.startsWith("Assistant (you, earlier): "));
   if (lines.length === 0) return null;
   return lines[lines.length - 1].replace("Assistant (you, earlier): ", "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Diagnostics for the attached CTA: logs the link's base ORIGIN + PATH only.
+ * Never logs the `?p=<phone>` query (dropped) or the full appointment-id access
+ * token (truncated to 8 chars) — no secrets, no PII. Lets us confirm at a glance
+ * that PUBLIC_BASE_URL resolved to the intended domain (e.g. the Vercel URL) and
+ * not the localhost fallback.
+ */
+function logPlatformLink(kind: PlatformLink, url: string): void {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(
+      /\/appointment\/([0-9a-f]{8})[0-9a-f-]*/i,
+      "/appointment/$1…"
+    );
+    console.log(`[platform-turn] link_attached=${kind} base=${parsed.origin} path=${path}`);
+  } catch {
+    console.log(`[platform-turn] link_attached=${kind} (url parse failed)`);
+  }
 }
 
 function errorDecision(branch: string, ok = false): ReceptionistDecision {
