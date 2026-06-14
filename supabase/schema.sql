@@ -601,3 +601,31 @@ ALTER TABLE business_settings
   ADD COLUMN IF NOT EXISTS last_whatsapp_error_at TIMESTAMPTZ;
 ALTER TABLE business_settings
   ADD COLUMN IF NOT EXISTS whatsapp_consecutive_failures INTEGER NOT NULL DEFAULT 0;
+
+-- ============================================================
+-- Row Level Security (migration 011)
+--
+-- The app connects ONLY as service_role (lib/supabase/server.ts), which has
+-- BYPASSRLS — so RLS never affects any server flow. The anon key is never used
+-- to query the DB (lib/supabase/client.ts has no importers). Enabling RLS with
+-- NO policies denies the public anon/authenticated roles all access while the
+-- service_role keeps working. This is the strictest safe posture; permissive
+-- anon policies are intentionally omitted (they would re-expose customer data).
+-- Idempotent: ENABLE on an already-enabled table is a no-op.
+-- ============================================================
+ALTER TABLE public.businesses           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_settings    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff_members        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_hours       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.staff_working_hours  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.service_categories   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.services             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customers            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.appointments         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.messages             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conversation_states  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.knowledge_base_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ai_settings          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ai_events            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.events               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.waitlist_entries     ENABLE ROW LEVEL SECURITY;
