@@ -127,7 +127,8 @@ export async function runPlatformTurn(
     const wantsBooking = u.appointmentIntent === "BOOK" || u.intent === "booking";
     const wantsManage =
       u.appointmentIntent === "CANCEL" || u.appointmentIntent === "RESCHEDULE" ||
-      u.appointmentIntent === "MODIFY" || u.intent === "cancel_request" || u.intent === "reschedule_request";
+      u.appointmentIntent === "MODIFY" || u.appointmentIntent === "LIST" ||
+      u.intent === "cancel_request" || u.intent === "reschedule_request";
 
     if (wantsManage) {
       const apptId = await nearestUpcomingAppointmentId(db, businessId, customerId);
