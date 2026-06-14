@@ -30,9 +30,22 @@ conversational-machinery removal) are scoped in TRANSITION_PLAN.md.
   sharper FAQ (answer-first), honest escalation, one-question ambiguity handling.
 - **Booking UX polish**: trust chips, structured detail card (confirm + success),
   `aria-live` slot states, RTL/a11y, service-card affordances.
-- **AI Settings product area**: migration 008 (`business_type`/`persona_voice`/
-  `things_to_avoid`, NOT applied), strangler-safe `updateAISettings` (saves core if
-  the columns are missing), dashboard "אישיות העסק" section + deferred notice.
+- **AI Settings = "Define your receptionist"** (SIMPLIFIED 2026-06-13, latest):
+  the form is now five plain sections (Capabilities / Identity / Personality /
+  Writing style / Hard rules). `tone` presets and `business_type` were RETIRED from
+  the UI + persona (the AI learns the business from facts/services/KB; both columns
+  kept dormant as read-only back-compat — persona still reads `tone` as a silent
+  fallback for configs that only set one). Personality is ONE natural-language field
+  (`custom_instructions`) + an optional **✨ enhance** button (`lib/ai/persona-enhance.ts`,
+  `enhancePersonaAction`) that rewrites the description via one fail-soft, settings-time
+  Gemini call — NOT on the customer-turn path (`brain.ts` is still the only per-turn
+  call site). Added **`assistant_gender`** (Identity) for Hebrew self-reference
+  ("אני שמחה" vs "אני שמח"); default neutral; does not change customer-directed phrasing.
+  Predefined starter templates were REMOVED (user-owned named profiles are the next
+  pass). `updateAISettings` is now precise-strangler-safe (drops only the offending
+  unknown column on a missing-column error). Migrations 008 + 009 applied; **migration
+  010 (`assistant_gender`) is NEW and not yet applied** — until then the strangler
+  drops the column on save and reads default to neutral (no behavior gap).
 - **Waitlist vertical slice**: join on fully-booked days; freed-slot matcher
   (`lib/booking/waitlist.ts`); cancel/reschedule (platform + dashboard) emit freed
   slots; `lib/events/process.ts` notifies the earliest waitlist match (FIFO, cap 1).
@@ -40,9 +53,11 @@ conversational-machinery removal) are scoped in TRANSITION_PLAN.md.
   driven by `POST /api/jobs/process` (JOBS_SECRET-gated; 503 until set).
 - **Audit**: confirmed all appointment writes are deterministic (`flow.ts` +
   `platform.ts`); `lib/ai/` never mutates appointments.
-- Sim scenarios added: 24 (receptionist quality), 25 (persona depth), 26 (waitlist
-  windows). Lint+build+full suite green.
-- New founder checkpoints: apply migration 008; set JOBS_SECRET + schedule the runner.
+- Sim scenarios: 24 (receptionist quality), 25 (rewritten → "Define your receptionist":
+  one description, gender self-reference, format precedence, legacy back-compat),
+  26 (waitlist windows). Lint+build+full suite green.
+- New founder checkpoints: **apply migration 010** (`assistant_gender`) to enable the
+  gender field (the code is fail-soft until then); set JOBS_SECRET + schedule the runner.
 
 ## What currently works (validated live and/or in sims)
 - End-to-end WhatsApp booking in Hebrew: greeting → any-order field collection →
