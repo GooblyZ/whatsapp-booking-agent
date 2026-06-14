@@ -35,6 +35,9 @@ export default async function BookingPage({ params, searchParams }: PageProps) {
     <main className={styles.page} dir="rtl" lang="he">
       <div className={styles.card}>
         <header className={styles.header}>
+          <div className={styles.monogram} aria-hidden>
+            {business.name.trim().charAt(0) || "✦"}
+          </div>
           <h1 className={styles.businessName}>{business.name}</h1>
           <p className={styles.subtitle}>קביעת תור אונליין</p>
           <ul className={styles.trustChips} aria-label="יתרונות">

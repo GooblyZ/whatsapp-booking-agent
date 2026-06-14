@@ -38,6 +38,9 @@ export default async function AppointmentPage({ params }: PageProps) {
     <main className={styles.page} dir="rtl" lang="he">
       <div className={styles.card}>
         <header className={styles.header}>
+          <div className={styles.monogram} aria-hidden>
+            {view.business.name.trim().charAt(0) || "✦"}
+          </div>
           <h1 className={styles.businessName}>{view.business.name}</h1>
           <p className={styles.subtitle}>פרטי התור שלך</p>
         </header>

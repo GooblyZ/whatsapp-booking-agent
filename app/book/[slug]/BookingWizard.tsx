@@ -113,7 +113,7 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
       <Steps current={step} />
 
       {step === "service" && (
-        <section aria-label="בחירת שירות">
+        <section className={styles.pane} aria-label="בחירת שירות">
           <h2 className={styles.stepTitle}>איזה שירות?</h2>
           <ul className={styles.serviceList}>
             {services.map((s) => (
@@ -136,9 +136,9 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
       )}
 
       {step === "time" && service && (
-        <section aria-label="בחירת מועד">
+        <section className={styles.pane} aria-label="בחירת מועד">
           <button type="button" className={styles.backLink} onClick={() => setStep("service")}>
-            ‹ {service.name}
+            › {service.name}
           </button>
           <h2 className={styles.stepTitle}>מתי נוח?</h2>
 
@@ -197,9 +197,9 @@ export default function BookingWizard({ slug, services, days, initialPhone }: Pr
       )}
 
       {step === "details" && service && time && (
-        <section aria-label="פרטים ואישור">
+        <section className={styles.pane} aria-label="פרטים ואישור">
           <button type="button" className={styles.backLink} onClick={() => { setStep("time"); setError(null); }}>
-            ‹ שינוי מועד
+            › שינוי מועד
           </button>
           <h2 className={styles.stepTitle}>כמעט סיימנו</h2>
 

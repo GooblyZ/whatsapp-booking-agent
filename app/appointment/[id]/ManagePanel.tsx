@@ -82,7 +82,10 @@ export default function ManagePanel({ id, status, isFuture, days, bookAgainUrl }
       <div className={styles.success} role="status">
         <div className={styles.successIcon} aria-hidden>✓</div>
         <h2 className={styles.successTitle}>התור עודכן!</h2>
-        <p className={styles.successHint}>הפרטים המעודכנים מופיעים למעלה לאחר רענון הדף.</p>
+        <p className={styles.successHint}>שלחנו לך אישור בוואטסאפ עם המועד החדש.</p>
+        <button type="button" className={styles.secondaryBtn} onClick={() => window.location.reload()}>
+          הצגת הפרטים המעודכנים
+        </button>
       </div>
     );
   }
@@ -125,9 +128,9 @@ export default function ManagePanel({ id, status, isFuture, days, bookAgainUrl }
       )}
 
       {changeable && mode === "reschedule" && (
-        <section aria-label="בחירת מועד חדש">
+        <section className={styles.pane} aria-label="בחירת מועד חדש">
           <button type="button" className={styles.backLink} onClick={() => { setMode("view"); setError(null); }}>
-            ‹ חזרה
+            › חזרה
           </button>
           <h2 className={styles.stepTitle}>לאיזה מועד לעבור?</h2>
 
