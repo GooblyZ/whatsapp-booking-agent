@@ -597,17 +597,55 @@ export function isLowSignalTurn(d: ReceptionistDecision): boolean {
 
 export type LowSignalKind = "gibberish" | "emoji" | "unclear" | "smalltalk" | "meta" | "productive";
 
-/** Fine-grained kind for logging + counting. gibberish/unclear push toward quiet
- *  mode; smalltalk/meta/productive do not. */
-export function lowSignalKind(d: ReceptionistDecision, message: string, serviceNames: string[] = []): LowSignalKind {
-  if (!d.ok || !d.turn) return "unclear";
-  const u = d.turn.understanding;
-  if (u.intent === "faq") return "productive";
-  if (claimsOperation(u)) return "productive";          // evidence gate already ran upstream
+// ── Axis 1 · TURN MEANING — the single, stateless turn classifier ──────────────
+// Consolidation target (ARCHITECTURE_ASSESSMENT §4a): "what is THIS message?" has
+// been answered by a scatter of detectors (looksLikeNoise / isEmojiOnly /
+// looksLikeGreetingOrMeta / the raw model intent). classifyTurnSignal is the ONE
+// place that question is answered; other call sites migrate to it incrementally.
+//
+// BEHAVIOR-NEUTRAL by construction: it encodes EXACTLY the precedence lowSignalKind
+// used — the model's "productive" judgement (faq / a corroborated operation) outranks
+// structural noise; the evidence gate is assumed to have ALREADY run upstream, so a
+// still-claimed operation is trusted. The old detectors stay in place (the pre-Gemini
+// guard still calls them directly) until each is provably unused.
+//
+// `emoji` is intentionally NOT a value yet: emoji-only turns are short-circuited
+// before Gemini (see runPlatformTurn) and never reach this classifier, and adding the
+// branch here would silently change lowSignalKind's contract for that latent input
+// (looksLikeNoise already treats emoji-only as gibberish). It joins when the
+// pre-Gemini emoji branch itself migrates onto classifyTurnSignal.
+export type TurnSignal = "substantive" | "gibberish" | "greeting" | "meta" | "unclear";
+
+export function classifyTurnSignal(
+  u: ReceptionistTurn["understanding"] | null | undefined,
+  message: string,
+  serviceNames: string[] = []
+): TurnSignal {
+  if (!u) return "unclear";
+  if (u.intent === "faq") return "substantive";
+  if (claimsOperation(u)) return "substantive";          // evidence gate already ran upstream
   if (looksLikeNoise(message, serviceNames)) return "gibberish";
-  if (u.intent === "smalltalk") return "smalltalk";
+  if (u.intent === "smalltalk") return "greeting";
   if (u.intent === "meta") return "meta";
   return "unclear";
+}
+
+// The (unchanged) low-signal vocabulary, now DERIVED from the Axis-1 signal so the
+// counting logic and the turn classifier can never drift apart.
+const SIGNAL_TO_LOW_SIGNAL_KIND: Record<TurnSignal, LowSignalKind> = {
+  substantive: "productive",
+  greeting: "smalltalk",
+  meta: "meta",
+  gibberish: "gibberish",
+  unclear: "unclear",
+};
+
+/** Fine-grained kind for logging + counting. gibberish/unclear push toward quiet
+ *  mode; smalltalk/meta/productive do not. Thin adapter over classifyTurnSignal
+ *  (Axis 1) — identical outputs to before, single source of turn meaning. */
+export function lowSignalKind(d: ReceptionistDecision, message: string, serviceNames: string[] = []): LowSignalKind {
+  if (!d.ok || !d.turn) return "unclear";
+  return SIGNAL_TO_LOW_SIGNAL_KIND[classifyTurnSignal(d.turn.understanding, message, serviceNames)];
 }
 
 /** Kinds that escalate toward quiet mode (the others reset the counter). */
