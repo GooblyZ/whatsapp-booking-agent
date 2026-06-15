@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "eval": "node --import tsx scripts/eval/reliability-eval.ts",
+    "eval:live": "node --env-file=.env.local --import tsx scripts/eval/live-understanding.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.107.0",
