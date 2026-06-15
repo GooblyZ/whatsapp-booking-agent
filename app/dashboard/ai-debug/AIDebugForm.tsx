@@ -53,7 +53,7 @@ export function AIDebugForm() {
           name="message"
           rows={3}
           required
-          placeholder="הדבק/י הודעת לקוח לבדיקה, לדוגמה: מה שעות הפעילות? / אני רוצה תספורת מחר בערב"
+          placeholder="הדבק/י הודעת לקוח לבדיקה, לדוגמה: מה שעות הפעילות? / אני רוצה לקבוע תור למחר בערב"
           defaultValue={state.message ?? ""}
           style={{
             width: "100%",

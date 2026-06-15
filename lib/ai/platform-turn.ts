@@ -16,7 +16,7 @@ import {
 } from "./conversation";
 import { isGeminiCoolingDown, geminiCooldownRemainingMs } from "./gemini";
 import {
-  runReceptionistTurn, FALLBACK, classifyInput, type ReceptionistDecision,
+  runReceptionistTurn, FALLBACK, classifyInput, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
 import { logAIEvent } from "./events";
@@ -30,6 +30,9 @@ export interface PlatformTurnOutcome {
   replyText: string;
   decision: ReceptionistDecision;
   linkAttached: PlatformLink;
+  /** Quiet mode: the router should NOT send a WhatsApp reply this turn (inbound is
+   *  already saved; state is persisted). Used to stop replying to endless nonsense. */
+  suppressReply?: boolean;
 }
 
 // WhatsApp renders *…* as bold and auto-links a bare URL on its own line. A bold
@@ -50,13 +53,18 @@ export async function runPlatformTurn(
   customerId: string,
   customerPhone: string,
   messageText: string,
-  rawState: string
+  rawState: string,
+  priorContext: Record<string, unknown> = {}
 ): Promise<PlatformTurnOutcome> {
+  // Low-signal escalation counter — persisted in the (always-idle) platform state.
+  const prevLowSignal = readLowSignalCount(priorContext);
+
   // Legacy conversational-booking states cannot continue in platform mode —
-  // reset once so the customer starts clean after the flip.
+  // reset once so the customer starts clean after the flip (but carry the
+  // low-signal counter forward so repeated gibberish across a reset still escalates).
   if (rawState !== "idle") {
     console.log(`[platform-turn] resetting legacy state "${rawState}" → idle`);
-    await upsertConversationState(db, businessId, customerId, "idle", {});
+    await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: prevLowSignal });
   }
 
   let ctx;
@@ -78,17 +86,100 @@ export async function runPlatformTurn(
   ]);
   const lastAssistant = lastAssistantLine(memory.transcript);
   const bookingBlock = [customerBlock, upcomingBlock].filter(Boolean).join("\n\n");
+  // A booking link was sent earlier iff our transcript already carries a URL — only
+  // we ever send links. Lets the reply legitimately reference "the link I sent".
+  const previousBookingLinkSent = /https?:\/\/\S+/.test(memory.transcript);
+
+  // ── EMOJI-ONLY messages (e.g. "🙏🏻", "😊😊"): contentless but legitimate. NEVER
+  //    call Gemini, and route them through the SAME low-signal counter + escalation
+  //    + quiet mode as text gibberish (fixes the per-emoji fallback spam). Mixed
+  //    text+emoji ("תודה 😊") is NOT emoji-only and flows normally. Detected
+  //    cheaply and generally (no blacklist): has a pictographic char and no letters/
+  //    digits. Gender on the boundary reply is fixed at the outbound chokepoint.
+  if (isEmojiOnly(messageText)) {
+    const newCount = prevLowSignal + 1;
+    const action = lowSignalActionFor(newCount);
+    let replyText = LOW_SIGNAL_SHORT;       // tiers 1-2: one short clarification
+    let suppressReply = false;
+    if (action === "boundary") replyText = LOW_SIGNAL_BOUNDARY;
+    else if (action === "quiet_mode") {
+      const plan = quietModePlan(newCount);
+      suppressReply = plan.suppressReply;
+      replyText = plan.suppressReply ? "" : LOW_SIGNAL_QUIET_REMINDER;
+    }
+    await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: newCount });
+    const decision = errorDecision("low_signal_emoji", true);
+    await safeLog(businessId, customerId, decision);
+    console.log(
+      `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=skip_gemini_emoji` +
+      ` gemini_skipped_reason=emoji_only low_signal=true low_signal_kind=emoji` +
+      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
+      ` low_signal_action=${action} reply_suppressed=${suppressReply} link=-`
+    );
+    return { replyText, decision, linkAttached: null, suppressReply };
+  }
+
+  // ── PRE-GEMINI QUIET-MODE GUARD (cost control, BEFORE any model call) ──────────
+  // Active only once the boundary has been set (3+ consecutive low-signal turns).
+  // Cheap, local classification decides — Gemini is never paid for here:
+  //   • OBVIOUS gibberish/keyboard-smash → no Gemini, mostly silent (sparse reminder)
+  //   • a normal greeting / meta ("היי", "מה קורה", "יש תשובה?") → NOT spam: a short
+  //     friendly RESET reply (no Gemini) and the counter resets — never silently dropped
+  //   • anything else (a real-looking message) → fall through to Gemini
+  const activeServiceNames = ctx.services.filter((s) => s.active).map((s) => s.name);
+  const preGemini = preGeminiAction(prevLowSignal, messageText, activeServiceNames);
+  if (preGemini !== "proceed_to_gemini") {
+    if (preGemini === "skip_gemini_gibberish") {
+      const newCount = prevLowSignal + 1;
+      const plan = quietModePlan(newCount);
+      await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: newCount });
+      const decision = errorDecision("low_signal_quiet", true);
+      await safeLog(businessId, customerId, decision);
+      console.log(
+        `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=skip_gemini_gibberish` +
+        ` gemini_skipped_reason=quiet_mode_gibberish low_signal=true low_signal_kind=gibberish` +
+        ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
+        ` low_signal_action=quiet_mode cooldown_short_circuit=true reply_suppressed=${plan.suppressReply} link=-`
+      );
+      return {
+        replyText: plan.suppressReply ? "" : LOW_SIGNAL_QUIET_REMINDER,
+        decision, linkAttached: null, suppressReply: plan.suppressReply,
+      };
+    }
+    if (preGemini === "cheap_reset_reply") {
+      // Human greeting/meta during quiet mode: answer cheaply and DE-escalate.
+      await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: 0 });
+      const decision = errorDecision("low_signal_reset", true);
+      await safeLog(businessId, customerId, decision);
+      console.log(
+        `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=cheap_reset_reply` +
+        ` gemini_skipped_reason=quiet_mode_reset_message low_signal=false low_signal_kind=meta` +
+        ` low_signal_count_before=${prevLowSignal} low_signal_count_after=0 reply_suppressed=false link=-`
+      );
+      return { replyText: QUIET_RESET, decision, linkAttached: null, suppressReply: false };
+    }
+    // else: real-looking message → fall through to Gemini (recovery happens there).
+  }
 
   // DEGRADED MODE: during a Gemini overload cooldown the platform story is
   // simple — the booking page IS the deterministic path. Route to it directly.
   if (isGeminiCoolingDown() && classifyInput(messageText) === "ok") {
-    console.warn(`[platform-turn] DEGRADED MODE — cooldown ${Math.ceil(geminiCooldownRemainingMs() / 1000)}s left; deterministic link reply`);
-    const link = buildBookingLink(ctx.business.slug, customerPhone);
-    let replyText = `יש לי רגע עומס קטן במערכת 🙏 אפשר בינתיים לקבוע, לשנות או לבדוק זמינות כאן:\n${link}`;
+    console.warn(`[platform-turn] DEGRADED MODE — cooldown ${Math.ceil(geminiCooldownRemainingMs() / 1000)}s left`);
+    // Even during an outage, only attach the link on a real booking signal — never
+    // spam a link onto small talk just because the AI is down.
+    if (hasBookingSignal(messageText, activeServiceNames)) {
+      const link = buildBookingLink(ctx.business.slug, customerPhone);
+      let replyText = `יש לי רגע עומס קטן במערכת 🙏 אפשר בינתיים לקבוע, לשנות או לבדוק זמינות כאן:\n${link}`;
+      if (ctx.aiSettings?.emoji_usage === "none") replyText = stripEmojis(replyText);
+      const decision = errorDecision("gemini_cooldown", true);
+      await safeLog(businessId, customerId, decision);
+      return { replyText, decision, linkAttached: "booking" };
+    }
+    let replyText = "יש לי רגע עומס קטן במערכת 🙏 אחזור אלייך עוד רגע — אפשר גם לכתוב לי שוב בעוד דקה.";
     if (ctx.aiSettings?.emoji_usage === "none") replyText = stripEmojis(replyText);
     const decision = errorDecision("gemini_cooldown", true);
     await safeLog(businessId, customerId, decision);
-    return { replyText, decision, linkAttached: "booking" };
+    return { replyText, decision, linkAttached: null };
   }
 
   let replyGuidance: string | undefined;
@@ -114,14 +205,29 @@ export async function runPlatformTurn(
   if (decision.ok && claimsBookingCompleted(replyText)) {
     replyText = "את התור עצמו קובעים בקישור — שניה ושולח לך אותו 🙂";
   }
-  // Never send the exact same reply twice in a row.
+  // Never send the exact same reply twice in a row. (No link wording here — a link
+  // is only ever promised by the deterministic link logic below, never by a generic
+  // fallback; the link-wording fence at the end is the backstop.)
   if (decision.ok && sameOutboundText(replyText, lastAssistant)) {
-    replyText = "אני כאן 🙂 אפשר לשאול אותי הכל על העסק, או לקבוע תור בקישור למטה.";
+    replyText = "אני כאן 🙂 אפשר לשאול אותי כל דבר על העסק, או לקבוע תור מתי שתרצה.";
   }
 
   // ── Outbound URL safety: strip any URL the MODEL wrote (echoed from history or
   //    invented) so the final message carries AT MOST the one deterministic link.
   replyText = stripModelUrls(replyText);
+
+  // ── EVIDENCE GATE (BUG-004): never trust a model-claimed operation without
+  //    supporting evidence in the USER message. Gemini hallucinates BOOK on
+  //    gibberish; this downgrades it to non-actionable IN PLACE, so the corrected
+  //    understanding flows into BOTH the link decision and the low-signal counter
+  //    below (a hallucinated BOOK can no longer reset the counter / escape quiet mode).
+  let bookingEvidence = false;
+  let bookingEvidenceReason = "n/a";
+  if (decision.ok && decision.turn) {
+    const ev = applyBookingEvidenceGate(decision.turn.understanding, messageText, activeServiceNames);
+    bookingEvidence = ev.evidence;
+    bookingEvidenceReason = ev.reason;
+  }
 
   // ── Deterministic link control (OVERRIDES Gemini's intent). Complaints about
   //    links/bugs, bare meta-questions ("מה?"/"למה?"/"לא הבנתי"), corrections and
@@ -142,13 +248,24 @@ export async function runPlatformTurn(
       console.log("[platform-turn] link suppressed (meta/non-action) — model reply kept, no link");
     }
   } else if (decision.ok && u) {
-    const wantsBooking = u.appointmentIntent === "BOOK" || u.intent === "booking";
-    const wantsManage =
+    // PRIMARY GATE — actionability: the model must have judged this an actual
+    // business operation. (The parser already forces appointmentIntent=NONE when
+    // requestsBusinessAction is false, so this is also defense-in-depth.)
+    const isAction = u.requestsBusinessAction === true;
+    const wantsBooking = isAction && (u.appointmentIntent === "BOOK" || u.intent === "booking");
+    const wantsManage = isAction && (
       u.appointmentIntent === "CANCEL" || u.appointmentIntent === "RESCHEDULE" ||
       u.appointmentIntent === "MODIFY" || u.appointmentIntent === "LIST" ||
-      u.intent === "cancel_request" || u.intent === "reschedule_request";
+      u.intent === "cancel_request" || u.intent === "reschedule_request");
 
-    if (wantsManage) {
+    // SECONDARY GATE (deterministic floor): even an affirmed operation must be
+    // corroborated by a real booking/service signal in the message — catches the
+    // rare case where the model still over-asserts an action.
+    const bookingSignal = hasBookingSignal(messageText, activeServiceNames);
+
+    if ((wantsBooking || wantsManage) && !bookingSignal) {
+      console.log(`[platform-turn] link suppressed: action=${isAction} intent=${u.intent}/${u.appointmentIntent} but no booking signal in message`);
+    } else if (wantsManage) {
       // Deterministic link decision — code decides the fact, the model never
       // guesses how many appointments exist or which one to manage:
       //   0 upcoming → booking link (nothing to manage; offer to book)
@@ -200,18 +317,66 @@ export async function runPlatformTurn(
     }
   }
 
+  // ── LOW-SIGNAL GUARD: gently clarify, then set a polite boundary, so repeated
+  //    no-intent / gibberish messages don't loop forever. Any productive turn (a
+  //    real business question or an operation) resets the counter. Friendly first.
+  // Counter is driven by KIND, not raw intent: only gibberish + meaningless unclear
+  // escalate. Greetings/smalltalk/meta are legitimate human turns — they reset the
+  // counter and keep the model's friendly reply (BUG-005). Productive resets too.
+  const kind: LowSignalKind = decision.ok && decision.turn
+    ? lowSignalKind(decision, messageText, activeServiceNames)
+    : "unclear";
+  const lowSignal = decision.ok && !!decision.turn && countsTowardQuiet(kind);
+  let newLowSignal = prevLowSignal;
+  let lowSignalAct: LowSignalAction = "none";
+  let suppressReply = false;
+  if (decision.ok && decision.turn) {
+    newLowSignal = lowSignal ? prevLowSignal + 1 : 0;
+    lowSignalAct = lowSignalActionFor(newLowSignal);
+    // count 1 → keep the model's (friendly) clarification; escalate from 2 up.
+    if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
+    else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
+    else if (lowSignalAct === "quiet_mode") {
+      // Reached via Gemini (the message wasn't obvious local nonsense). Go sparse:
+      // mostly suppress, a rare reminder — never the same line every turn.
+      linkAttached = null;
+      const plan = quietModePlan(newLowSignal);
+      if (plan.suppressReply) suppressReply = true;
+      else replyText = LOW_SIGNAL_QUIET_REMINDER;
+    }
+  }
+  // !decision.ok (system fallback) leaves the counter unchanged — never penalize a
+  // customer for our own error.
+
+  // ── LINK-WORDING FENCE: never imply a link is present/sent unless one was
+  //    actually attached this turn or sent earlier in the conversation.
+  let linkWordingFenceApplied = false;
+  if (shouldFenceLinkWording(linkAttached, previousBookingLinkSent, replyText)) {
+    replyText = stripPhantomLinkWording(replyText);
+    linkWordingFenceApplied = true;
+  }
+
+  // Persist the low-signal counter (platform state is always idle).
+  await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: newLowSignal });
+
   if (ctx.aiSettings?.emoji_usage === "none") {
     replyText = stripEmojis(replyText);
   }
 
   await safeLog(businessId, customerId, decision);
   console.log(
-    `[platform-turn] ai_called=${decision.geminiCalled} intent=${u?.intent ?? "-"}` +
-    ` appt_intent=${u?.appointmentIntent ?? "-"} link=${linkAttached ?? "-"}` +
+    `[platform-turn] ai_called=${decision.geminiCalled} action=${u?.requestsBusinessAction ?? "-"}` +
+    ` intent=${u?.intent ?? "-"} appt_intent=${u?.appointmentIntent ?? "-"} link=${linkAttached ?? "-"}` +
+    ` booking_evidence=${bookingEvidence} booking_evidence_reason=${bookingEvidenceReason}` +
+    ` pre_gemini_guard=false pre_gemini_action=proceed_to_gemini gemini_skipped_reason=none` +
+    ` low_signal=${lowSignal} low_signal_kind=${kind}` +
+    ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newLowSignal}` +
+    ` low_signal_action=${lowSignalAct} cooldown_short_circuit=false reply_suppressed=${suppressReply}` +
+    ` link_wording_fence_applied=${linkWordingFenceApplied}` +
     ` src=${decision.replySource} memLines=${memory.turnsUsed}`
   );
 
-  return { replyText, decision, linkAttached };
+  return { replyText, decision, linkAttached, suppressReply };
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -220,6 +385,198 @@ function lastAssistantLine(transcript: string): string | null {
   const lines = transcript.split("\n").filter((l) => l.startsWith("Assistant (you, earlier): "));
   if (lines.length === 0) return null;
   return lines[lines.length - 1].replace("Assistant (you, earlier): ", "").replace(/\s+/g, " ").trim();
+}
+
+// ── Low-signal conversation guard ──────────────────────────────────────────────
+// "Low-signal" = the model judged the turn NON-actionable AND conversationally
+// empty (unclear / gibberish / off-topic / contentless small talk / a question
+// about the bot). A real business question (faq) or any operation is NOT low-signal.
+// Driven entirely by the model/router classification + a per-session counter — no
+// hardcoded message lists.
+export type LowSignalAction = "none" | "normal_clarify" | "short_clarify" | "boundary" | "quiet_mode";
+
+export const LOW_SIGNAL_SHORT =
+  "לא הצלחתי להבין 🙂 רוצה לקבוע תור, או לשאול משהו על העסק?";
+export const LOW_SIGNAL_BOUNDARY =
+  "נראה שאני לא מצליחה להבין את הכוונה כרגע. אפשר לכתוב שוב בצורה ברורה כשתרצה לקבוע תור או לשאול משהו על העסק.";
+// Sparse reminder used RARELY in quiet mode (not every turn) — distinct from the
+// boundary so we never loop the same sentence.
+export const LOW_SIGNAL_QUIET_REMINDER =
+  "עדיין כאן 🙂 כשיהיה ברור מה צריך — תור או שאלה על העסק — אשמח לעזור.";
+// Cheap, friendly reset used when a real human greeting/meta arrives during quiet
+// mode — answered WITHOUT Gemini, and the counter resets (never silently dropped).
+export const QUIET_RESET =
+  "אני כאן 🙂 אפשר לכתוב לי אם תרצה לקבוע תור או לשאול משהו על העסק.";
+
+export function readLowSignalCount(context: Record<string, unknown>): number {
+  const n = context?.consecutiveLowSignalTurns;
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+// Compact recognizer for normal greetings / "are you there?" / follow-up meta — a
+// SMALL bounded set (not a gibberish blacklist) so quiet mode can answer a real
+// human cheaply instead of suppressing them. Only short messages qualify; anything
+// with a booking/service signal is productive, not a greeting.
+const GREETING_META_RE =
+  /^(היי+|הי|שלום|הלו+|אהלן|בוקר טוב|ערב טוב|צהריים טובים|מה קורה|מה נשמע|מה המצב|מה חדש|מה איתך|יש תשובה|יש מישהו|אתה שם|את שם|מישהו שם|למה לא ענית|למה אתה לא עונה|למה את לא עונה|מה קורה פה|מה קורה כאן|מה אתה עושה)(?=\s|$)/;
+export function looksLikeGreetingOrMeta(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim().replace(/[?!.…״"'\s]+$/g, "").trim();
+  if (t.length === 0 || t.length > 22) return false; // greetings/meta are short
+  if (hasBookingSignal(t, serviceNames)) return false; // productive, not a greeting
+  return GREETING_META_RE.test(t);
+}
+
+// ── Cheap LOCAL low-signal detector (no Gemini) ────────────────────────────────
+// Recognizes OBVIOUS nonsense so quiet mode can short-circuit before the model:
+// single chars, punctuation-only, keyboard-smash, Hebrew consonant clusters,
+// misplaced final-form letters. Deliberately HIGH-PRECISION and conservative —
+// anything with a booking/service signal, a space (multi-word), a "?", or vowel
+// structure is left for Gemini. No blacklist; purely structural.
+const HEB_FINAL = "ךםןףץ"; // final-form letters — valid only at a word's end
+const HEB_VOWEL = "אהוי";  // mater lectionis — almost every real Hebrew word has one
+const isHebrewChar = (c: string): boolean => {
+  const n = c.charCodeAt(0);
+  return n >= 0x0590 && n <= 0x05ff;
+};
+
+export function looksLikeNoise(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (!t) return false;
+  if (hasBookingSignal(t, serviceNames)) return false;     // productive → never noise
+  if (t.length <= 1) return true;                           // single character
+  if (/^[^\p{L}\p{N}]+$/u.test(t)) return true;             // punctuation/symbols only
+  if (t.includes("?") || t.includes("؟")) return false;     // a question → let Gemini decide
+  if (/\s/.test(t)) return false;                           // multi-word → conservative, let Gemini
+  // Single token: structural gibberish signals.
+  const chars = [...t];
+  for (let i = 0; i < chars.length - 1; i++) {
+    if (HEB_FINAL.includes(chars[i])) return true;          // final-form letter mid-word
+  }
+  const hasVowel = chars.some((c) => HEB_VOWEL.includes(c));
+  const hebrewCount = chars.filter(isHebrewChar).length;
+  // Hebrew "mater lectionis" (א/ה/ו/י) appear in almost every real word; a 4+ letter
+  // single token with NONE is a consonant smash ("חבצב", "חכלגצג"). 3-letter no-vowel
+  // words exist ("מחר") so the floor is 4.
+  if (!hasVowel && hebrewCount >= 4) return true;
+  return false;
+}
+
+/**
+ * True for an EMOJI-ONLY message: at least one pictographic emoji and NO meaningful
+ * letters or digits (so emoji + modifiers / skin tones / ZWJ / variation selectors /
+ * punctuation / whitespace all qualify). General, not a blacklist. Mixed text+emoji
+ * ("תודה 😊") returns false. */
+export function isEmojiOnly(message: string): boolean {
+  const t = (message ?? "").trim();
+  if (!t) return false;
+  if (!/\p{Extended_Pictographic}/u.test(t)) return false; // must contain an emoji
+  return !/[\p{L}\p{N}]/u.test(t);                          // and no letters/digits anywhere
+}
+
+// ── Quiet-mode sparse-reply planner ────────────────────────────────────────────
+// Quiet mode starts at the 4th consecutive low-signal turn (the boundary was the
+// 3rd). We then go mostly silent and emit ONE short reminder only every N turns,
+// so we neither spam the same line forever nor ghost a possibly-confused user.
+const QUIET_REMINDER_EVERY = 4;
+export function quietModePlan(count: number): { isQuiet: boolean; suppressReply: boolean } {
+  if (count < 4) return { isQuiet: false, suppressReply: false };
+  const quietIndex = count - 3; // 1, 2, 3, …
+  const sendReminder = quietIndex % QUIET_REMINDER_EVERY === 0;
+  return { isQuiet: true, suppressReply: !sendReminder };
+}
+
+/** Does this turn push toward QUIET MODE? Only truly low-content turns do —
+ *  gibberish and meaningless "unclear". Real business questions (faq), operations,
+ *  AND ordinary greetings/smalltalk/meta are NOT counted (BUG-005: a greeting is a
+ *  legitimate human message, not spam). */
+export function isLowSignalTurn(d: ReceptionistDecision): boolean {
+  if (!d.ok || !d.turn) return false;
+  const u = d.turn.understanding;
+  if (u.requestsBusinessAction) return false;       // an operation is productive
+  if (u.intent === "faq") return false;             // a real business question is productive
+  return u.intent === "unclear" || u.intent === "out_of_scope";
+}
+
+export type LowSignalKind = "gibberish" | "emoji" | "unclear" | "smalltalk" | "meta" | "productive";
+
+/** Fine-grained kind for logging + counting. gibberish/unclear push toward quiet
+ *  mode; smalltalk/meta/productive do not. */
+export function lowSignalKind(d: ReceptionistDecision, message: string, serviceNames: string[] = []): LowSignalKind {
+  if (!d.ok || !d.turn) return "unclear";
+  const u = d.turn.understanding;
+  if (u.intent === "faq") return "productive";
+  if (claimsOperation(u)) return "productive";          // evidence gate already ran upstream
+  if (looksLikeNoise(message, serviceNames)) return "gibberish";
+  if (u.intent === "smalltalk") return "smalltalk";
+  if (u.intent === "meta") return "meta";
+  return "unclear";
+}
+
+/** Kinds that escalate toward quiet mode (the others reset the counter). */
+export function countsTowardQuiet(kind: LowSignalKind): boolean {
+  return kind === "gibberish" || kind === "unclear";
+}
+
+export type PreGeminiAction = "skip_gemini_gibberish" | "cheap_reset_reply" | "proceed_to_gemini";
+
+/** Decides — BEFORE any model call — what to do with the incoming message. Quiet
+ *  mode (3+ prior low-signal turns) short-circuits obvious gibberish (no Gemini) and
+ *  answers a human greeting/meta cheaply (no Gemini, never silent). Everything else
+ *  proceeds to Gemini, where recovery/normal handling happens. */
+export function preGeminiAction(prevLowSignal: number, message: string, serviceNames: string[] = []): PreGeminiAction {
+  if (prevLowSignal < 3) return "proceed_to_gemini";          // not in quiet mode
+  if (looksLikeNoise(message, serviceNames)) return "skip_gemini_gibberish";
+  if (looksLikeGreetingOrMeta(message, serviceNames)) return "cheap_reset_reply";
+  return "proceed_to_gemini";                                 // real-looking message
+}
+
+/** Escalation tier for N consecutive low-signal turns. */
+export function lowSignalActionFor(count: number): LowSignalAction {
+  if (count <= 0) return "none";
+  if (count === 1) return "normal_clarify"; // friendly, keep the model's reply
+  if (count === 2) return "short_clarify";
+  if (count === 3) return "boundary";
+  return "quiet_mode";
+}
+
+// ── Link-wording fence ─────────────────────────────────────────────────────────
+// Catches replies that imply a link is PRESENT/SENT ("בקישור למטה", "דרך הקישור",
+// "הקישור ששלחתי") when none was attached. Deliberately does NOT match a future
+// promise ("אשלח לך קישור") — only references to an existing/attached link.
+const PHANTOM_LINK_RE =
+  /(?:דרך\s+ה?|ב)(?:קישור|לינק|link)|ה(?:קישור|לינק)\s+(?:ש?שלחתי|למטה|הזה|המצורף|מצורף|מעלה)/i;
+// The phantom phrase + the rest of its clause, removed wholesale.
+const PHANTOM_LINK_STRIP =
+  /\s*(?:דרך\s+ה?|ב)(?:קישור|לינק|link)[^.,!?\n]*|\s*ה(?:קישור|לינק)\s+(?:ש?שלחתי|למטה|הזה|המצורף|מצורף|מעלה)[^.,!?\n]*/gi;
+const LINK_SAFE_FALLBACK = "אני כאן 🙂 אפשר לשאול אותי על העסק או לקבוע תור.";
+
+export function mentionsPhantomLink(text: string): boolean {
+  return PHANTOM_LINK_RE.test(text ?? "");
+}
+
+/** Whether to rewrite phantom link wording: only when NO link was attached this
+ *  turn AND none was sent earlier AND the reply implies one exists. (So
+ *  "בקישור ששלחתי" is allowed once a link really was sent.) */
+export function shouldFenceLinkWording(
+  linkAttached: PlatformLink, previousBookingLinkSent: boolean, reply: string
+): boolean {
+  return linkAttached === null && !previousBookingLinkSent && mentionsPhantomLink(reply);
+}
+
+/** Removes phantom link references and tidies the leftovers; falls back to a safe
+ *  line if stripping would leave the reply empty/too short. */
+export function stripPhantomLinkWording(text: string): string {
+  let out = (text ?? "")
+    .replace(PHANTOM_LINK_STRIP, "")
+    .replace(/\s*[,،]\s*(?:או|וגם)?\s*([.!?]|$)/g, "$1") // dangling ", או ." → "."
+    .replace(/\s+(?:או|וגם)\s*([.!?]|$)/g, "$1")          // dangling " או." → "."
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([.!?])/g, "$1")
+    .trim();
+  // If stripping left almost nothing (the reply was basically just a link line),
+  // use a safe canned line. Codepoint-safe: count non-whitespace characters.
+  if (out.replace(/\s/g, "").length < 3) out = LINK_SAFE_FALLBACK;
+  return out;
 }
 
 // ── Deterministic link-control (overrides Gemini's intent classification) ──────
@@ -255,6 +612,100 @@ export function suppressLinkFor(message: string): boolean {
   return false;
 }
 
+// ── Deterministic BOOKING-SIGNAL gate ──────────────────────────────────────────
+// A booking/manage link attaches only when Gemini's intent AND a real booking
+// signal in the message AGREE — two independent gates. This stops the live
+// "unsure → BOOK" drift, where vague/unrelated messages ("אני טס לחו״ל עוד
+// שבועיים", "רציתי לאכול", "מה עוד?", "לא תעזרי לי בזה?") were classified BOOK by
+// the model and wrongly received a link. The SHOULD-BOOK cases all carry a signal
+// (a booking verb or a service name), so genuine intent is never blocked.
+// No \b (it doesn't work on Hebrew). Each term is bounded so it can't fire inside
+// a longer word ("צבע" must NOT match "האצבע"/finger), while still allowing the
+// standard one-letter Hebrew prefixes ב/ה/ל/ו/ש/מ/כ so "הצבע"/"לתורים" still match.
+// Hebrew range via explicit codepoints (never a literal glyph, whose value is
+// unreliable through tooling).
+const HEB = `${String.fromCharCode(0x0590)}-${String.fromCharCode(0x05ff)}`;
+function bookingToken(term: string): string {
+  return `(?<![${HEB}])[בהלושמכ]?${term}`;
+}
+function escapeForRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+const BOOKING_DOMAIN = [
+  "לקבוע", "לקבע", "קביעת", "לתאם", "תיאום", "להזמין", "הזמנה", "פגישה", "פנוי", "זמינות",
+  "תורים", "לבטל", "ביטול", "לבטול", "להזיז", "לשנות", "לדחות", "להקדים", "לעדכן",
+];
+// BUSINESS-AGNOSTIC (see CLAUDE.md "Product principle"): the business's OWN configured
+// service names are the PRIMARY signal (matched below in hasBookingSignal). This list is
+// only a small generic fallback of cross-industry service/booking NOUNS — never a
+// per-vertical service catalogue. It must stay industry-neutral: a haircut, a Pilates
+// class, a physiotherapy session and a manicure all reach it through the same generic
+// words OR (better) through the business's configured service names. Do NOT re-add
+// salon-specific terms (תספורת / צבע / בלונד / מניקור …) here — those belong in each
+// business's services data. (Booking VERBS and the generic nouns פגישה/תורים already live
+// in BOOKING_DOMAIN above; bare "תור"/"ביקור" are deliberately omitted — they fire inside
+// תורה/תורת and ביקורת.) Every term is intent-gated (a link attaches only when Gemini ALSO
+// judged the turn an operation), but keep additions generic to avoid false signals — and
+// extend SCENARIO 29 in the sim suite when you change this.
+const GENERIC_SERVICE = [
+  "שירות", "טיפול", "שיעור", "סשן", "ייעוץ", "אימון",
+];
+const SIGNAL_RE = new RegExp([...BOOKING_DOMAIN, ...GENERIC_SERVICE].map(bookingToken).join("|"));
+
+/** True when the message carries a genuine booking/manage/service signal — the
+ *  deterministic half of the two-gate link decision (the other half is Gemini's
+ *  intent). Checks booking verbs, generic service words, and the business's own
+ *  configured service names — all word-bounded so they don't misfire mid-word. */
+export function hasBookingSignal(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (!t) return false;
+  if (SIGNAL_RE.test(t)) return true;
+  for (const name of serviceNames) {
+    const n = (name ?? "").trim();
+    if (n.length >= 2 && new RegExp(bookingToken(escapeForRegex(n))).test(t)) return true;
+  }
+  return false;
+}
+
+// ── EVIDENCE GATE (BUG-004) ────────────────────────────────────────────────────
+// Gemini intermittently hallucinates BOOK for keyboard-smash gibberish ("חכלגצג",
+// "חבצב"). The model's claim alone is NOT trusted: an operation
+// (BOOK / RESCHEDULE / CANCEL / LIST) requires CORROBORATING EVIDENCE in the user's
+// own words (a booking/manage verb or a service name). Without it, the turn is
+// downgraded to non-actionable — so it can't reset the low-signal counter or escape
+// quiet mode. (FAQ stays productive via intent; it isn't an operation.)
+type Understanding = ReceptionistTurn["understanding"];
+const APPT_OPERATIONS = ["BOOK", "RESCHEDULE", "CANCEL", "MODIFY", "LIST"];
+const INTENT_OPERATIONS = ["booking", "cancel_request", "reschedule_request"];
+
+/** True when the model's understanding asserts a business OPERATION (not FAQ/chat). */
+export function claimsOperation(u: Understanding): boolean {
+  return u.requestsBusinessAction === true ||
+    APPT_OPERATIONS.includes(u.appointmentIntent) ||
+    INTENT_OPERATIONS.includes(u.intent);
+}
+
+/**
+ * Enforces the evidence requirement IN PLACE. If an operation is claimed but the
+ * user message carries no booking/service evidence, the operation is stripped
+ * (requestsBusinessAction=false, appointmentIntent=NONE, operation-intent→unclear).
+ * Returns whether evidence was present + a reason for logs. No-op for non-operations.
+ */
+export function applyBookingEvidenceGate(
+  u: Understanding, message: string, serviceNames: string[]
+): { evidence: boolean; reason: string } {
+  if (!claimsOperation(u)) {
+    return { evidence: false, reason: u.intent === "faq" ? "faq_productive" : "no_operation_claimed" };
+  }
+  const evidence = hasBookingSignal(message, serviceNames);
+  if (!evidence) {
+    u.requestsBusinessAction = false;
+    u.appointmentIntent = "NONE";
+    if (INTENT_OPERATIONS.includes(u.intent)) u.intent = "unclear";
+  }
+  return { evidence, reason: evidence ? "signal_in_message" : "no_signal_model_hallucinated" };
+}
+
 /** Removes any URL the model wrote so the final message carries at most the one
  *  deterministic platform link (prevents the "two links" the user complained of). */
 export function stripModelUrls(text: string): string {
@@ -283,7 +734,9 @@ function appendPlatformLink(
 const SCHEDULING_Q = new RegExp(
   [
     "איז[הו]\\s+(שירות|טיפול|יום|תאריך|שעה|תור)",
-    "מתי\\s+(נוח|בא\\s*לך|מתאים|תרצ|תוכל|יתאים)",
+    "מתי\\s+(נוח|בא\\s*לך|מתאים|תרצ|תוכל|יתאים|מעדיפ|תעדיפ|נראה|להגיע|לקבוע|לבוא)",
+    "מתאים\\s+לך\\s+\\S*\\s*(שעה|יום|תאריך|מועד)",
+    "שעה\\s+(מסוימת|מסויימת|ספציפית|שנוחה|שמתאימה)",
     "מה\\s+התאריך",
     "באיז[הו]\\s+(תאריך|שעה|שירות|יום|תור)",
     "לאיז[הו]\\s+(שעה|תאריך|יום|שירות|תור)",

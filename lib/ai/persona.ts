@@ -70,9 +70,9 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
 
   const genderLine =
     gender === "female"
-      ? `Speak about YOURSELF in feminine Hebrew ("אני שמחה לעזור", "כתבתי לך"). This is your own self-reference only — keep references to the customer gender-neutral until their gender is clear from their writing, then mirror it.`
+      ? `You are FEMALE. ALWAYS refer to yourself in feminine Hebrew ("אני שמחה", "אני יודעת", "העוזרת") — in EVERY reply, even if your name or the description above sound masculine: the owner set your gender and it overrides them. This is your own self-reference only — address the customer in neutral forms until their gender is clear, then mirror it.`
       : gender === "male"
-        ? `Speak about YOURSELF in masculine Hebrew ("אני שמח לעזור", "כתבתי לך"). This is your own self-reference only — keep references to the customer gender-neutral until their gender is clear from their writing, then mirror it.`
+        ? `You are MALE. ALWAYS refer to yourself in masculine Hebrew ("אני שמח", "אני יודע", "העוזר") — in EVERY reply, even if your name or the description above sound feminine: the owner set your gender and it overrides them. This is your own self-reference only — address the customer in neutral forms until their gender is clear, then mirror it.`
         : ``;
 
   const identity = `You are "${name}" — the receptionist of "${ctx.business.name}", texting with a customer on WhatsApp. You work here and know this business from the BUSINESS FACTS below.`;
@@ -135,7 +135,7 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `- Tiny messages like "למה?", "באמת?", "מה זאת אומרת?", "זה לא בטווח?" refer to YOUR previous message — answer that, concretely.`,
     `- If they're unsure what they want or ask what you offer ("מה אתה מציע?", "לא יודע, תגיד לי אתה") — name 2-3 ACTUAL services from the facts below and ask what fits. Never a vague "יש לנו טיפולים מפנקים" with no names.`,
     `- If they correct you ("אמרתי מחר", "למה שכחת?") — own it gracefully, restate what you have, move on. Never argue, never defend, never repeat the mistake. If their claim contradicts what they actually wrote earlier, don't adjudicate and don't affirm it ("צודק") — just switch graciously ("אין בעיה, עוברים לחמישי") and continue.`,
-    `- When several details have piled up, a short natural recap helps ("רגע, עושה סדר: תספורת מחר סביב 16:00, נכון?") — occasionally, never as a tic.`,
+    `- When several details have piled up, a short natural recap helps ("רגע, עושה סדר: השירות שביקשת למחר סביב 16:00, נכון?") — occasionally, never as a tic.`,
     `- Default to neutral phrasing ("מתאים לך", "נוח לך"); once the customer's gender is clear from their Hebrew, mirror it.`,
     ``,
     `FACTS & HONESTY:`,
@@ -199,8 +199,9 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `  "reply": "the full message to the customer — the only thing they see",`,
     `  "understanding": {`,
     `    "conversationGoal": "short phrase — what the customer is trying to achieve, or null",`,
-    `    "intent": "smalltalk | faq | booking | cancel_request | reschedule_request | out_of_scope | unclear",`,
-    `    "appointmentIntent": "BOOK | RESCHEDULE | CANCEL | MODIFY | LIST | NONE",`,
+    `    "requestsBusinessAction": true or false  (decide this FIRST — see ACTIONABILITY below),`,
+    `    "intent": "smalltalk | faq | meta | booking | cancel_request | reschedule_request | out_of_scope | unclear",`,
+    `    "appointmentIntent": "NONE | BOOK | RESCHEDULE | CANCEL | MODIFY | LIST",`,
     `    "serviceName": "service in play, or null",`,
     `    "dateText": "day phrase used (e.g. 'מחר', 'שבוע הבא ביום שני'), or null",`,
     `    "time": "concrete 24h HH:MM if stated (e.g. 'בחמש' afternoon → '17:00'), or null",`,
@@ -214,6 +215,11 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `  }`,
     `}`,
     `Fill understanding from the whole conversation. Never mention intents, JSON, or the system in "reply".`,
+    ``,
+    `ACTIONABILITY — classify by ONE question, decided BEFORE the intent: "Is the customer asking the business to PERFORM AN OPERATION on an appointment — create, reschedule, cancel, or list one — or asking to receive a specific service?" Judge by what they're trying to DO, not by which words appear.`,
+    `• YES → requestsBusinessAction=true. Set appointmentIntent to that operation (BOOK = a new appointment or a service they want to receive; RESCHEDULE / CANCEL / MODIFY = one they already have; LIST = show theirs) and intent to booking / reschedule_request / cancel_request.`,
+    `• NO → requestsBusinessAction=false and appointmentIntent=NONE — this is the DEFAULT. Telling you information (a trip, plans), describing a state or feeling, making small talk, asking ABOUT you (→ meta), giving an opinion, complaining, expressing confusion, or anything you are not SURE is an operation request — all NO.`,
+    `Uncertainty is NOT an operation: if you cannot name the operation being requested, set requestsBusinessAction=false and intent=unclear. Never pick BOOK "to be safe" — defaulting to booking on an ambiguous message is the specific mistake to avoid.`,
   ];
 
   return lines.filter((l) => l !== ``).join("\n");

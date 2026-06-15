@@ -1,27 +1,33 @@
 import { sendWhatsAppTextMessage } from "@/lib/whatsapp";
 import { stripEmojis } from "@/lib/ai/reply-polish";
+import { enforceAssistantGender } from "@/lib/ai/gender";
 import { recordWhatsAppSendResult } from "@/lib/integration-health";
 import { type DB, saveOutboundMessage } from "./helpers";
 
 /**
  * THE single outbound chokepoint, shared by the chat router (flow.ts) and the
- * booking platform. Owner AI settings (emoji_usage=none) apply to EVERY
- * customer-facing message — model-written, guard, deterministic strings, and
- * platform notifications alike. Fail-open: if settings can't be read, the text
- * is sent unmodified.
+ * booking platform. Owner AI settings apply to EVERY customer-facing message —
+ * model-written, guard, deterministic strings, and platform notifications alike:
+ *   - assistant_gender → the assistant's own Hebrew forms are forced to the
+ *     configured gender (the FINAL authority — beats persona text, name, history,
+ *     and model drift; never touches references to the customer).
+ *   - emoji_usage=none → all emojis stripped.
+ * Fail-open: if settings can't be read, the text is sent unmodified.
  */
 export async function applyOutboundSettings(db: DB, businessId: string, text: string): Promise<string> {
   try {
     const { data } = await db
       .from("ai_settings")
-      .select("emoji_usage")
+      .select("emoji_usage, assistant_gender")
       .eq("business_id", businessId)
       .maybeSingle();
-    if (data?.emoji_usage === "none") return stripEmojis(text);
+    let out = enforceAssistantGender(text, data?.assistant_gender as ("neutral" | "female" | "male") | undefined);
+    if (data?.emoji_usage === "none") out = stripEmojis(out);
+    return out;
   } catch {
     // settings unavailable → send as-is
+    return text;
   }
-  return text;
 }
 
 /**

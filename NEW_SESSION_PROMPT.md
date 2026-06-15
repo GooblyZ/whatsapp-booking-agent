@@ -17,6 +17,11 @@ booking). This is a continuation of mature, working development — NOT a new pr
 5. `REPOSITORY_MAP.md` — file layout and reading order for the code.
 
 **Non-negotiables (summary — full versions in CLAUDE.md):**
+- **Business-agnostic product.** This serves ALL appointment-based businesses (salons,
+  studios, clinics, physios, coaches…), not hair salons. RB Hair Studio is only the test
+  tenant. Classify business OPERATIONS, not TYPES; never hardcode salon-specific
+  assumptions — each business teaches the system through its own data (see the "Product
+  principle" section in CLAUDE.md).
 - Gemini understands and speaks; the SYSTEM validates and executes. The AI never writes
   to the DB and never claims a booking happened without the deterministic INSERT.
 - Single model (`gemini-2.5-flash-lite`), one call per turn. No routing, no model

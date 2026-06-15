@@ -150,7 +150,7 @@ async function turn(
   console.log(`\n>> USER: ${message}`);
   console.log(`   REPLY: ${replyOut.replace(/\n/g, " | ")}`);
   console.log(
-    `   meta: intent=${u?.intent ?? "-"} apptIntent=${u?.appointmentIntent ?? "-"} changeReq=${u?.changeRequest ?? "-"}` +
+    `   meta: action=${u?.requestsBusinessAction ?? "-"} intent=${u?.intent ?? "-"} apptIntent=${u?.appointmentIntent ?? "-"} changeReq=${u?.changeRequest ?? "-"}` +
     ` preCleared=[${pre.cleared.join(",")}] correcting=${u?.userCorrecting ?? "-"} frustrated=${u?.userFrustrated ?? "-"}` +
     ` | fields_new=[${newFields.join(",")}] missing=[${st.session.active ? missingFields(st.session).join(",") : ""}]` +
     ` day=${st.session.dateISO ?? "-"} time=${st.session.time ?? "-"} lifecycle=${st.session.lifecycle ?? "-"} grounded=${d.grounded} ` +
@@ -607,11 +607,16 @@ async function main() {
     // Opening-hours mentions and "see the available times on the page" are fine;
     // what platform mode forbids is OFFERING bookable slots in chat — a list of
     // times, or binding a concrete time to a free/taken claim ("16:00 פנוי").
-    const timeTokens = d22.replyText.match(/\d{1,2}:\d{2}/g) ?? [];
+    // The customer never sees the RAW model reply: runPlatformTurn runs
+    // defuseSchedulingQuestion first, so validate that FENCED output (the real
+    // deterministic guarantee) — not raw model phrasing variance.
+    const { defuseSchedulingQuestion } = await import("../lib/ai/platform-turn");
+    const fenced22 = defuseSchedulingQuestion(d22.replyText).text;
+    const timeTokens = fenced22.match(/\d{1,2}:\d{2}/g) ?? [];
     const slotList = timeTokens.length >= 3;
-    const claimsSpecificFree = /\d{1,2}:\d{2}[^.!?\n]{0,12}(פנוי|זמין|מתאים|תפוס)|(פנוי|זמין|תפוס)[^.!?\n]{0,12}\d{1,2}:\d{2}/.test(d22.replyText);
+    const claimsSpecificFree = /\d{1,2}:\d{2}[^.!?\n]{0,12}(פנוי|זמין|מתאים|תפוס)|(פנוי|זמין|תפוס)[^.!?\n]{0,12}\d{1,2}:\d{2}/.test(fenced22);
     const offersSlots = slotList || claimsSpecificFree;
-    console.log(`  [live] reply offers no bookable slots: ${!offersSlots ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
+    console.log(`  [live] reply offers no bookable slots (after platform fence): ${!offersSlots ? "PASS ✓" : `FAIL ✗ ("${fenced22}")`}`);
     console.log(`  [live] reply claims no completed booking: ${!claimsBookingCompleted(d22.replyText) ? "PASS ✓" : `FAIL ✗ ("${d22.replyText}")`}`);
   }
 
@@ -824,6 +829,393 @@ async function main() {
     });
     const uPlat = dPlat.turn?.understanding;
     console.log(`  [live] booking intent still detected with customerPhone set: ${dPlat.ok && (uPlat?.appointmentIntent === "BOOK" || uPlat?.intent === "booking") ? "PASS ✓" : `FAIL ✗ (ok=${dPlat.ok} intent=${uPlat?.intent})`}`);
+  }
+
+  console.log("\n================ SCENARIO 28: assistant-gender enforcement (deterministic, 0 drift) ================");
+  {
+    const { enforceAssistantGender, countWrongGenderForms } = await import("../lib/ai/gender");
+    const femDrift = [
+      "אני שמחה לעזור לך!", "אני יודעת בדיוק מה שאת צריכה", "אני מבינה אותך לגמרי",
+      "אני לא בטוחה, אבל אבדוק", "אני ממליצה על זה", "אני מנילה, העוזרת הוירטואלית של המספרה",
+      "שמחה לעזור בכל שאלה", "אני מצטערת על הבלבול",
+    ];
+    const mascDrift = [
+      "אני שמח לעזור!", "אני יודע מה לעשות", "אני מבין אותך", "אני בטוח שכן",
+      "אני העוזר הוירטואלי", "שמח לעזור בכל שאלה", "אני מצטער על הבלבול",
+    ];
+    let maleWrong = 0;
+    for (const s of femDrift) maleWrong += countWrongGenderForms(enforceAssistantGender(s, "male"), "male");
+    console.log("  [pure] MALE setting: feminine drift → 0 wrong forms:", maleWrong === 0 ? "PASS ✓" : `FAIL ✗ (${maleWrong})`);
+    let femWrong = 0;
+    for (const s of mascDrift) femWrong += countWrongGenderForms(enforceAssistantGender(s, "female"), "female");
+    console.log("  [pure] FEMALE setting: masculine drift → 0 wrong forms:", femWrong === 0 ? "PASS ✓" : `FAIL ✗ (${femWrong})`);
+    console.log("  [pure] 'אני שמחה לעזור' →male→ 'אני שמח לעזור':",
+      enforceAssistantGender("אני שמחה לעזור", "male") === "אני שמח לעזור" ? "PASS ✓" : `FAIL ✗ ("${enforceAssistantGender("אני שמחה לעזור", "male")}")`);
+    console.log("  [pure] 'מנילה, העוזרת הוירטואלית' →male→ '…העוזר הוירטואלי':",
+      enforceAssistantGender("מנילה, העוזרת הוירטואלית", "male") === "מנילה, העוזר הוירטואלי" ? "PASS ✓" : `FAIL ✗ ("${enforceAssistantGender("מנילה, העוזרת הוירטואלית", "male")}")`);
+    // Exact live-failure sentence (RB Hair Studio greeting) — must become masculine.
+    {
+      const liveIn = "אני מנילה, העוזרת הוירטואלית של RB Hair Studio, כאן כדי לעזור לך בכל מה שתצטרך.";
+      const liveWant = "אני מנילה, העוזר הוירטואלי של RB Hair Studio, כאן כדי לעזור לך בכל מה שתצטרך.";
+      const liveGot = enforceAssistantGender(liveIn, "male");
+      console.log("  [pure] live greeting 'העוזרת הוירטואלית' →male→ 'העוזר הוירטואלי':",
+        liveGot === liveWant ? "PASS ✓" : `FAIL ✗ ("${liveGot}")`);
+    }
+    const custFem = "מתי נוח לך? את רוצה תספורת? תכתבי לי";
+    console.log("  [pure] customer-directed feminine NOT altered (male setting):",
+      enforceAssistantGender(custFem, "male") === custFem ? "PASS ✓" : `FAIL ✗ ("${enforceAssistantGender(custFem, "male")}")`);
+    console.log("  [pure] neutral gender = no-op:",
+      enforceAssistantGender("אני שמחה לעזור", "neutral") === "אני שמחה לעזור" ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 29: booking-signal gate (deterministic) ================");
+  {
+    const { hasBookingSignal } = await import("../lib/ai/platform-turn");
+    const services = ["תספורת", "צבע", "פן"];
+    const shouldNot = [
+      "אני טס לחו״ל עוד שבועיים", "רציתי לאכול", "אפשר גם לאכול?", "לא תעזרי לי בזה?",
+      "מה עוד?", "אתה בן או בת?", "יש לך באג", "שלחת שני קישורים", "מה שלומך?", "למה?",
+      "כואבת לי האצבע", "אני בפנים",
+    ];
+    const shouldYes = [
+      "אני רוצה לקבוע תור", "אפשר לקבוע תור?", "אשמח לקבוע תור", "אני רוצה תספורת",
+      "אני רוצה צבע", "בא לי פן", "אני רוצה טיפול", "אני רוצה להספיק תספורת לפני הטיסה",
+      "צריך לקבוע משהו לפני שאני טס", "אני רוצה לבטל", "אני רוצה להזיז", "איזה תורים יש לי?",
+      "שלח לי את הקישור לתורים",
+    ];
+    const falsePos = shouldNot.filter((m) => hasBookingSignal(m, services));
+    console.log(`  [pure] SHOULD-NOT-BOOK carry no signal (${shouldNot.length - falsePos.length}/${shouldNot.length}):`,
+      falsePos.length === 0 ? "PASS ✓" : `FAIL ✗ [${falsePos.join(" | ")}]`);
+    const missed = shouldYes.filter((m) => !hasBookingSignal(m, services));
+    console.log(`  [pure] SHOULD-BOOK carry a signal (${shouldYes.length - missed.length}/${shouldYes.length}):`,
+      missed.length === 0 ? "PASS ✓" : `FAIL ✗ [${missed.join(" | ")}]`);
+
+    // BUSINESS-AGNOSTIC matrix (CLAUDE.md "Product principle"): the gate must fire for
+    // ANY appointment vertical — through generic nouns/verbs OR the business's own
+    // configured service names — and must stay quiet on unrelated chatter. Proves the
+    // salon-term removal from GENERIC_SERVICE left every vertical covered.
+    const industries: { label: string; services: string[]; yes: string[]; no: string[] }[] = [
+      { label: "hair salon",    services: ["תספורת", "צבע", "פן"],
+        yes: ["אני רוצה לקבוע תור לתספורת מחר", "בא לי תספורת"],
+        no:  ["כמה עולה אצלכם?", "איפה אתם נמצאים?"] },
+      { label: "pilates/yoga",  services: ["שיעור פילאטיס", "יוגה"],
+        yes: ["אני רוצה שיעור פילאטיס מחר", "אפשר לקבוע יוגה לשבוע הבא?"],
+        no:  ["מתי אתם פתוחים?", "תודה רבה!"] },
+      { label: "physio/clinic", services: ["טיפול פיזיותרפיה", "ייעוץ"],
+        yes: ["אני צריך טיפול לגב", "אפשר לקבוע ייעוץ?"],
+        no:  ["יש לכם חניה לנכים?", "הכאב עבר, תודה"] },
+      { label: "nail/beauty",   services: ["מניקור", "פדיקור"],
+        yes: ["אני רוצה מניקור מחר", "אפשר לקבוע פדיקור?"],
+        no:  ["כמה זמן לוקח?", "אתם פתוחים בשבת?"] },
+    ];
+    for (const ind of industries) {
+      const yMissed = ind.yes.filter((m) => !hasBookingSignal(m, ind.services));
+      const nFalse = ind.no.filter((m) => hasBookingSignal(m, ind.services));
+      console.log(
+        `  [pure] ${ind.label}: booking msgs signal (${ind.yes.length - yMissed.length}/${ind.yes.length}), chatter quiet (${ind.no.length - nFalse.length}/${ind.no.length}):`,
+        yMissed.length === 0 && nFalse.length === 0
+          ? "PASS ✓"
+          : `FAIL ✗ [yes-missed: ${yMissed.join(" | ")}] [no-fired: ${nFalse.join(" | ")}]`);
+    }
+    // Salon terms are no longer hardcoded as "generic": a nail service signals ONLY via
+    // the business's configured name, never a built-in list.
+    console.log("  [pure] removed salon terms are NOT built-in generics (מניקור needs a configured service):",
+      !hasBookingSignal("אני רוצה מניקור מחר", []) && hasBookingSignal("אני רוצה מניקור מחר", ["מניקור"]) ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 30: actionability gate is authoritative (parser coercion) ================");
+  {
+    const { parseReceptionistTurn } = await import("../lib/ai/brain");
+    const mk = (rba: boolean, intent: string, appt: string) =>
+      JSON.stringify({ reply: "תשובה כלשהי", understanding: { requestsBusinessAction: rba, intent, appointmentIntent: appt } });
+    // The exact reported bug: not actionable, yet model labeled booking/BOOK → coerced.
+    const t1 = parseReceptionistTurn(mk(false, "booking", "BOOK"))!;
+    console.log("  [pure] action=false coerces BOOK→NONE and booking→unclear:",
+      t1.understanding.appointmentIntent === "NONE" && t1.understanding.intent === "unclear" ? "PASS ✓" : `FAIL ✗ (${t1.understanding.intent}/${t1.understanding.appointmentIntent})`);
+    // Not actionable + cancel_request → also neutralized.
+    const t2 = parseReceptionistTurn(mk(false, "cancel_request", "CANCEL"))!;
+    console.log("  [pure] action=false neutralizes manage intents too:",
+      t2.understanding.appointmentIntent === "NONE" && t2.understanding.intent === "unclear" ? "PASS ✓" : `FAIL ✗ (${t2.understanding.intent}/${t2.understanding.appointmentIntent})`);
+    // Conversational categories are preserved when not actionable.
+    const t3 = parseReceptionistTurn(mk(false, "smalltalk", "NONE"))!;
+    console.log("  [pure] action=false keeps a conversational intent:",
+      t3.understanding.intent === "smalltalk" && t3.understanding.appointmentIntent === "NONE" ? "PASS ✓" : "FAIL ✗");
+    // Actionable but operation unnamed → derived (booking→BOOK, cancel→CANCEL).
+    const t4 = parseReceptionistTurn(mk(true, "booking", "NONE"))!;
+    const t5 = parseReceptionistTurn(mk(true, "cancel_request", "NONE"))!;
+    console.log("  [pure] action=true derives the operation when unnamed:",
+      t4.understanding.appointmentIntent === "BOOK" && t5.understanding.appointmentIntent === "CANCEL" ? "PASS ✓" : `FAIL ✗ (${t4.understanding.appointmentIntent}/${t5.understanding.appointmentIntent})`);
+    // Missing field defaults to non-actionable (safe default).
+    const t6 = parseReceptionistTurn(JSON.stringify({ reply: "היי", understanding: { intent: "booking", appointmentIntent: "BOOK" } }))!;
+    console.log("  [pure] missing actionability defaults to NOT an operation:",
+      t6.understanding.requestsBusinessAction === false && t6.understanding.appointmentIntent === "NONE" ? "PASS ✓" : `FAIL ✗ (${t6.understanding.requestsBusinessAction}/${t6.understanding.appointmentIntent})`);
+  }
+
+  console.log("\n================ SCENARIO 31: robust AI JSON parsing (BUG-001) ================");
+  {
+    const { parseAiJsonResponse } = await import("../lib/ai/json-parse");
+    const { parseReceptionistTurn } = await import("../lib/ai/brain");
+    const valid = `{"reply":"היי","understanding":{"requestsBusinessAction":false,"intent":"smalltalk","appointmentIntent":"NONE"}}`;
+    const replyOf = (d: unknown) => (d as { reply?: string }).reply ?? "";
+
+    const r1 = parseAiJsonResponse(valid);
+    console.log("  [pure] clean JSON parses (recovered=clean):", r1.ok && r1.recovered === "clean" ? "PASS ✓" : "FAIL ✗");
+    const r2 = parseAiJsonResponse("```json\n" + valid + "\n```");
+    console.log("  [pure] ```json fence stripped:", r2.ok && r2.recovered === "fence-stripped" ? "PASS ✓" : "FAIL ✗");
+    const r3 = parseAiJsonResponse("בטח, הנה:\n" + valid);
+    console.log("  [pure] prose BEFORE json sliced out:", r3.ok && r3.recovered === "sliced" ? "PASS ✓" : "FAIL ✗");
+    const r4 = parseAiJsonResponse(valid + "\nמקווה שעזרתי!");
+    console.log("  [pure] prose AFTER json sliced out:", r4.ok && r4.recovered === "sliced" ? "PASS ✓" : "FAIL ✗");
+    const shc = `{"reply":"תספורת (80 ש"ח), פן (120 ש"ח)","understanding":{"requestsBusinessAction":true,"intent":"booking","appointmentIntent":"BOOK"}}`;
+    const r5 = parseAiJsonResponse(shc);
+    console.log("  [pure] Hebrew unescaped ש\"ח quotes repaired (content preserved):",
+      r5.ok && r5.recovered === "quote-repaired" && replyOf(r5.data).includes("ש\"ח") ? "PASS ✓" : `FAIL ✗ (${r5.ok ? r5.recovered : r5.reason})`);
+    const r6 = parseAiJsonResponse(`{"reply":"היי","understanding":{"intent":"booking"}`);
+    console.log("  [pure] truncated JSON → classified truncated_json:", !r6.ok && r6.reason === "truncated_json" ? "PASS ✓" : `FAIL ✗ (${r6.ok ? "ok" : r6.reason})`);
+    const r7 = parseAiJsonResponse("מצטער, לא הצלחתי לעזור");
+    console.log("  [pure] non-JSON prose → failure (no fabrication):", !r7.ok ? "PASS ✓" : "FAIL ✗");
+
+    // The EXACT live BUG-001 response shape → must recover a usable turn (no generic error).
+    const exact = `{ "reply": "בטח, קובי! אנחנו מציעים תספורת (80 ש"ח), פן ועיצוב שיער (120 ש"ח), וצביעת שיער (250 ש"ח). מה תרצה להזמין?", "understanding": { "conversationGoal": "לקבוע תור", "requestsBusinessAction": true, "intent": "booking", "appointmentIntent": "BOOK", "serviceName": null } }`;
+    const turn = parseReceptionistTurn(exact);
+    console.log("  [pure] BUG-001 exact response recovers a valid turn:",
+      turn !== null && turn.reply.includes("תספורת") && turn.understanding.appointmentIntent === "BOOK"
+        ? "PASS ✓" : `FAIL ✗ (${turn === null ? "null" : turn.reply.slice(0, 40)})`);
+  }
+
+  console.log("\n================ SCENARIO 32: low-signal guard + link-wording fence (BUG-002) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const { runReceptionistTurn } = await import("../lib/ai/brain");
+
+    console.log("  [pure] escalation tiers 1→normal, 2→short, 3→boundary, 4→quiet_mode:",
+      pt.lowSignalActionFor(0) === "none" && pt.lowSignalActionFor(1) === "normal_clarify" &&
+      pt.lowSignalActionFor(2) === "short_clarify" && pt.lowSignalActionFor(3) === "boundary" &&
+      pt.lowSignalActionFor(4) === "quiet_mode" ? "PASS ✓" : "FAIL ✗");
+
+    // Counter state machine: escalate over consecutive low-signal turns, RESET on a productive one.
+    {
+      const seq = [true, true, true, true, false, true]; // low ×4, productive, low
+      let c = 0; const acts: string[] = [];
+      for (const low of seq) { c = low ? c + 1 : 0; acts.push(pt.lowSignalActionFor(c)); }
+      const want = ["normal_clarify", "short_clarify", "boundary", "quiet_mode", "none", "normal_clarify"];
+      console.log("  [pure] counter escalates then RESETS on a productive turn:",
+        JSON.stringify(acts) === JSON.stringify(want) ? "PASS ✓" : `FAIL ✗ (${acts.join(",")})`);
+    }
+
+    console.log("  [pure] phantom 'בקישור למטה' detected; future 'אשלח קישור' NOT:",
+      pt.mentionsPhantomLink("לקבוע תור בקישור למטה") && !pt.mentionsPhantomLink("בכיף אשלח לך קישור כשתרצה") ? "PASS ✓" : "FAIL ✗");
+
+    const ex = "אני כאן 🙂 אפשר לשאול אותי הכל על העסק, או לקבוע תור בקישור למטה.";
+    const stripped = pt.stripPhantomLinkWording(ex);
+    console.log("  [pure] link wording removed, content preserved:",
+      !/קישור|לינק/.test(stripped) && stripped.includes("העסק") ? `PASS ✓ ("${stripped}")` : `FAIL ✗ ("${stripped}")`);
+
+    console.log("  [pure] 'בקישור ששלחתי' fenced with no prior link, allowed once a link was sent:",
+      pt.shouldFenceLinkWording(null, false, "צפה בקישור ששלחתי") === true &&
+      pt.shouldFenceLinkWording(null, true, "צפה בקישור ששלחתי") === false ? "PASS ✓" : "FAIL ✗");
+
+    const dec = (u: Record<string, unknown>) =>
+      ({ ok: true, turn: { reply: "r", understanding: u } }) as unknown as Parameters<typeof pt.isLowSignalTurn>[0];
+    console.log("  [pure] isLowSignalTurn: unclear=low; smalltalk/meta/faq/operation NOT low (BUG-005):",
+      pt.isLowSignalTurn(dec({ requestsBusinessAction: false, intent: "unclear", appointmentIntent: "NONE" })) &&
+      !pt.isLowSignalTurn(dec({ requestsBusinessAction: false, intent: "smalltalk", appointmentIntent: "NONE" })) &&
+      !pt.isLowSignalTurn(dec({ requestsBusinessAction: false, intent: "meta", appointmentIntent: "NONE" })) &&
+      !pt.isLowSignalTurn(dec({ requestsBusinessAction: false, intent: "faq", appointmentIntent: "NONE" })) &&
+      !pt.isLowSignalTurn(dec({ requestsBusinessAction: true, intent: "booking", appointmentIntent: "BOOK" })) ? "PASS ✓" : "FAIL ✗");
+
+    // Light-live: the RUNTIME counter uses lowSignalKind (catches gibberish
+    // structurally regardless of the model's intent label). No-vowel smash counts;
+    // a pricing question is productive (resets).
+    const svc = ["תספורת", "צבע", "פן"];
+    const dg = await runReceptionistTurn(makeCtx(), { conversationContext: "", message: "חכלגתד", bookingBlock: "", platformMode: true });
+    const dq = await runReceptionistTurn(makeCtx(), { conversationContext: "", message: "כמה עולה תספורת?", bookingBlock: "", platformMode: true });
+    console.log("  [live] gibberish → counts toward quiet, pricing question → productive (resets):",
+      pt.countsTowardQuiet(pt.lowSignalKind(dg, "חכלגתד", svc)) && !pt.countsTowardQuiet(pt.lowSignalKind(dq, "כמה עולה תספורת?", svc))
+        ? "PASS ✓" : `FAIL ✗ (gib=${pt.lowSignalKind(dg, "חכלגתד", svc)} price=${pt.lowSignalKind(dq, "כמה עולה תספורת?", svc)})`);
+  }
+
+  console.log("\n================ SCENARIO 33: low-signal QUIET MODE — cost control (BUG-003) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const { runReceptionistTurn } = await import("../lib/ai/brain");
+    const services = ["תספורת", "צבע", "פן"];
+
+    // Cheap LOCAL noise detector (no Gemini): obvious nonsense → true.
+    const noise = ["כ", "ח", "....", "לגךדכחע", "כחדטלךע", "חכלגתד", "כללסתג"];
+    const noiseMisses = noise.filter((m) => !pt.looksLikeNoise(m, services));
+    console.log(`  [pure] obvious nonsense detected locally (${noise.length - noiseMisses.length}/${noise.length}):`,
+      noiseMisses.length === 0 ? "PASS ✓" : `FAIL ✗ [${noiseMisses.join(" | ")}]`);
+
+    // Real / productive / conversational messages must NOT be flagged as local noise
+    // (they go to Gemini — quiet mode never blocks them).
+    const notNoise = [
+      "אני רוצה פן", "אפשר לקבוע תור", "אני רוצה תספורת", "איזה תורים יש לי", "אני רוצה לבטל",
+      "יש חניה", "כמה עולה", "מה שעות הפעילות", "מה נשמע", "אתה בן או בת", "אני טס לחו״ל",
+      "אני רעב", "שלום", "מחר", "כן", "לא", "תודה",
+    ];
+    const falseNoise = notNoise.filter((m) => pt.looksLikeNoise(m, services));
+    console.log(`  [pure] real/convo messages NOT flagged as noise (${notNoise.length - falseNoise.length}/${notNoise.length}):`,
+      falseNoise.length === 0 ? "PASS ✓" : `FAIL ✗ [${falseNoise.join(" | ")}]`);
+
+    // Sparse-reply planner: quiet starts at count 4; mostly suppressed, rare reminder.
+    const plans = [4, 5, 6, 7, 8].map((c) => pt.quietModePlan(c));
+    const suppressedCount = plans.filter((p) => p.isQuiet && p.suppressReply).length;
+    console.log("  [pure] quiet mode is sparse (mostly suppressed, occasional reminder):",
+      plans.every((p) => p.isQuiet) && suppressedCount >= 3 && suppressedCount < 5 ? "PASS ✓" : `FAIL ✗ (suppressed ${suppressedCount}/5)`);
+    console.log("  [pure] below threshold (count<4) is NOT quiet mode:",
+      !pt.quietModePlan(3).isQuiet && !pt.quietModePlan(1).isQuiet ? "PASS ✓" : "FAIL ✗");
+
+    // Light-live RECOVERY: a meaningful message after nonsense is NOT local-noise and
+    // classifies productive (resets) — quiet mode releases immediately.
+    const dBook = await runReceptionistTurn(makeCtx(), { conversationContext: "", message: "אשמח לקבוע תור", bookingBlock: "", platformMode: true });
+    const dFaq = await runReceptionistTurn(makeCtx(), { conversationContext: "", message: "יש חניה?", bookingBlock: "", platformMode: true });
+    console.log("  [live] recovery: booking + FAQ are not noise and reset (not low-signal):",
+      !pt.looksLikeNoise("אשמח לקבוע תור", services) && !pt.isLowSignalTurn(dBook) &&
+      !pt.looksLikeNoise("יש חניה?", services) && !pt.isLowSignalTurn(dFaq) ? "PASS ✓" : `FAIL ✗ (book=${dBook.turn?.understanding.intent} faq=${dFaq.turn?.understanding.intent})`);
+  }
+
+  console.log("\n================ SCENARIO 34: evidence gate — hallucinated BOOK on gibberish (BUG-004) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const { runReceptionistTurn } = await import("../lib/ai/brain");
+    const services = ["תספורת", "צבע", "פן"];
+    const GIBBERISH = ["חכלגצג", "חבצב", "חגלגגצמגמד"]; // exact messages from the BUG-004 logs
+    type U = Parameters<typeof pt.applyBookingEvidenceGate>[0];
+    const mkU = (over: Record<string, unknown>): U =>
+      ({ requestsBusinessAction: false, intent: "unclear", appointmentIntent: "NONE", ...over }) as unknown as U;
+    const mkDec = (u: U) =>
+      ({ ok: true, turn: { reply: "r", understanding: u } }) as unknown as Parameters<typeof pt.isLowSignalTurn>[0];
+
+    // PURE: a hallucinated BOOK on gibberish is downgraded to non-actionable + low-signal.
+    let pureOk = 0;
+    for (const g of GIBBERISH) {
+      const u = mkU({ requestsBusinessAction: true, intent: "booking", appointmentIntent: "BOOK" });
+      const ev = pt.applyBookingEvidenceGate(u, g, services);
+      const downgraded = u.requestsBusinessAction === false && u.appointmentIntent === "NONE" && u.intent === "unclear";
+      const low = pt.isLowSignalTurn(mkDec(u));
+      if (!ev.evidence && downgraded && low) pureOk++;
+    }
+    console.log(`  [pure] gibberish+hallucinated-BOOK → action=false, low_signal=true (${pureOk}/${GIBBERISH.length}):`,
+      pureOk === GIBBERISH.length ? "PASS ✓" : "FAIL ✗");
+
+    // PURE: a GENUINE operation with evidence is NOT downgraded.
+    const ub = mkU({ requestsBusinessAction: true, intent: "booking", appointmentIntent: "BOOK" });
+    const evb = pt.applyBookingEvidenceGate(ub, "אני רוצה פן", services);
+    console.log("  [pure] genuine 'אני רוצה פן' keeps BOOK (evidence present, stays productive):",
+      evb.evidence && ub.requestsBusinessAction === true && !pt.isLowSignalTurn(mkDec(ub)) ? "PASS ✓" : "FAIL ✗");
+
+    // PURE: FAQ is productive and untouched (not an operation).
+    const uf = mkU({ requestsBusinessAction: false, intent: "faq", appointmentIntent: "NONE" });
+    const evf = pt.applyBookingEvidenceGate(uf, "יש חניה?", services);
+    console.log("  [pure] FAQ untouched by evidence gate (productive):",
+      evf.reason === "faq_productive" && uf.intent === "faq" ? "PASS ✓" : "FAIL ✗");
+
+    // LIVE: regardless of what Gemini emits for these exact messages, after the gate
+    // they MUST be action=false + low_signal=true (counter would increment, not reset).
+    let liveOk = 0; const liveDetail: string[] = [];
+    for (const g of GIBBERISH) {
+      const d = await runReceptionistTurn(makeCtx(), { conversationContext: "", message: g, bookingBlock: "", platformMode: true });
+      const rawAction = d.turn?.understanding.requestsBusinessAction === true;
+      if (d.ok && d.turn) pt.applyBookingEvidenceGate(d.turn.understanding, g, services);
+      const action = d.turn?.understanding.requestsBusinessAction === true;
+      // The runtime counts via lowSignalKind (gibberish caught structurally even if
+      // the model labeled it smalltalk/unclear) — that's what holds quiet mode.
+      const low = pt.countsTowardQuiet(pt.lowSignalKind(d, g, services));
+      if (!action && low) liveOk++; else liveDetail.push(`"${g}"(rawBOOK=${rawAction}→action=${action}/low=${low})`);
+    }
+    console.log(`  [live] exact log gibberish → action=false + low_signal=true after gate (${liveOk}/${GIBBERISH.length}):`,
+      liveOk === GIBBERISH.length ? "PASS ✓" : `FAIL ✗ ${liveDetail.join(" ")}`);
+  }
+
+  console.log("\n================ SCENARIO 35: softer quiet mode + pre-Gemini guard (BUG-005) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const { runReceptionistTurn } = await import("../lib/ai/brain");
+    const services = ["תספורת", "צבע", "פן"];
+
+    // Greetings / meta / "are you there?" are NOT gibberish.
+    const greetings = ["היי", "שלום", "מה קורה?", "הלו?", "יש תשובה?", "למה לא ענית?", "מה קורה פה?", "היי מה קורה?", "מה קורה"];
+    const flaggedNoise = greetings.filter((m) => pt.looksLikeNoise(m, services));
+    console.log(`  [pure] greetings/meta NOT flagged as gibberish (${greetings.length - flaggedNoise.length}/${greetings.length}):`,
+      flaggedNoise.length === 0 ? "PASS ✓" : `FAIL ✗ [${flaggedNoise.join(" | ")}]`);
+    const recognized = greetings.filter((m) => pt.looksLikeGreetingOrMeta(m, services));
+    console.log(`  [pure] greetings/meta recognized for cheap handling (${recognized.length}/${greetings.length}):`,
+      recognized.length === greetings.length ? "PASS ✓" : `FAIL ✗ [${greetings.filter((m) => !pt.looksLikeGreetingOrMeta(m, services)).join(" | ")}]`);
+    const notGreeting = ["אני רוצה לקבוע תור", "יש חניה", "כמה עולה תספורת", "חכלגצג"].filter((m) => pt.looksLikeGreetingOrMeta(m, services));
+    console.log("  [pure] real/booking/gibberish NOT mistaken for greeting:",
+      notGreeting.length === 0 ? "PASS ✓" : `FAIL ✗ [${notGreeting.join(" | ")}]`);
+
+    // PRE-GEMINI guard decisions (the cost fix).
+    const pa = (n: number, m: string) => pt.preGeminiAction(n, m, services);
+    console.log("  [pure] quiet+gibberish → skip Gemini; quiet+greeting → cheap reset; quiet+booking → Gemini:",
+      pa(3, "חכלגצג") === "skip_gemini_gibberish" &&
+      pa(4, "היי") === "cheap_reset_reply" &&
+      pa(4, "יש תשובה?") === "cheap_reset_reply" &&
+      pa(4, "מה קורה פה") === "cheap_reset_reply" &&
+      pa(4, "אני רוצה לקבוע תור") === "proceed_to_gemini" ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] NOT in quiet mode → always proceed to Gemini (no false short-circuit):",
+      pa(0, "היי") === "proceed_to_gemini" && pa(2, "חכלגצג") === "proceed_to_gemini" ? "PASS ✓" : "FAIL ✗");
+
+    // KIND classification: greetings/meta are not counted; gibberish/unclear are.
+    const dec = (u: Record<string, unknown>) =>
+      ({ ok: true, turn: { reply: "r", understanding: u } }) as unknown as Parameters<typeof pt.lowSignalKind>[0];
+    const sm = pt.lowSignalKind(dec({ requestsBusinessAction: false, intent: "smalltalk", appointmentIntent: "NONE" }), "מה נשמע", services);
+    const mt = pt.lowSignalKind(dec({ requestsBusinessAction: false, intent: "meta", appointmentIntent: "NONE" }), "אתה בוט?", services);
+    const gb = pt.lowSignalKind(dec({ requestsBusinessAction: false, intent: "unclear", appointmentIntent: "NONE" }), "חכלגצג", services);
+    const fq = pt.lowSignalKind(dec({ requestsBusinessAction: false, intent: "faq", appointmentIntent: "NONE" }), "יש חניה", services);
+    console.log("  [pure] kind: smalltalk/meta NOT counted, gibberish counted, faq productive:",
+      sm === "smalltalk" && !pt.countsTowardQuiet(sm) && mt === "meta" && !pt.countsTowardQuiet(mt) &&
+      gb === "gibberish" && pt.countsTowardQuiet(gb) && fq === "productive" && !pt.countsTowardQuiet(fq) ? "PASS ✓" : "FAIL ✗");
+
+    // LIVE: a greeting at the START is not low-signal (doesn't increment the counter).
+    const dHi = await runReceptionistTurn(makeCtx(), { conversationContext: "", message: "היי", bookingBlock: "", platformMode: true });
+    const kindHi = pt.lowSignalKind(dHi, "היי", services);
+    console.log("  [live] 'היי' at conversation start is not counted toward quiet:",
+      !pt.countsTowardQuiet(kindHi) ? "PASS ✓" : `FAIL ✗ (kind=${kindHi}, intent=${dHi.turn?.understanding.intent})`);
+  }
+
+  console.log("\n================ SCENARIO 36: emoji-only → low-signal flow (BUG-005 emoji) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const { enforceAssistantGender } = await import("../lib/ai/gender");
+
+    // Emoji-only detection (general, no blacklist) — the exact live examples + variants.
+    const emojiOnly = ["🙏🏻", "🥹", "😙", "🤩", "😄", "😊", "😊😊😊", "👍", "🙂!", "🙏🏻 "];
+    const missed = emojiOnly.filter((m) => !pt.isEmojiOnly(m));
+    console.log(`  [pure] emoji-only detected (${emojiOnly.length - missed.length}/${emojiOnly.length}):`,
+      missed.length === 0 ? "PASS ✓" : `FAIL ✗ [${missed.join(" | ")}]`);
+
+    // Mixed text+emoji and plain text are NOT emoji-only (normal flow).
+    const notEmoji = ["תודה 😊", "אני רוצה תור 😊", "יש חניה? 🙏", "כמה עולה טיפול? 🙂", "היי", "חכלגצג", "יש חניה?"];
+    const falseEmoji = notEmoji.filter((m) => pt.isEmojiOnly(m));
+    console.log(`  [pure] mixed text+emoji / plain NOT treated as emoji-only (${notEmoji.length - falseEmoji.length}/${notEmoji.length}):`,
+      falseEmoji.length === 0 ? "PASS ✓" : `FAIL ✗ [${falseEmoji.join(" | ")}]`);
+
+    // Escalation reuses the SAME tiers (this mirrors the emoji block's reply choice):
+    const emojiReply = (count: number): { reply: string; suppressed: boolean } => {
+      const action = pt.lowSignalActionFor(count);
+      if (action === "boundary") return { reply: pt.LOW_SIGNAL_BOUNDARY, suppressed: false };
+      if (action === "quiet_mode") { const p = pt.quietModePlan(count); return { reply: p.suppressReply ? "" : pt.LOW_SIGNAL_QUIET_REMINDER, suppressed: p.suppressReply }; }
+      return { reply: pt.LOW_SIGNAL_SHORT, suppressed: false };
+    };
+    const r1 = emojiReply(1), r2 = emojiReply(2), r3 = emojiReply(3), r4 = emojiReply(4), r7 = emojiReply(7);
+    console.log("  [pure] repeated emoji escalate: 1-2 short, 3 boundary, 4+ mostly suppressed (no spam):",
+      !r1.suppressed && r1.reply === pt.LOW_SIGNAL_SHORT && !r2.suppressed &&
+      !r3.suppressed && r3.reply === pt.LOW_SIGNAL_BOUNDARY &&
+      r4.suppressed && r7.reply === pt.LOW_SIGNAL_QUIET_REMINDER ? "PASS ✓" : "FAIL ✗");
+
+    // Recovery: meaningful messages after emoji quiet are NOT emoji-only (→ normal flow).
+    const recovery = ["יש חניה?", "אני רוצה לקבוע תור", "איזה תורים יש לי?"];
+    console.log("  [pure] recovery messages not emoji-only (proceed to normal flow):",
+      recovery.every((m) => !pt.isEmojiOnly(m)) ? "PASS ✓" : "FAIL ✗");
+
+    // GENDER on the boundary reply (fixed at the outbound chokepoint).
+    const maleBoundary = enforceAssistantGender(pt.LOW_SIGNAL_BOUNDARY, "male");
+    const femBoundary = enforceAssistantGender(pt.LOW_SIGNAL_BOUNDARY, "female");
+    console.log("  [pure] boundary gender: male→'אני לא מצליח', female→'אני לא מצליחה':",
+      maleBoundary.includes("אני לא מצליח ") && !maleBoundary.includes("מצליחה") && femBoundary.includes("מצליחה")
+        ? "PASS ✓" : `FAIL ✗ (male="${maleBoundary.slice(0, 30)}")`);
   }
 
   console.log("\n================ SCENARIO 18: Gemini 503 resilience (degraded mode) ================");

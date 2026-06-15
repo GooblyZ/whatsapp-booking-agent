@@ -25,6 +25,39 @@ claim a booking happened unless the deterministic write ran.
 > The conversational machinery stays intact until the owner flips the flag and
 > approves its removal.
 
+## Product principle — business-agnostic (do not violate)
+This is an **appointment-based-business platform**, NOT a hair-salon product. The live
+test tenant (**RB Hair Studio**) is one example tenant, never the product definition.
+The product must serve any appointment-based business: hair/nail salons, beauticians,
+yoga & Pilates studios, physiotherapists, massage therapists, clinics, consultants,
+coaches — and businesses that don't exist yet.
+
+> **Classify business OPERATIONS, not business TYPES.**
+> Reason about *what the customer is asking the system to do*, never about the industry.
+> "אני רוצה פן", "אני רוצה שיעור פילאטיס", "אני רוצה טיפול פנים" are all the same
+> operation — *the customer wants a service* → **BOOK**. The booking, cancel, reschedule,
+> list, and FAQ operations are identical across every industry; only the data differs.
+
+How this binds every layer (apply it forward — to AI behavior, intent classification,
+booking flows, CRM, reminders, dashboard, appointment management, future automations):
+- **Each business teaches the system what it is** through its own data — `services`,
+  `business_settings`, `knowledge_base_items`, `ai_settings` (the persona description).
+  The AI/persona learns the business from these facts, never from hardcoded industry
+  vocabulary. (This is exactly why `business_type` and the `tone` presets were retired
+  on 2026-06-13 — the AI infers the business from facts/services/KB.)
+- **No hardcoded industry assumptions in logic.** Intent gates, parsers, guards, prompts,
+  schema, and UI must work for a Pilates class and a physiotherapy session as well as a
+  haircut. A business's configured service names are the source of truth for "what they
+  offer" — any built-in service keyword list is only a generic fallback and must stay
+  industry-neutral (see `hasBookingSignal` in `lib/ai/platform-turn.ts`).
+- **Examples are examples, not the model.** Hebrew like "תספורת"/"פן" may appear in
+  comments, seed data, dashboard placeholders, and sim scenarios as *illustrations* of
+  the test tenant — never as a built-in expectation. Prefer industry-neutral examples in
+  any text the system sends (persona prompts, customer-facing strings, link labels).
+- **New features stay vertical-neutral.** Before adding anything that names a salon
+  service or assumes a salon workflow, ask: would this still be correct for a yoga studio
+  or a clinic? If not, generalize it or move the specificity into per-business data.
+
 ## Architectural rules (do not violate)
 1. **One Gemini call per customer turn** (`lib/ai/brain.ts` is the only runtime call
    site). No multi-model routing, no classifier calls, no fallback models.

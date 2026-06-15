@@ -84,9 +84,15 @@ export async function handleBookingFlow(
   if (getBookingMode() === "platform") {
     console.log(`[router] mode=platform state="${state}" → platform turn`);
     const turnAnchor = await latestInboundAt(db, businessId, customerId);
-    const outcome = await runPlatformTurn(db, businessId, customerId, fromPhone, messageText, state);
+    const outcome = await runPlatformTurn(db, businessId, customerId, fromPhone, messageText, state, context);
     if (await hasNewerInbound(db, businessId, customerId, turnAnchor)) {
       console.log(`[router] superseded by newer inbound message — reply skipped`);
+      return;
+    }
+    // Quiet mode: state is already persisted and the inbound was saved upstream —
+    // intentionally send NO WhatsApp reply this turn (cost + anti-loop control).
+    if (outcome.suppressReply) {
+      console.log(`[router] platform reply suppressed (quiet mode) — no outbound sent`);
       return;
     }
     await replyFn(outcome.replyText);

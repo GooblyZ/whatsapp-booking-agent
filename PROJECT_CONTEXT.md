@@ -11,12 +11,21 @@
 > in **`TRANSITION_PLAN.md`**, which supersedes this document where they conflict.
 
 ## Product vision
-A WhatsApp-first **AI receptionist SaaS** for Israeli small businesses (hair salons,
-barbershops, clinics, studios). A customer texts the business's WhatsApp number in natural,
-messy Hebrew; the AI receptionist answers questions, collects booking details
-conversationally, checks **real** availability, and books appointments — feeling like a
-reliable human receptionist, not a menu bot. The business owner manages everything
-(services, hours, AI personality, knowledge base, appointments) from a web dashboard.
+A WhatsApp-first **AI receptionist SaaS** for Israeli **appointment-based small
+businesses** — hair/nail salons, beauticians, yoga & Pilates studios, physiotherapists,
+massage therapists, clinics, consultants, coaches, and any future appointment business.
+A customer texts the business's WhatsApp number in natural, messy Hebrew; the AI
+receptionist answers questions, collects booking details conversationally, checks
+**real** availability, and books appointments — feeling like a reliable human
+receptionist, not a menu bot. The business owner manages everything (services, hours, AI
+personality, knowledge base, appointments) from a web dashboard.
+
+> **Business-agnostic principle (binding — see `CLAUDE.md` "Product principle"):** the
+> product classifies business OPERATIONS, not business TYPES. RB Hair Studio is the test
+> tenant, never the product. Each business teaches the system what it is through its own
+> data (services / settings / KB / persona); logic must never hardcode salon-specific
+> assumptions. "פן", "שיעור פילאטיס", and "טיפול פנים" are all one operation: the
+> customer wants a service → BOOK.
 
 Guiding principle, stated by the product owner and enforced throughout the code:
 

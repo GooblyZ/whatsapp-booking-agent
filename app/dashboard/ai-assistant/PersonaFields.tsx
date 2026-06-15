@@ -84,7 +84,7 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
         <Toggle
           name="intent_detection_enabled" defaultChecked={initial?.intent_detection_enabled !== false}
           title="זיהוי כוונת קביעת תור"
-          desc="זיהוי משפטים כמו &quot;אני רוצה תספורת מחר&quot; והצעה לפתוח תהליך קביעת תור."
+          desc="זיהוי משפטים כמו &quot;אני רוצה לקבוע תור למחר&quot; והצעה לפתוח תהליך קביעת תור."
         />
       </fieldset>
 

@@ -19,17 +19,21 @@ import { geminiGenerateConversation } from "./gemini";
 import { buildFacts, formatFacts, buildFactIndex, type BusinessFacts, type Capabilities } from "./facts";
 import { buildReceptionistInstruction } from "./persona";
 import { verifyGrounding, extractTimeTokens, extractPhoneDigits } from "./grounding";
+import { parseAiJsonResponse } from "./json-parse";
 import { buildContextReply, type BookingSession } from "./booking-session";
 import { renderVerdictReplyHe, type AvailabilityInfo } from "./availability-facts";
 import type { AIEventResponseType } from "./events";
 
 export type ReceptionistIntent =
-  | "smalltalk" | "faq" | "booking" | "cancel_request"
+  | "smalltalk" | "faq" | "meta" | "booking" | "cancel_request"
   | "reschedule_request" | "out_of_scope" | "unclear";
 
 const VALID_INTENTS: ReceptionistIntent[] = [
-  "smalltalk", "faq", "booking", "cancel_request", "reschedule_request", "out_of_scope", "unclear",
+  "smalltalk", "faq", "meta", "booking", "cancel_request", "reschedule_request", "out_of_scope", "unclear",
 ];
+
+/** Intents that assert a business operation (everything else is conversational). */
+const OPERATION_INTENTS: ReceptionistIntent[] = ["booking", "cancel_request", "reschedule_request"];
 
 /** Appointment lifecycle intent — the system must never confuse these. */
 export type AppointmentIntent = "BOOK" | "RESCHEDULE" | "CANCEL" | "MODIFY" | "LIST" | "NONE";
@@ -41,6 +45,13 @@ export interface ReceptionistTurn {
   reply: string;
   understanding: {
     conversationGoal?: string | null;
+    /**
+     * ACTIONABILITY GATE — is the customer asking the business to perform an
+     * operation (book / reschedule / cancel / list) or requesting a service?
+     * Default false. The system treats this as authoritative: when false, no
+     * operation is possible (appointmentIntent is forced to NONE downstream).
+     */
+    requestsBusinessAction: boolean;
     intent: ReceptionistIntent;
     appointmentIntent: AppointmentIntent;
     serviceName?: string | null;
@@ -257,12 +268,19 @@ export async function runReceptionistTurn(
 
   const turn = parseReceptionistTurn(res.text);
   if (!turn) {
-    // Failure-path diagnostic: short head of the raw model output (generated
-    // text only — no secrets, no customer PII).
+    // Rich, observable failure diagnostics. `diag` re-runs the recovery pass (cheap,
+    // failure-path only) to classify WHY it failed. reason="schema_mismatch" means
+    // valid JSON that lacked required fields; otherwise it's a parse failure with a
+    // typed reason. We log a large capped slice of the raw MODEL output (not the
+    // customer's message) so these are debuggable from logs alone.
+    const diag = parseAiJsonResponse(res.text);
+    const reason = diag.ok ? "schema_mismatch" : diag.reason;
+    const errMsg = (diag.ok ? "valid JSON, missing/invalid required fields" : diag.error).slice(0, 240);
     console.warn(
-      `[ai] malformed_json rawLen=${res.text.length} head(160)="${res.text.slice(0, 160).replace(/\s+/g, " ")}"`
+      `[ai] malformed_json reason=${reason} rawLen=${res.text.length} err="${errMsg}" ` +
+      `raw(2000)="${res.text.slice(0, 2000).replace(/\s+/g, " ")}"`
     );
-    return fallback(FALLBACK.error, "error", "parse_error", { geminiCalled: true, fallbackReason: "malformed_json", usage: res.usage });
+    return fallback(FALLBACK.error, "error", "parse_error", { geminiCalled: true, fallbackReason: `malformed_json:${reason}`, usage: res.usage });
   }
 
   // Strict grounding (last-resort fence; availability truth was fed upstream):
@@ -322,16 +340,13 @@ function intentToResponseType(intent: ReceptionistIntent): AIEventResponseType {
 
 /** Parses + validates Gemini's JSON into a ReceptionistTurn. Returns null if untrustworthy. */
 export function parseReceptionistTurn(raw: string): ReceptionistTurn | null {
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const obj = parsed as Record<string, unknown>;
+  // Robust, recovery-capable parse (fences, surrounding prose, unescaped inner
+  // quotes like ש"ח). Never fabricates: an unrecoverable response returns null and
+  // the caller logs rich diagnostics + serves the safe fallback.
+  const result = parseAiJsonResponse(raw);
+  if (!result.ok) return null;
+  if (typeof result.data !== "object" || result.data === null) return null;
+  const obj = result.data as Record<string, unknown>;
 
   const reply = typeof obj.reply === "string" ? obj.reply.trim() : "";
   if (reply.length === 0) return null;
@@ -341,14 +356,30 @@ export function parseReceptionistTurn(raw: string): ReceptionistTurn | null {
     : {}) as Record<string, unknown>;
 
   const rawIntent = typeof u.intent === "string" ? u.intent : "unclear";
-  const intent = (VALID_INTENTS as string[]).includes(rawIntent)
+  let intent = (VALID_INTENTS as string[]).includes(rawIntent)
     ? (rawIntent as ReceptionistIntent)
     : "unclear";
 
   const rawApptIntent = typeof u.appointmentIntent === "string" ? u.appointmentIntent.toUpperCase() : "NONE";
-  const appointmentIntent = (VALID_APPT_INTENTS as string[]).includes(rawApptIntent)
+  let appointmentIntent = (VALID_APPT_INTENTS as string[]).includes(rawApptIntent)
     ? (rawApptIntent as AppointmentIntent)
     : "NONE";
+
+  // ACTIONABILITY is authoritative — it resolves the "uncertainty → BOOK" drift at
+  // the source. The model first decides whether this is a business operation; if
+  // not, the turn CANNOT carry one (NONE), and a contradictory operation-intent is
+  // downgraded to unclear. This keeps intent + appointmentIntent internally
+  // coherent instead of leaving "intent=booking appt=BOOK" on a vague message.
+  const requestsBusinessAction = u.requestsBusinessAction === true;
+  if (!requestsBusinessAction) {
+    appointmentIntent = "NONE";
+    if (OPERATION_INTENTS.includes(intent)) intent = "unclear";
+  } else if (appointmentIntent === "NONE") {
+    // Affirmed an operation but didn't name it → derive from intent (default BOOK,
+    // the common case: a new appointment / service request).
+    appointmentIntent = intent === "cancel_request" ? "CANCEL"
+      : intent === "reschedule_request" ? "RESCHEDULE" : "BOOK";
+  }
 
   const needsRaw = typeof obj.needs === "string" ? obj.needs : "none";
   const needs = (["none", "services", "availability", "policies"] as const).includes(
@@ -361,6 +392,7 @@ export function parseReceptionistTurn(raw: string): ReceptionistTurn | null {
     reply,
     understanding: {
       conversationGoal: optionalString(u.conversationGoal),
+      requestsBusinessAction,
       intent,
       appointmentIntent,
       serviceName: optionalString(u.serviceName),
