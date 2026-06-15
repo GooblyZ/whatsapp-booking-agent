@@ -32,6 +32,14 @@ const PRICE_RE = /(?:₪\s*(\d{1,6}))|(?:(\d{1,6})\s*(?:₪|ש"?ח|שקלים?|s
 const TIME_RE = /\b(\d{1,2}):(\d{2})\b/g;
 // Long digit runs that look like a phone number (>= 9 digits, allowing separators).
 const PHONE_RE = /(?:\+?\d[\d\-\s().]{8,}\d)/g;
+// URLs — appointment links, the My-Appointments token, the booking link's
+// ?p=<phone>: their ids/tokens/params are NOT customer-facing prices/times/phones
+// and must never be grounding-checked (the bug: a 19-digit token read as a "phone").
+const URL_RE = /\bhttps?:\/\/\S+/gi;
+// E.164 caps real phone numbers at 15 digits. Anything longer is an id / token /
+// numeric blob — never a phone — so it must NOT trip the phone fence.
+const PHONE_MIN_DIGITS = 9;
+const PHONE_MAX_DIGITS = 15;
 
 // ── Hebrew time parsing ────────────────────────────────────────────────────────
 //
@@ -183,12 +191,12 @@ export function extractTimeTokens(text: string): Set<string> {
   return out;
 }
 
-/** Digit runs (>= 9 digits) that look like phone numbers, in any text. */
+/** Digit runs that look like phone numbers (9–15 digits — E.164 bound), in any text. */
 export function extractPhoneDigits(text: string): Set<string> {
   const out = new Set<string>();
-  for (const m of (text ?? "").matchAll(PHONE_RE)) {
+  for (const m of (text ?? "").replace(URL_RE, " ").matchAll(PHONE_RE)) {
     const digits = m[0].replace(/\D/g, "");
-    if (digits.length >= 9) out.add(digits);
+    if (digits.length >= PHONE_MIN_DIGITS && digits.length <= PHONE_MAX_DIGITS) out.add(digits);
   }
   return out;
 }
@@ -213,7 +221,11 @@ export function verifyGrounding(
 ): GroundingResult {
   const violations: string[] = [];
   const kinds = new Set<"price" | "time" | "phone">();
-  const text = reply ?? "";
+  // Strip URLs before any check: appointment links, the My-Appointments token and
+  // the booking link's ?p=<phone> carry ids/tokens/params that are not customer-
+  // facing facts. (Root cause of "phone <19-digit token> does not match business
+  // phone" → reply discarded → confused fallback.)
+  const text = (reply ?? "").replace(URL_RE, " ");
 
   // 1. Prices — every currency amount must be a real service price.
   for (const m of text.matchAll(PRICE_RE)) {
@@ -247,7 +259,9 @@ export function verifyGrounding(
     const matchesEither = (a: string, b: string) => a === b || a.endsWith(b) || b.endsWith(a);
     for (const m of text.matchAll(PHONE_RE)) {
       const digits = m[0].replace(/\D/g, "");
-      if (digits.length < 9) continue;
+      // Only 9–15 digit runs can be phones (E.164). Shorter = not a phone; longer
+      // = an id/token/blob (e.g. an appointment token) — never flag it.
+      if (digits.length < PHONE_MIN_DIGITS || digits.length > PHONE_MAX_DIGITS) continue;
       if (matchesEither(digits, index.phoneDigits)) continue;
       if ([...allowedPhones].some((p) => p.length >= 9 && matchesEither(digits, p))) continue;
       violations.push(`phone ${digits} does not match business phone`);

@@ -21,6 +21,8 @@ import {
 import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
+import { buildMyAppointmentsLink } from "@/lib/booking/appointment-token";
+import { listUpcomingByCustomer } from "@/lib/booking/appointments";
 
 export type PlatformLink = "booking" | "manage" | null;
 
@@ -30,8 +32,13 @@ export interface PlatformTurnOutcome {
   linkAttached: PlatformLink;
 }
 
-const BOOK_LINE = "לקביעת תור:";
-const MANAGE_LINE = "לצפייה, שינוי או ביטול התור:";
+// WhatsApp renders *…* as bold and auto-links a bare URL on its own line. A bold
+// label + clean URL reads as an intentional, premium CTA (no markdown links in
+// WhatsApp). Emojis are intentionally omitted here so the CTA looks the same
+// regardless of the owner's emoji setting and never trips the chokepoint.
+const BOOK_LINE = "*לקביעת תור — מהיר ופשוט:*";
+const MANAGE_LINE = "*לניהול התור (צפייה · שינוי · ביטול):*";
+const MY_APPTS_LINE = "*כל התורים שלך — לבחירה וניהול:*";
 
 /**
  * Runs one platform-mode turn. Persists nothing except a state reset for
@@ -65,7 +72,7 @@ export async function runPlatformTurn(
   const timezone = ctx.business.timezone || "Asia/Jerusalem";
   const [memory, upcomingBlock, customerBlock, lastSendFailed] = await Promise.all([
     getConversationContext(db, businessId, customerId),
-    renderUpcomingAppointments(db, businessId, customerId, timezone),
+    renderUpcomingAppointments(db, businessId, customerId, timezone, true),
     renderCustomerState(db, businessId, customerId, timezone),
     didLastReplyFailToSend(db, businessId, customerId),
   ]);
@@ -112,18 +119,29 @@ export async function runPlatformTurn(
     replyText = "אני כאן 🙂 אפשר לשאול אותי הכל על העסק, או לקבוע תור בקישור למטה.";
   }
 
-  // ── Deterministic intent routing — the system ALWAYS attaches the link for a
-  //    booking/manage intent. Platform mode never books in chat, so the CTA must
-  //    appear on EVERY booking-intent turn; the model can neither omit nor
-  //    override it.
-  //    (Previously gated by `!lastAssistant?.includes(url)`, which SUPPRESSED the
-  //    link on follow-up turns once a prior reply already carried the same URL —
-  //    so while the model kept asking conversational questions, booking intent
-  //    was detected but the link went missing. The link IS the answer here, so
-  //    repeating it is correct, not spam.)
+  // ── Outbound URL safety: strip any URL the MODEL wrote (echoed from history or
+  //    invented) so the final message carries AT MOST the one deterministic link.
+  replyText = stripModelUrls(replyText);
+
+  // ── Deterministic link control (OVERRIDES Gemini's intent). Complaints about
+  //    links/bugs, bare meta-questions ("מה?"/"למה?"/"לא הבנתי"), corrections and
+  //    one-char messages must NEVER get a booking/manage link — Gemini mislabels
+  //    them as BOOK, which created the live "complain about links → bot sends
+  //    another link" loop. The link attaches only on a genuine action intent.
   const u = decision.turn?.understanding;
   let linkAttached: PlatformLink = null;
-  if (decision.ok && u) {
+
+  if (decision.ok && suppressLinkFor(messageText)) {
+    if (LINK_COMPLAINT_RE.test(messageText) && !isExplicitLinkRequest(messageText)) {
+      replyText = COMPLAINT_ACK; // breaks the complaint loop — acknowledge, no link
+      console.log("[platform-turn] link suppressed (complaint) — deterministic ack, no link");
+    } else if (/קישור|לינק/.test(replyText)) {
+      replyText = META_FALLBACK; // model dangled a link promise on a no-link turn
+      console.log("[platform-turn] link suppressed (meta/non-action) — cleaned dangling link promise");
+    } else {
+      console.log("[platform-turn] link suppressed (meta/non-action) — model reply kept, no link");
+    }
+  } else if (decision.ok && u) {
     const wantsBooking = u.appointmentIntent === "BOOK" || u.intent === "booking";
     const wantsManage =
       u.appointmentIntent === "CANCEL" || u.appointmentIntent === "RESCHEDULE" ||
@@ -131,14 +149,52 @@ export async function runPlatformTurn(
       u.intent === "cancel_request" || u.intent === "reschedule_request";
 
     if (wantsManage) {
-      const apptId = await nearestUpcomingAppointmentId(db, businessId, customerId);
-      const url = apptId ? buildAppointmentLink(apptId) : buildBookingLink(ctx.business.slug, customerPhone);
-      replyText = `${replyText}\n\n${apptId ? MANAGE_LINE : BOOK_LINE}\n${url}`;
-      linkAttached = apptId ? "manage" : "booking";
+      // Deterministic link decision — code decides the fact, the model never
+      // guesses how many appointments exist or which one to manage:
+      //   0 upcoming → booking link (nothing to manage; offer to book)
+      //   1 upcoming → that appointment's manage page (/appointment/[id])
+      //   2+ upcoming → My Appointments page (customer picks which one)
+      const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
+      let url: string;
+      let label: string;
+      if (upcoming.length === 0) {
+        url = buildBookingLink(ctx.business.slug, customerPhone);
+        label = BOOK_LINE;
+        linkAttached = "booking";
+      } else if (upcoming.length === 1) {
+        url = buildAppointmentLink(upcoming[0].id);
+        label = MANAGE_LINE;
+        linkAttached = "manage";
+      } else {
+        url = buildMyAppointmentsLink(customerId);
+        label = MY_APPTS_LINE;
+        linkAttached = "manage";
+      }
+      // Same fence as booking: never ask the customer to identify/specify an
+      // appointment in chat. For manage we DON'T keep model sentences (that's where
+      // it merges/invents appointment details) — the link shows the accurate list.
+      const fenced =
+        upcoming.length === 0
+          ? defuseSchedulingQuestion(replyText)
+          : defuseSchedulingQuestion(replyText, { bridge: FENCE_BRIDGE_MANAGE, keepWarmth: false });
+      if (fenced.defused) {
+        console.log(`[platform-turn] fence: neutralized in-chat selection question (manage, ${upcoming.length} appts)`);
+        replyText = fenced.text;
+      }
+      replyText = appendPlatformLink(replyText, label, url, lastAssistant, messageText);
       logPlatformLink(linkAttached, url);
     } else if (wantsBooking) {
+      // DETERMINISTIC FENCE: a booking-intent reply must never ask the customer
+      // to pick service/day/time in chat — that's the website's job. Validation
+      // showed the model still slips a scheduling question in ~60-80% of the time
+      // even with the persona rules, so we strip it deterministically here.
+      const fenced = defuseSchedulingQuestion(replyText);
+      if (fenced.defused) {
+        console.log("[platform-turn] fence: stripped in-chat scheduling question (booking intent → link-first)");
+        replyText = fenced.text;
+      }
       const url = buildBookingLink(ctx.business.slug, customerPhone);
-      replyText = `${replyText}\n\n${BOOK_LINE}\n${url}`;
+      replyText = appendPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText);
       linkAttached = "booking";
       logPlatformLink(linkAttached, url);
     }
@@ -160,26 +216,115 @@ export async function runPlatformTurn(
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-async function nearestUpcomingAppointmentId(
-  db: DB, businessId: string, customerId: string
-): Promise<string | null> {
-  const { data } = await db
-    .from("appointments")
-    .select("id")
-    .eq("business_id", businessId)
-    .eq("customer_id", customerId)
-    .in("status", ["pending", "confirmed"])
-    .gt("start_time", new Date().toISOString())
-    .order("start_time", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  return (data?.id as string) ?? null;
-}
-
 function lastAssistantLine(transcript: string): string | null {
   const lines = transcript.split("\n").filter((l) => l.startsWith("Assistant (you, earlier): "));
   if (lines.length === 0) return null;
   return lines[lines.length - 1].replace("Assistant (you, earlier): ", "").replace(/\s+/g, " ").trim();
+}
+
+// ── Deterministic link-control (overrides Gemini's intent classification) ──────
+// Complaints about the bot/links, bare meta-questions, and trivial messages must
+// never trigger a booking/manage link. Gemini frequently mislabels these as BOOK.
+const LINK_COMPLAINT_RE =
+  /קישורים|שני\s*קישור|שתי\s*קישור|תפסיק|להפסיק|נמאס|באג|מבלבל|מבחבל|מתסכל|לא\s*טוב|טעית|בלי\s*שכתבתי|למה\s*כתבת|די\s/;
+const META_ONLY_RE =
+  /^(מה|למה|הא|נו|אה|לא\s*הבנתי|מה\s*זאת\s*אומרת|מה\s*אמרת|מה\s*זה|באמת|מה\s*קרה)\s*[?!.…׳"']*$/;
+// An explicit REQUEST for the link (imperative/future) — these DO get one link.
+const EXPLICIT_LINK_REQUEST_RE =
+  /תשלח|תשלחי|שלח\s*לי|שלחי\s*לי|אפשר\s*(את\s*)?ה?קישור|איפה\s*ה?קישור|תן\s*לי\s*(את\s*)?ה?קישור|תני\s*לי\s*(את\s*)?ה?קישור|רוצה\s*(את\s*)?ה?(קישור|לינק)/;
+
+export const COMPLAINT_ACK =
+  "סליחה על הבלבול! 🙏 אני כאן לכל שאלה על העסק. מתי שתרצה לקבוע, לשנות או לבטל תור — תגיד לי ואשלח קישור אחד מסודר.";
+export const META_FALLBACK =
+  "לא בטוח/ה שהבנתי 🙂 אפשר לשאול אותי כל דבר על העסק, ואם תרצה לקבוע, לשנות או לבטל תור — רק תגיד.";
+
+export function isExplicitLinkRequest(message: string): boolean {
+  return EXPLICIT_LINK_REQUEST_RE.test(message);
+}
+
+/** True when this message must NOT receive a link, whatever Gemini classified it
+ *  as: one-char/punctuation, bare meta-questions, and complaints — unless the user
+ *  explicitly asks for the link (then they get exactly one). */
+export function suppressLinkFor(message: string): boolean {
+  const t = (message ?? "").trim();
+  if (isExplicitLinkRequest(t)) return false;
+  if (t.length <= 1) return true;
+  if (/^[?؟!.…״"'\s,־-]+$/.test(t)) return true;
+  if (META_ONLY_RE.test(t)) return true;
+  if (LINK_COMPLAINT_RE.test(t)) return true;
+  return false;
+}
+
+/** Removes any URL the model wrote so the final message carries at most the one
+ *  deterministic platform link (prevents the "two links" the user complained of). */
+export function stripModelUrls(text: string): string {
+  return (text ?? "")
+    .replace(/\bhttps?:\/\/\S+/gi, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Appends the single deterministic link — OR, if we just sent this exact link and
+ *  the user didn't ask for it again, references it instead of re-spamming the URL. */
+function appendPlatformLink(
+  reply: string, label: string, url: string, lastAssistant: string | null, message: string
+): string {
+  if (lastAssistant?.includes(url) && !isExplicitLinkRequest(message)) {
+    return `${reply}\n\nהקישור שכבר שלחתי קודם עדיין מחכה לך — בודקים שם 🙂`;
+  }
+  return `${reply}\n\n${label}\n${url}`;
+}
+
+// In-chat selection questions the model must never ask in platform mode (the
+// website collects service/day/time AND lets the customer pick which appointment).
+// Covers booking ("איזה שירות/יום/שעה?") and manage ("איזה תור?", "לאיזה תאריך?").
+const SCHEDULING_Q = new RegExp(
+  [
+    "איז[הו]\\s+(שירות|טיפול|יום|תאריך|שעה|תור)",
+    "מתי\\s+(נוח|בא\\s*לך|מתאים|תרצ|תוכל|יתאים)",
+    "מה\\s+התאריך",
+    "באיז[הו]\\s+(תאריך|שעה|שירות|יום|תור)",
+    "לאיז[הו]\\s+(שעה|תאריך|יום|שירות|תור)",
+    "איז[הו]\\s+\\S{1,12}\\s+(את|אתה)\\s+(רוצ|מעוניינ|תרצ)",
+    // English forms — the model occasionally answers in English on thin context.
+    "\\bwhich\\s+(appointment|service|one|day|time|date)",
+    "\\bwhat\\s+(date|time|service)\\b",
+    "\\bwhen\\s+(would|works|suits)",
+  ].join("|"),
+  "i"
+);
+
+export const FENCE_BRIDGE_BOOK = "את השירות, היום והשעה בוחרים ישירות בקישור — קל ומהיר.";
+export const FENCE_BRIDGE_MANAGE = "כל הפרטים והניהול בקישור — בוחרים תור וצופים, משנים או מבטלים אותו.";
+
+/**
+ * Deterministic platform fence: if a reply asked the customer to pick a
+ * service/day/time/appointment in chat, neutralize it and bridge to the link.
+ *  - book mode (keepWarmth=true): drop the offending sentence(s) + any question,
+ *    keep the model's non-question warmth.
+ *  - manage mode (keepWarmth=false): replace the whole reply — manage
+ *    disambiguation is exactly where the model MERGES/INVENTS appointment details
+ *    ("the OTHER one was צביעת at 10:30" — wrong), so we don't keep its sentences.
+ * If no selection question is present the reply is returned untouched (good
+ * replies are never altered; FAQ / small talk never reach here).
+ */
+export function defuseSchedulingQuestion(
+  reply: string,
+  opts: { bridge?: string; keepWarmth?: boolean } = {}
+): { text: string; defused: boolean } {
+  if (!SCHEDULING_Q.test(reply)) return { text: reply, defused: false };
+  const bridge = opts.bridge ?? FENCE_BRIDGE_BOOK;
+  if (opts.keepWarmth === false) return { text: `בטח! ${bridge}`, defused: true };
+  const warmth = reply
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !SCHEDULING_Q.test(s) && !s.includes("?") && !s.includes("？"))
+    .join(" ")
+    .trim();
+  const text = warmth.length >= 8 ? `${warmth} ${bridge}` : `בטח! ${bridge}`;
+  return { text, defused: true };
 }
 
 /**

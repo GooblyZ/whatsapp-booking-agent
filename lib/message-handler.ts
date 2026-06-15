@@ -39,28 +39,28 @@ export async function handleIncomingMessage(msg: IncomingWhatsAppMessage): Promi
   const textPreview = msg.messageText.slice(0, 40) + (msg.messageText.length > 40 ? "…" : "");
   console.log(`[message-handler] received — phone=${maskedPhone} text="${textPreview}"`);
 
-  // 1. Deduplication — skip if this wamid was already processed.
-  const { data: existing } = await db
-    .from("messages")
-    .select("id")
-    .eq("meta_message_id", msg.waMessageId)
-    .maybeSingle();
+  // 1+2. Dedup check and customer upsert are independent — run them in PARALLEL
+  //       to shave a DB round-trip off the hot path (every real message lands
+  //       here). A duplicate still upserts the customer first (idempotent,
+  //       harmless); the win is for the common non-duplicate case.
+  const [dedup, customerResult] = await Promise.all([
+    db.from("messages").select("id").eq("meta_message_id", msg.waMessageId).maybeSingle(),
+    db
+      .from("customers")
+      .upsert(
+        { business_id: msg.businessId, phone: msg.fromPhone },
+        { onConflict: "business_id,phone", ignoreDuplicates: false }
+      )
+      .select("id")
+      .single(),
+  ]);
 
-  if (existing) {
+  if (dedup.data) {
     console.log(`[message-handler] duplicate wamid=${msg.waMessageId} — skipped`);
     return;
   }
 
-  // 2. Upsert customer: one record per (business_id, phone).
-  const { data: customer, error: customerError } = await db
-    .from("customers")
-    .upsert(
-      { business_id: msg.businessId, phone: msg.fromPhone },
-      { onConflict: "business_id,phone", ignoreDuplicates: false }
-    )
-    .select("id")
-    .single();
-
+  const { data: customer, error: customerError } = customerResult;
   if (customerError || !customer) {
     console.error("[message-handler] failed to upsert customer:", customerError?.message);
     return;

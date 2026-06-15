@@ -806,6 +806,17 @@ async function main() {
     console.log("  [pure] business phone still passes grounding:",
       verifyGrounding("אפשר להתקשר אלינו: 03-1234567", idx, new Set(), new Set(), allowed).ok ? "PASS ✓" : "FAIL ✗");
 
+    // (d2) Root-cause class fix: a long id/token (>15 digits — never an E.164 phone)
+    //      must NOT trip the phone fence. Live bug: "phone 8766797264654787882 does
+    //      not match business phone" → reply discarded → confused fallback chain.
+    console.log("  [pure] 19-digit id/token is NOT treated as a phone:",
+      verifyGrounding("התור אושר, מס' אסמכתא 8766797264654787882.", idx).ok ? "PASS ✓" : "FAIL ✗");
+
+    // (d3) URLs are stripped before grounding — appointment links, the My-Appointments
+    //      token and the booking link's ?p=<phone> must never be grounding-checked.
+    console.log("  [pure] URL with ids/?p= does NOT fail grounding:",
+      verifyGrounding("הקישור: https://x.vercel.app/appointment/98f1fa0d-c017?p=972502201340", idx).ok ? "PASS ✓" : "FAIL ✗");
+
     // (e) customerPhone threads to the brain without breaking normal platform routing.
     const dPlat = await runReceptionistTurn(makeCtx(), {
       conversationContext: "", message: "אפשר לקבוע תור לתספורת?", bookingBlock: "",

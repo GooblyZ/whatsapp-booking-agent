@@ -91,7 +91,7 @@ export async function didLastReplyFailToSend(db: DB, businessId: string, custome
  * cancel/reschedule questions.
  */
 export async function renderUpcomingAppointments(
-  db: DB, businessId: string, customerId: string, timezone: string
+  db: DB, businessId: string, customerId: string, timezone: string, platformMode = false
 ): Promise<string> {
   try {
     const { data } = await db
@@ -102,11 +102,14 @@ export async function renderUpcomingAppointments(
       .in("status", ["pending", "confirmed"])
       .gte("start_time", new Date().toISOString())
       .order("start_time", { ascending: true })
-      .limit(3);
+      .limit(5);
 
     const rows = (data ?? []) as Array<{ start_time: string; status: string; services: { name?: string } | null }>;
     if (rows.length === 0) {
-      return "EXISTING APPOINTMENTS (system-checked): this customer has NO upcoming appointment. If they ask to cancel/change one, say honestly that you don't see an active appointment under this number.";
+      const tail = platformMode
+        ? "If they ask to cancel/change one, say honestly that you don't see an upcoming appointment under this number, and offer to book (the system attaches a booking link)."
+        : "If they ask to cancel/change one, say honestly that you don't see an active appointment under this number.";
+      return `EXISTING APPOINTMENTS (system-checked): this customer has NO upcoming appointment. ${tail}`;
     }
     const fmt = rows.map((r) => {
       const d = new Date(r.start_time);
@@ -114,7 +117,14 @@ export async function renderUpcomingAppointments(
       const time = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false }).format(d);
       return `• ${date} בשעה ${time}${r.services?.name ? ` — ${r.services.name}` : ""} (${r.status})`;
     });
-    return `EXISTING APPOINTMENTS (system-checked) for this customer:\n${fmt.join("\n")}\nChanges/cancellations are not possible via this chat yet — refer them to the business, and refer to these appointments accurately.`;
+    // The system-checked list is the ONLY truth about appointments. The closing
+    // line differs by mode: platform mode routes changes to the website (the
+    // system attaches the right link), so it must NOT tell the model to "refer to
+    // the business" — that produced wrong, confusing answers.
+    const tail = platformMode
+      ? "Relay these appointments accurately (date/time/service) when asked — never invent, omit, or merge one. Viewing, rescheduling and cancelling happen on the booking page; the SYSTEM attaches the correct link (a single-appointment link, or a 'My Appointments' link when there are 2+). NEVER claim you changed/cancelled anything, and NEVER claim the website can do something beyond view/reschedule/cancel these appointments."
+      : "Changes/cancellations are not possible via this chat yet — refer them to the business, and refer to these appointments accurately.";
+    return `EXISTING APPOINTMENTS (system-checked) for this customer:\n${fmt.join("\n")}\n${tail}`;
   } catch (err) {
     console.error("[ai-memory] upcoming-appointments fetch failed:", err instanceof Error ? err.message : String(err));
     return "";
