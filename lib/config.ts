@@ -16,6 +16,23 @@ export function getBookingMode(): BookingMode {
   return process.env.BOOKING_MODE === "platform" ? "platform" : "conversational";
 }
 
+/**
+ * Burst-aggregation debounce (ms). After an inbound is saved, the handler waits this
+ * long before processing, then skips the turn if a newer inbound already arrived — so
+ * normal WhatsApp-style split messages ("אני רוצה" + "להבין איפה אתם") coalesce into ONE
+ * turn instead of producing a reply per fragment. Adds at most this much latency per reply.
+ * Default 2000ms (live testing showed 1000ms too short for human typing pauses). Set
+ * AGGREGATION_DEBOUNCE_MS=0 to disable entirely (pre-debounce behavior). Capped at 10s
+ * to prevent an accidental long webhook stall.
+ */
+export function getAggregationDebounceMs(): number {
+  const raw = process.env.AGGREGATION_DEBOUNCE_MS;
+  if (raw === undefined || raw.trim() === "") return 2000;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 2000;
+  return Math.min(n, 10_000);
+}
+
 let warnedNoBaseUrl = false;
 
 /**

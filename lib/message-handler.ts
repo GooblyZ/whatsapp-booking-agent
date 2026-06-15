@@ -10,8 +10,11 @@
 // (lib/booking/flow.ts) in a future phase. The webhook route must NOT change for that.
 
 import { supabaseServer } from "@/lib/supabase/server";
-import { handleBookingFlow } from "@/lib/booking/flow";
+import { handleBookingFlow, hasNewerInbound } from "@/lib/booking/flow";
 import { getWhatsAppHealth, attemptWhatsAppRecovery } from "@/lib/integration-health";
+import { getAggregationDebounceMs } from "@/lib/config";
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export interface IncomingWhatsAppMessage {
   businessId:  string;
@@ -118,26 +121,44 @@ export async function handleIncomingMessage(msg: IncomingWhatsAppMessage): Promi
     console.log(`[message-handler] WhatsApp auth recovered — resuming normal flow for this message`);
   }
 
-  // 5. ZERO-LATENCY BURST HANDLING. Real users send "אני רוצה תור" / "תספורת" /
-  //    "מחר" / "בחמש" as rapid separate messages. We add NO artificial waiting:
-  //    - here, all still-unanswered fragments are combined into one turn text
-  //    - in flow.ts, a SUPERSEDE check right before sending skips this turn's
-  //      reply if a newer message has arrived meanwhile (the newest turn then
-  //      answers with the full combined context). The model's own processing
-  //      time (~2-4s) acts as the natural coalescing window.
+  // 5. BURST HANDLING. Real users send "אני רוצה תור" / "תספורת" / "מחר" / "בחמש" as
+  //    rapid separate messages. Two cooperating mechanisms coalesce them into ONE turn:
+  //    (a) a small DEBOUNCE here, then an EARLY supersede check — if a newer fragment
+  //        already arrived during the wait, THIS fragment skips entirely (no Gemini, no
+  //        reply); a later fragment answers the full combined text. This widens the
+  //        coalescing window beyond the model's ~2-4s processing time so slightly slower
+  //        typists still merge. Disabled with AGGREGATION_DEBOUNCE_MS=0.
+  //    (b) aggregateBurst combines all still-unanswered fragments into one turn text, and
+  //        flow.ts keeps its own supersede check right before sending (defense in depth).
+  const debounceMs = getAggregationDebounceMs();
+  if (debounceMs > 0) {
+    await sleep(debounceMs);
+    if (await hasNewerInbound(db, msg.businessId, customer.id, savedMsg.created_at as string)) {
+      console.log(
+        `[message-handler] debounce(${debounceMs}ms): newer inbound arrived — skipping this fragment` +
+        ` (a later turn aggregates it); no Gemini call, no reply`
+      );
+      return;
+    }
+  }
+
   const effectiveText = await aggregateBurst(
     db, msg.businessId, customer.id, savedMsg.created_at as string, msg.messageText
   );
 
   // 6. Run the conversation/booking flow — handles all logic and outbound replies.
-  await handleBookingFlow(db, msg.businessId, msg.fromPhone, customer.id, effectiveText);
+  //    Pass THIS fragment's created_at as the supersede anchor so the flow/turn skips
+  //    (before Gemini) when a later fragment exists — serializing a burst to ONE turn.
+  await handleBookingFlow(db, msg.businessId, msg.fromPhone, customer.id, effectiveText, savedMsg.created_at as string);
 }
 
 /**
  * Combines the unanswered burst (inbound messages since the last outbound reply,
  * capped at 60s) into one text, so fragmented input becomes one coherent turn.
+ * Exported for unit testing. (The 60s lookback bounds which already-arrived fragments
+ * count; the coalescing WINDOW is governed by the debounce in handleIncomingMessage.)
  */
-async function aggregateBurst(
+export async function aggregateBurst(
   db: ReturnType<typeof supabaseServer>,
   businessId: string,
   customerId: string,

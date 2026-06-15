@@ -1146,8 +1146,8 @@ async function main() {
     console.log("  [pure] real/booking/gibberish NOT mistaken for greeting:",
       notGreeting.length === 0 ? "PASS ✓" : `FAIL ✗ [${notGreeting.join(" | ")}]`);
 
-    // PRE-GEMINI guard decisions (the cost fix).
-    const pa = (n: number, m: string) => pt.preGeminiAction(n, m, services);
+    // PRE-GEMINI guard decisions (the cost fix). greetingCount=0 here (no loop).
+    const pa = (n: number, m: string) => pt.preGeminiAction(n, 0, m, services);
     console.log("  [pure] quiet+gibberish → skip Gemini; quiet+greeting → cheap reset; quiet+booking → Gemini:",
       pa(3, "חכלגצג") === "skip_gemini_gibberish" &&
       pa(4, "היי") === "cheap_reset_reply" &&
@@ -1278,6 +1278,296 @@ async function main() {
   const o3 = await runReceptionistTurn(ctx, { conversationContext: "", message: "כמה עולה תספורת?", bookingBlock: "" });
   console.log("  [recovery] normal AI behavior resumes after cooldown:",
     o3.ok && o3.replySource === "gemini" && !isGeminiCoolingDown() ? "PASS ✓" : `FAIL ✗ (ok=${o3.ok} src=${o3.replySource})`);
+
+  console.log("\n================ SCENARIO 37: low-signal lines kept OUT of AI history (Risk A) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    // Every deterministic confusion / quiet / reset line must be filtered from the
+    // AI-facing transcript so the model never mimics "I didn't understand" after recovery.
+    const canned = [
+      pt.LOW_SIGNAL_SHORT, pt.LOW_SIGNAL_BOUNDARY, pt.LOW_SIGNAL_QUIET_REMINDER,
+      pt.QUIET_RESET, pt.COMPLAINT_ACK, pt.META_FALLBACK,
+    ];
+    const filtered = canned.filter((s) => isKnownFallbackText(s));
+    console.log(`  [pure] canned low-signal/quiet lines filtered from AI history (${filtered.length}/${canned.length}):`,
+      filtered.length === canned.length ? "PASS ✓" : "FAIL ✗");
+    // Gender-swapped boundary (outbound enforcement rewrites מצליחה→מצליח for male) too.
+    const maleBoundary = pt.LOW_SIGNAL_BOUNDARY.replace("מצליחה", "מצליח");
+    console.log("  [pure] gender-swapped (male) boundary still filtered:",
+      isKnownFallbackText(maleBoundary) ? "PASS ✓" : `FAIL ✗ ("${maleBoundary}")`);
+    // Real business answers must NEVER be dropped from history (no over-filtering).
+    const real = ["כן, אנחנו עושים פן בשמחה 🙂", "מעולה, נקבע לך תור לחמישי ב-17:30",
+      "שעות הפעילות שלנו הן 9:00-19:00", "אפשר לשאול אותי מה תרצי על העסק"];
+    const wronglyFiltered = real.filter((s) => isKnownFallbackText(s));
+    console.log("  [pure] genuine business answers NOT filtered:",
+      wronglyFiltered.length === 0 ? "PASS ✓" : `FAIL ✗ [${wronglyFiltered.join(" | ")}]`);
+  }
+
+  console.log("\n================ SCENARIO 38: greeting/meta reset BEFORE quiet mode (Risk B) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const services = ["תספורת", "צבע", "פן"];
+    // The exact live failure: a clear greeting/meta at low-signal count 1-2 must reset
+    // cheaply (no Gemini) instead of going to Gemini and escalating to the boundary.
+    const resets: Array<[string, number]> = [
+      ["היי", 1], ["היי מה קורה?", 2], ["את פה?", 2], ["יש תשובה?", 2], ["מה קורה פה?", 2],
+    ];
+    const hit = resets.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) === "cheap_reset_reply");
+    console.log(`  [pure] greeting/meta after low-signal history → cheap reset at counts 1-2 (${hit.length}/${resets.length}):`,
+      hit.length === resets.length ? "PASS ✓" : `FAIL ✗ [${resets.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) !== "cheap_reset_reply").map(([m, n]) => `${m}@${n}`).join(" | ")}]`);
+    // Booking/FAQ at the same counts must STILL reach Gemini (never short-circuited).
+    const proceeds: Array<[string, number]> = [["אני רוצה לקבוע תור", 2], ["כמה עולה פן?", 2], ["יש חניה?", 2]];
+    const ok2 = proceeds.every(([m, n]) => pt.preGeminiAction(n, 0, m, services) === "proceed_to_gemini");
+    console.log("  [pure] booking/FAQ at low-signal count still proceed to Gemini:",
+      ok2 ? "PASS ✓" : `FAIL ✗ [${proceeds.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) !== "proceed_to_gemini").map(([m]) => m).join(" | ")}]`);
+    // A clean conversation's first greeting (no history, no loop) stays warm (Gemini).
+    console.log("  [pure] first greeting in a clean conversation still goes to Gemini (warm):",
+      pt.preGeminiAction(0, 0, "היי", services) === "proceed_to_gemini" &&
+      pt.preGeminiAction(0, 0, "היי מה קורה?", services) === "proceed_to_gemini" ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 39: repeated-greeting Gemini cost cap + de-spam (Risk C + BUG-009) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const services = ["תספורת", "צבע", "פן"];
+    // Model a greeting loop: greetings that reach Gemini advance the greeting counter;
+    // once it hits the threshold, further greetings are answered deterministically.
+    let greeting = 0, geminiCalls = 0;
+    const actions: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const a = pt.preGeminiAction(0, greeting, "היי", services);
+      actions.push(a);
+      greeting++; // every greeting (Gemini or cheap) advances the loop counter
+      if (a === "proceed_to_gemini") geminiCalls++;
+    }
+    console.log(`  [pure] 8 repeated greetings → Gemini called only ${geminiCalls}× (cap=${pt.GREETING_DETERMINISTIC_AT}):`,
+      geminiCalls === pt.GREETING_DETERMINISTIC_AT ? "PASS ✓" : `FAIL ✗ [${actions.join(",")}]`);
+    // First couple of greetings stay warm (model-generated), not cold from turn one.
+    console.log("  [pure] first greetings (#1,#2) still warm via Gemini:",
+      actions[0] === "proceed_to_gemini" && actions[1] === "proceed_to_gemini" ? "PASS ✓" : "FAIL ✗");
+    // A productive turn resets the greeting loop → the next greeting is warm again.
+    console.log("  [pure] greeting loop resets after a productive turn:",
+      pt.preGeminiAction(0, 0, "היי", services) === "proceed_to_gemini" ? "PASS ✓" : "FAIL ✗");
+
+    // BUG-009: the deterministic greeting reply must NOT be the identical full line every
+    // turn — full friendly reset once, then mostly suppressed / a short distinct reminder.
+    const plans = [3, 4, 5, 6, 7, 8, 9].map((n) => pt.greetingResetPlan(n));
+    const full = plans.filter((p) => !p.suppressReply && p.reply === pt.QUIET_RESET).length;
+    const suppressed = plans.filter((p) => p.suppressReply).length;
+    const sparse = plans.filter((p) => !p.suppressReply && p.reply === pt.GREETING_SPARSE_REMINDER).length;
+    console.log(`  [pure] deep greeting loop de-spams (full=${full} sparse=${sparse} suppressed=${suppressed}/7):`,
+      full === 1 && suppressed >= 4 && sparse >= 1 ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] first cheap reset is the full friendly line (never cold/empty):",
+      pt.greetingResetPlan(3).reply === pt.QUIET_RESET && !pt.greetingResetPlan(3).suppressReply ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] sparse reminder is shorter than the full reset:",
+      pt.GREETING_SPARSE_REMINDER.length < pt.QUIET_RESET.length ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 40: burst-aware greeting recovery (Risk D) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const services = ["תספורת", "צבע", "פן"];
+    // aggregateBurst joins fragments with "\n"; a noise burst whose tail is a clear
+    // greeting/meta must recover cheaply (no Gemini) even at low-signal count 0.
+    const recover = ["חבצב\nאת פה?", "גכלדמ\nהיי מה קורה?", "חכלגצג\nיש תשובה?"];
+    const hit = recover.filter((m) => pt.preGeminiAction(0, 0, m, services) === "cheap_reset_reply");
+    console.log(`  [pure] noise-burst + greeting tail → cheap reset (${hit.length}/${recover.length}):`,
+      hit.length === recover.length ? "PASS ✓" : `FAIL ✗ [${recover.filter((m) => pt.preGeminiAction(0, 0, m, services) !== "cheap_reset_reply").join(" | ")}]`);
+    // Real booking/FAQ split across a burst must STILL reach Gemini (meaning preserved).
+    const booking = ["אני רוצה\nלקבוע פן", "מה המחיר\nשל פן", "היי\nאני רוצה לקבוע תור"];
+    const ok2 = booking.every((m) => pt.preGeminiAction(0, 0, m, services) === "proceed_to_gemini");
+    console.log("  [pure] booking/FAQ split across a burst still proceeds to Gemini:",
+      ok2 ? "PASS ✓" : `FAIL ✗ [${booking.filter((m) => pt.preGeminiAction(0, 0, m, services) !== "proceed_to_gemini").join(" | ")}]`);
+  }
+
+  console.log("\n================ SCENARIO 41: superseded turns + context merge (Risks E + F) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    // Mock DB that records upserts — NO live write (suite contract: no DB writes).
+    let upserts = 0;
+    let lastCtx: Record<string, unknown> = {};
+    const mockDb = {
+      from: () => ({
+        upsert: async (row: { context: Record<string, unknown> }) => { upserts++; lastCtx = row.context; return { data: null, error: null }; },
+      }),
+    } as unknown as Parameters<typeof pt.persistPlatformState>[0];
+
+    // Risk E: a superseded turn must NOT persist (no counter mutation, no write).
+    const wroteSuperseded = await pt.persistPlatformState(mockDb, "b", "c", 3, 0, { consecutiveLowSignalTurns: 2 }, async () => true);
+    console.log("  [pure] superseded turn does NOT persist the counter:",
+      wroteSuperseded === false && upserts === 0 ? "PASS ✓" : `FAIL ✗ (wrote=${wroteSuperseded} upserts=${upserts})`);
+
+    // Risk E: a non-superseded turn DOES persist + advance both counters.
+    const wrote = await pt.persistPlatformState(mockDb, "b", "c", 4, 1, { consecutiveLowSignalTurns: 2, keepMe: "x" }, async () => false);
+    console.log("  [pure] non-superseded turn persists + advances counters:",
+      wrote === true && upserts === 1 && lastCtx.consecutiveLowSignalTurns === 4 && lastCtx.consecutiveGreetingTurns === 1 ? "PASS ✓" : `FAIL ✗ (wrote=${wrote} upserts=${upserts} ctx=${JSON.stringify(lastCtx)})`);
+
+    // Risk F: unrelated context fields survive the low-signal update (merge, not clobber).
+    console.log("  [pure] persist MERGES priorContext (unrelated fields survive):",
+      lastCtx.keepMe === "x" ? "PASS ✓" : `FAIL ✗ (ctx=${JSON.stringify(lastCtx)})`);
+  }
+
+  console.log("\n================ SCENARIO 42: routing integrity — single source of truth (LIST→booking-link + BUG-010) ================");
+  {
+    const rt = await import("../lib/ai/routing");
+    const u = (intent: string, appt: string, action = true) =>
+      ({ requestsBusinessAction: action, intent, appointmentIntent: appt }) as unknown as Parameters<typeof rt.resolveRoute>[0];
+    const R = (intent: string, appt: string, msg: string, action = true) => rt.resolveRoute(u(intent, appt, action), msg).route;
+
+    // THE LIVE BUG: model self-contradicts (intent=booking + appt=LIST) on "show my appts".
+    // Route must be LIST and the link 'manage' — NEVER a booking link.
+    console.log("  [pure] 'אפשר לראות את כל התורים שלי?' (model intent=booking/appt=LIST) → LIST → manage link:",
+      R("booking", "LIST", "אפשר לראות את כל התורים שלי?") === "LIST" && rt.linkKindForRoute("LIST") === "manage"
+        ? "PASS ✓" : `FAIL ✗ (route=${R("booking", "LIST", "אפשר לראות את כל התורים שלי?")})`);
+
+    // BUG-010 (opposite direction): an explicit booking verb wins over a model LIST mislabel.
+    console.log("  [pure] 'אפשר לקבוע פן?' (model appt=LIST) → BOOK → booking link:",
+      R("unclear", "LIST", "אפשר לקבוע פן?") === "BOOK" && rt.linkKindForRoute("BOOK") === "booking"
+        ? "PASS ✓" : `FAIL ✗ (route=${R("unclear", "LIST", "אפשר לקבוע פן?")})`);
+
+    // Full operation matrix from the USER'S OWN WORDS — robust to a deliberately WRONG
+    // model appt label ("LIST") on every row (proves the message decides, not the model).
+    const matrix: Array<[string, string]> = [
+      ["אפשר לקבוע פן?", "BOOK"],
+      ["אני רוצה לקבוע תור נוסף", "BOOK"],
+      ["אפשר לראות את כל התורים שלי?", "LIST"],
+      ["מה התורים שלי?", "LIST"],
+      ["אני רוצה לשנות את התור שלי", "RESCHEDULE"],
+      ["אפשר להזיז את התור?", "RESCHEDULE"],
+      ["אני רוצה לבטל את התור", "CANCEL"],
+      ["לבטל ולקבוע מחדש", "RESCHEDULE"], // cancel+re-book = reschedule, not a fresh booking
+    ];
+    const bad = matrix.filter(([m, w]) => R("unclear", "LIST", m) !== w);
+    console.log(`  [pure] operation matrix from user's words, robust to a wrong model label (${matrix.length - bad.length}/${matrix.length}):`,
+      bad.length === 0 ? "PASS ✓" : `FAIL ✗ [${bad.map(([m, w]) => `${m}→${R("unclear", "LIST", m)}≠${w}`).join(" | ")}]`);
+
+    // FAQ / smalltalk / questions ABOUT an operation never route to an operation.
+    console.log("  [pure] FAQ/smalltalk never route to an operation (even with an op verb):",
+      R("faq", "NONE", "כמה עולה לבטל תור?", false) === "NONE" &&
+      R("smalltalk", "NONE", "מה שלומך?", false) === "NONE" &&
+      R("faq", "NONE", "יש חניה?", false) === "NONE" ? "PASS ✓" : "FAIL ✗");
+
+    // Model self-contradiction is reconciled deterministically: appointmentIntent (fine)
+    // wins over the coarse `intent` so the two can never disagree silently.
+    console.log("  [pure] model field disagreement reconciled (appt wins over coarse intent):",
+      rt.modelOperation(u("booking", "LIST")) === "LIST" && rt.modelOperation(u("booking", "CANCEL")) === "CANCEL" &&
+      rt.modelOperation(u("unclear", "BOOK")) === "BOOK" ? "PASS ✓" : "FAIL ✗");
+
+    // No-verb message falls back to the (reconciled) model route.
+    console.log("  [pure] no-verb message falls back to model route:",
+      R("booking", "BOOK", "פן בבקשה") === "BOOK" && R("unclear", "NONE", "אוקיי") === "NONE" ? "PASS ✓" : "FAIL ✗");
+
+    // Link kind agrees with route for EVERY route (no link/intent disagreement possible).
+    console.log("  [pure] link kind agrees with route for all 5 routes:",
+      rt.linkKindForRoute("BOOK") === "booking" && rt.linkKindForRoute("LIST") === "manage" &&
+      rt.linkKindForRoute("RESCHEDULE") === "manage" && rt.linkKindForRoute("CANCEL") === "manage" &&
+      rt.linkKindForRoute("NONE") === null ? "PASS ✓" : "FAIL ✗");
+
+    // Existing appointments / prior links / conversation state do NOT enter routing:
+    // resolveRoute takes only (understanding, message). Same message ⇒ same route, whatever
+    // the model's appt label — structurally there is no appointment/state input to distort it.
+    console.log("  [pure] route depends ONLY on understanding + message (existing appts can't distort it):",
+      R("unclear", "LIST", "אפשר לקבוע פן?") === R("unclear", "BOOK", "אפשר לקבוע פן?") &&
+      R("booking", "BOOK", "אפשר לראות את כל התורים שלי?") === R("unclear", "CANCEL", "אפשר לראות את כל התורים שלי?") ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 43: burst aggregation + debounce (split-message coalescing) ================");
+  {
+    const mh = await import("../lib/message-handler");
+    const flow = await import("../lib/booking/flow");
+    const cfg = await import("../lib/config");
+    const pt = await import("../lib/ai/platform-turn");
+    const rt = await import("../lib/ai/routing");
+    const services = ["תספורת", "צבע", "פן"];
+
+    // Chainable mock DB (no real I/O). The lastOut query ends in .maybeSingle(); the burst
+    // query is awaited directly on .order() — so the two are distinguished by terminator.
+    const mkBurstDb = (lastOut: string | null, rows: Array<{ body: string }>) => {
+      const chain: Record<string, unknown> = {};
+      for (const m of ["select", "eq", "gt", "lte", "order", "limit"]) chain[m] = () => chain;
+      chain.maybeSingle = async () => ({ data: lastOut ? { created_at: lastOut } : null });
+      (chain as { then: unknown }).then = (resolve: (v: unknown) => void) => resolve({ data: rows });
+      return { from: () => chain } as unknown as Parameters<typeof mh.aggregateBurst>[0];
+    };
+    const agg = (rows: string[], fallback: string) =>
+      mh.aggregateBurst(mkBurstDb(null, rows.map((body) => ({ body }))), "b", "c", "2026-06-15T10:00:00Z", fallback);
+
+    // 1) Fragmented booking → aggregates; the user's words route to BOOK.
+    const b1 = await agg(["אני רוצה", "לקבוע פן"], "FB");
+    console.log("  [pure] fragmented booking aggregates + routes BOOK:",
+      b1 === "אני רוצה\nלקבוע פן" && rt.messageOperation(b1) === "BOOK" &&
+      pt.preGeminiAction(0, 0, b1, services) === "proceed_to_gemini" ? "PASS ✓" : `FAIL ✗ ("${b1}" op=${rt.messageOperation(b1)})`);
+
+    // 2) Fragmented FAQ → aggregates; has a service signal but is NOT forced to an operation.
+    const b2 = await agg(["מה המחיר", "של פן"], "FB");
+    console.log("  [pure] fragmented FAQ aggregates + stays FAQ/productive (no op forced):",
+      b2 === "מה המחיר\nשל פן" && pt.hasBookingSignal(b2, services) && rt.messageOperation(b2) === null &&
+      pt.preGeminiAction(0, 0, b2, services) === "proceed_to_gemini" ? "PASS ✓" : `FAIL ✗ ("${b2}")`);
+
+    // 3) Greeting split → ONE aggregated turn → ONE deterministic friendly reply (no duplicate).
+    const b3 = await agg(["היי", "מה קורה?"], "FB");
+    console.log("  [pure] greeting split aggregates + single friendly reply (no duplicate):",
+      b3 === "היי\nמה קורה?" && pt.preGeminiAction(0, 0, b3, services) === "cheap_reset_reply"
+        ? "PASS ✓" : `FAIL ✗ ("${b3}" → ${pt.preGeminiAction(0, 0, b3, services)})`);
+
+    // 4) Repeated "היי" spam → ONE aggregated turn → cheap reset → ZERO Gemini calls.
+    const b4 = await agg(Array(8).fill("היי"), "FB");
+    console.log("  [pure] repeated-greeting burst aggregates + 0 Gemini (cheap reset):",
+      b4.split("\n").length === 8 && pt.preGeminiAction(0, 0, b4, services) === "cheap_reset_reply" ? "PASS ✓" : "FAIL ✗");
+
+    // 5) Early supersede: a newer inbound during the debounce → skip (no Gemini, no reply).
+    const mkNewerDb = (rows: unknown[]) => {
+      const chain: Record<string, unknown> = {};
+      for (const m of ["select", "eq", "gt", "limit"]) chain[m] = () => chain;
+      (chain as { then: unknown }).then = (resolve: (v: unknown) => void) => resolve({ data: rows });
+      return { from: () => chain } as unknown as Parameters<typeof flow.hasNewerInbound>[0];
+    };
+    const newer = await flow.hasNewerInbound(mkNewerDb([{ id: "x" }]), "b", "c", "2026-06-15T10:00:00Z");
+    const noNewer = await flow.hasNewerInbound(mkNewerDb([]), "b", "c", "2026-06-15T10:00:00Z");
+    console.log("  [pure] early supersede skips when newer inbound exists, proceeds otherwise:",
+      newer === true && noNewer === false ? "PASS ✓" : `FAIL ✗ (newer=${newer} noNewer=${noNewer})`);
+
+    // 6) Single normal message → NOT aggregated (returns the message text as-is) → normal flow.
+    const b6 = await agg(["שלום"], "FALLBACK_MSG");
+    console.log("  [pure] single message is not aggregated (unchanged behavior):",
+      b6 === "FALLBACK_MSG" ? "PASS ✓" : `FAIL ✗ ("${b6}")`);
+
+    // Config: default 2000, disable with 0, env override honored, invalid → default, cap 10s.
+    const restore = process.env.AGGREGATION_DEBOUNCE_MS;
+    delete process.env.AGGREGATION_DEBOUNCE_MS;
+    const dDefault = cfg.getAggregationDebounceMs();
+    process.env.AGGREGATION_DEBOUNCE_MS = "0";
+    const dZero = cfg.getAggregationDebounceMs();
+    process.env.AGGREGATION_DEBOUNCE_MS = "1500";
+    const dSet = cfg.getAggregationDebounceMs();
+    process.env.AGGREGATION_DEBOUNCE_MS = "abc";
+    const dBad = cfg.getAggregationDebounceMs();
+    process.env.AGGREGATION_DEBOUNCE_MS = "999999";
+    const dCap = cfg.getAggregationDebounceMs();
+    if (restore === undefined) delete process.env.AGGREGATION_DEBOUNCE_MS; else process.env.AGGREGATION_DEBOUNCE_MS = restore;
+    console.log(`  [pure] debounce config default=${dDefault} "0"→${dZero} "1500"→${dSet} invalid→${dBad} cap→${dCap}:`,
+      dDefault === 2000 && dZero === 0 && dSet === 1500 && dBad === 2000 && dCap === 10_000 ? "PASS ✓" : "FAIL ✗");
+
+    // 3-fragment burst serialization (race fix): with the triggering-fragment anchor, only
+    // the LAST fragment has no newer inbound → only it proceeds; the older two skip BEFORE
+    // Gemini. Proves a burst is exactly ONE Gemini/flow execution regardless of timing.
+    const mkSerialDb = (times: string[]) => {
+      let gtArg: string | null = null;
+      const chain: Record<string, unknown> = {};
+      chain.select = () => chain; chain.eq = () => chain; chain.limit = () => chain;
+      chain.gt = (_c: string, v: string) => { gtArg = v; return chain; };
+      (chain as { then: unknown }).then = (resolve: (v: unknown) => void) =>
+        resolve({ data: times.filter((t) => gtArg !== null && t > gtArg).map((t) => ({ id: t })) });
+      return { from: () => chain } as unknown as Parameters<typeof flow.hasNewerInbound>[0];
+    };
+    const fragTimes = ["2026-06-16T10:00:00.000Z", "2026-06-16T10:00:00.700Z", "2026-06-16T10:00:01.400Z"];
+    let proceeds = 0;
+    for (const ti of fragTimes) {
+      if (!(await flow.hasNewerInbound(mkSerialDb(fragTimes), "b", "c", ti))) proceeds++;
+    }
+    console.log(`  [pure] 3-fragment burst → exactly ONE turn proceeds to Gemini (got ${proceeds}):`,
+      proceeds === 1 ? "PASS ✓" : "FAIL ✗");
+  }
 
   console.log("\nDONE.");
 }

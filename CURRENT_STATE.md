@@ -15,6 +15,11 @@ validated this session (live behavior unchanged until the owner flips the flag):
 - **`BOOKING_MODE` flag** — `conversational` (default, exact pre-pivot behavior) |
   `platform` (AI detects BOOK/CANCEL/RESCHEDULE intent → system attaches links;
   `lib/ai/platform-turn.ts`; persona drops all scheduling machinery).
+  > **`conversational` is LEGACY/DEPRECATED (Risk G).** All the reliability guards
+  > (low-signal/quiet mode, evidence gate, emoji handling, link-wording fences) live in
+  > platform mode only. `flow.ts` now emits a once-per-process `console.warn` when running
+  > conversational so no business is silently deployed on the unprotected path — set
+  > `BOOKING_MODE=platform` for production.
 - **Event layer** — migration `007_platform_events_waitlist.sql` (events + waitlist
   tables + source='platform'; NOT yet applied), fail-open emitter (`lib/events/emit.ts`),
   jobs-runner skeleton (`POST /api/jobs/process`, JOBS_SECRET-gated).

@@ -447,7 +447,14 @@ export function isLowValueAck(text: string): boolean {
  * (the guard-facing transcript keeps everything).
  */
 export function isKnownFallbackText(s: string): boolean {
-  return /משהו השתבש אצלי|שיהוק טכני|עומס קטן במערכת|עדיין בעומס|הייתה לי תקלה/.test(s);
+  // Two families, both kept OUT of AI-facing history (they carry no business
+  // information and, as model turns, teach the bot to talk about glitches/confusion):
+  //   1) error / overload notices
+  //   2) deterministic low-signal / quiet-mode / "I didn't understand" canned lines
+  //      (Risk A) — matched by distinctive, gender-stable fragments (outbound gender
+  //      enforcement may rewrite מצליחה→מצליח, hence מצליח(?:ה)?). Fragments are long
+  //      and specific so a genuine business answer is never dropped.
+  return /משהו השתבש אצלי|שיהוק טכני|עומס קטן במערכת|עדיין בעומס|הייתה לי תקלה|לא הצלחתי להבין|לא מצליח(?:ה)? להבין את הכוונה|כשיהיה ברור מה צריך|אפשר לכתוב לי אם תרצה לקבוע תור|סליחה על הבלבול|לא בטוח\/ה שהבנתי/.test(s);
 }
 
 /**

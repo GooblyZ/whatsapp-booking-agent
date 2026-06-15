@@ -36,6 +36,20 @@ export function isCancelIntent(text: string): boolean {
   return CANCEL_COMMANDS.has(t);
 }
 
+// Risk G: conversational mode is LEGACY (the product pivoted to platform booking) and
+// runs without the platform reliability guards (low-signal/quiet mode, evidence gate,
+// emoji handling, link fences). Warn once per process so it can't ship unnoticed.
+let warnedConversationalLegacy = false;
+function warnConversationalModeLegacy(): void {
+  if (warnedConversationalLegacy) return;
+  warnedConversationalLegacy = true;
+  console.warn(
+    "[router] BOOKING_MODE=conversational is LEGACY/DEPRECATED — it runs WITHOUT the platform " +
+    "reliability guards (low-signal/quiet mode, evidence gate, emoji handling, link fences). " +
+    "Set BOOKING_MODE=platform for production. See CURRENT_STATE.md."
+  );
+}
+
 // Outbound sending (settings enforcement, health recording, persistence) lives
 // in ./outbound.ts — the SAME chokepoint serves this router and the booking
 // platform, so owner settings can never diverge between the two paths.
@@ -61,7 +75,8 @@ async function reply(
  *   - technical failures (AI disabled / API down) → legacy menu as last resort
  */
 export async function handleBookingFlow(
-  db: DB, businessId: string, fromPhone: string, customerId: string, messageText: string
+  db: DB, businessId: string, fromPhone: string, customerId: string, messageText: string,
+  triggerCreatedAt: string | null = null
 ): Promise<void> {
   const { state: rawState, context: rawContext, expiresAt } = await getConversationState(db, businessId, customerId);
   const timezone = await getBusinessTimezone(db, businessId);
@@ -83,8 +98,17 @@ export async function handleBookingFlow(
   // entire conversational-booking pipeline below is bypassed.
   if (getBookingMode() === "platform") {
     console.log(`[router] mode=platform state="${state}" → platform turn`);
-    const turnAnchor = await latestInboundAt(db, businessId, customerId);
-    const outcome = await runPlatformTurn(db, businessId, customerId, fromPhone, messageText, state, context);
+    // Anchor = the fragment that triggered THIS turn (passed from the message-handler).
+    // Using the triggering fragment — not the global latest — means a turn supersedes
+    // itself the instant a newer fragment exists, even one that arrived between
+    // aggregation and here (fixes burst fragments each reaching Gemini).
+    const turnAnchor = triggerCreatedAt ?? await latestInboundAt(db, businessId, customerId);
+    // Pass the supersede predicate so the turn can SKIP persisting its low-signal
+    // counters if a newer inbound already arrived (Risk E — no over-count drift).
+    const outcome = await runPlatformTurn(
+      db, businessId, customerId, fromPhone, messageText, state, context,
+      () => hasNewerInbound(db, businessId, customerId, turnAnchor)
+    );
     if (await hasNewerInbound(db, businessId, customerId, turnAnchor)) {
       console.log(`[router] superseded by newer inbound message — reply skipped`);
       return;
@@ -98,6 +122,10 @@ export async function handleBookingFlow(
     await replyFn(outcome.replyText);
     return;
   }
+
+  // LEGACY conversational mode (Risk G): everything below runs WITHOUT the platform
+  // reliability guards. Warn once per process so no business is silently deployed here.
+  warnConversationalModeLegacy();
 
   const isMenuState = BOOKING_STATES.has(state);
   const session = loadBookingSession(context);
@@ -135,7 +163,7 @@ export async function handleBookingFlow(
 
   // EVERYTHING ELSE → the conversation engine (AI-first; one Gemini call).
   console.log(`[router] state=${state} ai_called=true deterministic_called=false reply_source=gemini`);
-  const turnAnchor = await latestInboundAt(db, businessId, customerId);
+  const turnAnchor = triggerCreatedAt ?? await latestInboundAt(db, businessId, customerId);
   const outcome = await runConversationTurn(db, businessId, customerId, messageText, context, timezone, state);
 
   // Technical failure + clear booking keyword → legacy menu as a TRUE fallback
@@ -182,8 +210,9 @@ async function latestInboundAt(db: DB, businessId: string, customerId: string): 
   return (data?.created_at as string) ?? null;
 }
 
-/** True if an inbound message newer than the anchor exists (burst supersede). */
-async function hasNewerInbound(db: DB, businessId: string, customerId: string, anchorISO: string | null): Promise<boolean> {
+/** True if an inbound message newer than the anchor exists (burst supersede). Exported so
+ *  the message-handler can run the SAME check after the aggregation debounce (early skip). */
+export async function hasNewerInbound(db: DB, businessId: string, customerId: string, anchorISO: string | null): Promise<boolean> {
   if (!anchorISO) return false;
   const { data } = await db
     .from("messages")

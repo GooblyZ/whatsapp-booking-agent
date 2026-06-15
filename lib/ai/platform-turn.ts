@@ -19,6 +19,7 @@ import {
   runReceptionistTurn, FALLBACK, classifyInput, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
+import { resolveRoute, linkKindForRoute } from "./routing";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
 import { buildMyAppointmentsLink } from "@/lib/booking/appointment-token";
@@ -54,17 +55,29 @@ export async function runPlatformTurn(
   customerPhone: string,
   messageText: string,
   rawState: string,
-  priorContext: Record<string, unknown> = {}
+  priorContext: Record<string, unknown> = {},
+  checkSuperseded?: () => Promise<boolean>
 ): Promise<PlatformTurnOutcome> {
-  // Low-signal escalation counter — persisted in the (always-idle) platform state.
+  // Low-signal + greeting escalation counters — persisted in the (always-idle) platform state.
   const prevLowSignal = readLowSignalCount(priorContext);
+  const prevGreeting = readGreetingCount(priorContext);
+
+  // Persists platform state (always idle), merging priorContext (Risk F) and skipping
+  // the write when a newer inbound already superseded this turn (Risk E). See
+  // persistPlatformState for the (unit-tested) contract.
+  const persist = (low: number, greet: number): Promise<boolean> =>
+    persistPlatformState(db, businessId, customerId, low, greet, priorContext, checkSuperseded);
 
   // Legacy conversational-booking states cannot continue in platform mode —
   // reset once so the customer starts clean after the flip (but carry the
-  // low-signal counter forward so repeated gibberish across a reset still escalates).
+  // counters forward so repeated gibberish across a reset still escalates).
+  // Deliberately does NOT merge priorContext — that's where stale legacy booking
+  // fields (services_list, …) live, and the reset's whole job is to drop them.
   if (rawState !== "idle") {
     console.log(`[platform-turn] resetting legacy state "${rawState}" → idle`);
-    await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: prevLowSignal });
+    await upsertConversationState(db, businessId, customerId, "idle", {
+      consecutiveLowSignalTurns: prevLowSignal, consecutiveGreetingTurns: prevGreeting,
+    });
   }
 
   let ctx;
@@ -107,13 +120,14 @@ export async function runPlatformTurn(
       suppressReply = plan.suppressReply;
       replyText = plan.suppressReply ? "" : LOW_SIGNAL_QUIET_REMINDER;
     }
-    await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: newCount });
+    await persist(newCount, 0); // emoji breaks any greeting run
     const decision = errorDecision("low_signal_emoji", true);
     await safeLog(businessId, customerId, decision);
     console.log(
       `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=skip_gemini_emoji` +
       ` gemini_skipped_reason=emoji_only low_signal=true low_signal_kind=emoji` +
       ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
+      ` greeting_count_before=${prevGreeting} greeting_count_after=0` +
       ` low_signal_action=${action} reply_suppressed=${suppressReply} link=-`
     );
     return { replyText, decision, linkAttached: null, suppressReply };
@@ -127,18 +141,19 @@ export async function runPlatformTurn(
   //     friendly RESET reply (no Gemini) and the counter resets — never silently dropped
   //   • anything else (a real-looking message) → fall through to Gemini
   const activeServiceNames = ctx.services.filter((s) => s.active).map((s) => s.name);
-  const preGemini = preGeminiAction(prevLowSignal, messageText, activeServiceNames);
+  const preGemini = preGeminiAction(prevLowSignal, prevGreeting, messageText, activeServiceNames);
   if (preGemini !== "proceed_to_gemini") {
     if (preGemini === "skip_gemini_gibberish") {
       const newCount = prevLowSignal + 1;
       const plan = quietModePlan(newCount);
-      await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: newCount });
+      await persist(newCount, 0); // gibberish breaks any greeting run
       const decision = errorDecision("low_signal_quiet", true);
       await safeLog(businessId, customerId, decision);
       console.log(
         `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=skip_gemini_gibberish` +
         ` gemini_skipped_reason=quiet_mode_gibberish low_signal=true low_signal_kind=gibberish` +
         ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
+        ` greeting_count_before=${prevGreeting} greeting_count_after=0` +
         ` low_signal_action=quiet_mode cooldown_short_circuit=true reply_suppressed=${plan.suppressReply} link=-`
       );
       return {
@@ -147,16 +162,23 @@ export async function runPlatformTurn(
       };
     }
     if (preGemini === "cheap_reset_reply") {
-      // Human greeting/meta during quiet mode: answer cheaply and DE-escalate.
-      await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: 0 });
+      // Clear human greeting/meta after low-signal history (B), as the recovery tail
+      // of a noise burst (D), or a repeated-greeting loop (C): answer cheaply WITHOUT
+      // Gemini and DE-escalate low-signal to 0. The reply DE-SPAMS as the greeting loop
+      // deepens — full friendly reset first, then mostly suppressed / a short sparse
+      // reminder (BUG-009) — never the identical full line every turn, never cold first.
+      const newGreeting = prevGreeting + 1;
+      await persist(0, newGreeting);
+      const plan = greetingResetPlan(newGreeting);
       const decision = errorDecision("low_signal_reset", true);
       await safeLog(businessId, customerId, decision);
       console.log(
         `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=cheap_reset_reply` +
-        ` gemini_skipped_reason=quiet_mode_reset_message low_signal=false low_signal_kind=meta` +
-        ` low_signal_count_before=${prevLowSignal} low_signal_count_after=0 reply_suppressed=false link=-`
+        ` gemini_skipped_reason=low_signal_greeting_reset low_signal=false low_signal_kind=meta` +
+        ` low_signal_count_before=${prevLowSignal} low_signal_count_after=0` +
+        ` greeting_count_before=${prevGreeting} greeting_count_after=${newGreeting} reply_suppressed=${plan.suppressReply} link=-`
       );
-      return { replyText: QUIET_RESET, decision, linkAttached: null, suppressReply: false };
+      return { replyText: plan.reply, decision, linkAttached: null, suppressReply: plan.suppressReply };
     }
     // else: real-looking message → fall through to Gemini (recovery happens there).
   }
@@ -186,6 +208,18 @@ export async function runPlatformTurn(
   if (lastSendFailed) {
     replyGuidance =
       `NOTE: your PREVIOUS reply FAILED to deliver (technical issue on our side — the customer never saw it). Open with a brief, warm acknowledgement of a small hiccup ("הייתה לי תקלה קטנה קודם") before continuing.`;
+  }
+
+  // FINAL supersede gate BEFORE the (expensive) Gemini call. A newer fragment that
+  // arrived during the debounce / aggregation / context-load means a later turn will
+  // answer the full aggregate — so THIS turn must not also call Gemini. This guarantees a
+  // burst costs ONE Gemini call (the last fragment's), not one per fragment. State is left
+  // untouched (no persist) and the reply is suppressed (the router skips it anyway).
+  if (checkSuperseded && (await checkSuperseded())) {
+    console.log("[platform-turn] superseded before Gemini call — skipping model call (burst coalesced to a later turn)");
+    const superseded = errorDecision("superseded", true);
+    await safeLog(businessId, customerId, superseded);
+    return { replyText: "", decision: superseded, linkAttached: null, suppressReply: true };
   }
 
   const decision = await runReceptionistTurn(ctx, {
@@ -236,8 +270,11 @@ export async function runPlatformTurn(
   //    another link" loop. The link attaches only on a genuine action intent.
   const u = decision.turn?.understanding;
   let linkAttached: PlatformLink = null;
+  let platformRoute = "-";
+  let platformRouteReason = "-";
 
   if (decision.ok && suppressLinkFor(messageText)) {
+    platformRoute = "NONE"; // complaints / bare-meta / one-char never get a link
     if (LINK_COMPLAINT_RE.test(messageText) && !isExplicitLinkRequest(messageText)) {
       replyText = COMPLAINT_ACK; // breaks the complaint loop — acknowledge, no link
       console.log("[platform-turn] link suppressed (complaint) — deterministic ack, no link");
@@ -248,29 +285,34 @@ export async function runPlatformTurn(
       console.log("[platform-turn] link suppressed (meta/non-action) — model reply kept, no link");
     }
   } else if (decision.ok && u) {
-    // PRIMARY GATE — actionability: the model must have judged this an actual
-    // business operation. (The parser already forces appointmentIntent=NONE when
-    // requestsBusinessAction is false, so this is also defense-in-depth.)
-    const isAction = u.requestsBusinessAction === true;
-    const wantsBooking = isAction && (u.appointmentIntent === "BOOK" || u.intent === "booking");
-    const wantsManage = isAction && (
-      u.appointmentIntent === "CANCEL" || u.appointmentIntent === "RESCHEDULE" ||
-      u.appointmentIntent === "MODIFY" || u.appointmentIntent === "LIST" ||
-      u.intent === "cancel_request" || u.intent === "reschedule_request");
-
-    // SECONDARY GATE (deterministic floor): even an affirmed operation must be
-    // corroborated by a real booking/service signal in the message — catches the
-    // rare case where the model still over-asserts an action.
+    // ── SINGLE SOURCE OF TRUTH (lib/ai/routing.ts): one canonical route, computed ONCE.
+    //    Everything below — which link, the wording/fence, the follow-up — derives from
+    //    it; no component re-interprets intent. This closes the class of bugs where the
+    //    coarse `intent`, the fine `appointmentIntent`, and the user's words disagreed and
+    //    different layers picked different answers (the live LIST→booking-link incident).
+    const { route, reason, modelRoute } = resolveRoute(u, messageText);
+    const linkKind = linkKindForRoute(route);
     const bookingSignal = hasBookingSignal(messageText, activeServiceNames);
+    platformRoute = route;
+    platformRouteReason = reason;
 
-    if ((wantsBooking || wantsManage) && !bookingSignal) {
-      console.log(`[platform-turn] link suppressed: action=${isAction} intent=${u.intent}/${u.appointmentIntent} but no booking signal in message`);
-    } else if (wantsManage) {
-      // Deterministic link decision — code decides the fact, the model never
-      // guesses how many appointments exist or which one to manage:
-      //   0 upcoming → booking link (nothing to manage; offer to book)
-      //   1 upcoming → that appointment's manage page (/appointment/[id])
-      //   2+ upcoming → My Appointments page (customer picks which one)
+    // When the user's words OVERRODE the model's own operation, the model's free text was
+    // written for the WRONG operation — replace it with a deterministic, route-appropriate
+    // line so the reply can NEVER disagree with the link that gets attached.
+    if (reason === "message_verb" && route !== modelRoute) {
+      console.log(`[platform-turn] route override: model=${modelRoute} → ${route} (user's words) — reply replaced for consistency`);
+      replyText = route === "BOOK" ? `בטח! ${FENCE_BRIDGE_BOOK}` : `בטח! ${FENCE_BRIDGE_MANAGE}`;
+    }
+
+    if (linkKind && reason === "model_intent" && !bookingSignal) {
+      // Defense-in-depth floor: a MODEL-derived operation with no corroborating signal in
+      // the message is not trusted to attach a link (the evidence gate normally already
+      // downgraded it). A message_verb route is self-evidenced and never lands here.
+      console.log(`[platform-turn] link suppressed: route=${route} (model_intent) but no booking signal in message`);
+    } else if (linkKind === "manage") {
+      // Route is fixed; only WHICH manage page varies, decided by real data (never the
+      // model): 0 upcoming → booking link (nothing to manage; offer to book) · 1 → that
+      // appointment's page · 2+ → My Appointments page.
       const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
       let url: string;
       let label: string;
@@ -287,9 +329,9 @@ export async function runPlatformTurn(
         label = MY_APPTS_LINE;
         linkAttached = "manage";
       }
-      // Same fence as booking: never ask the customer to identify/specify an
-      // appointment in chat. For manage we DON'T keep model sentences (that's where
-      // it merges/invents appointment details) — the link shows the accurate list.
+      // Never ask the customer to identify/specify an appointment in chat — the link shows
+      // the accurate list. (If we already replaced the reply on override, no question
+      // remains, so this is a no-op then.)
       const fenced =
         upcoming.length === 0
           ? defuseSchedulingQuestion(replyText)
@@ -300,11 +342,9 @@ export async function runPlatformTurn(
       }
       replyText = appendPlatformLink(replyText, label, url, lastAssistant, messageText);
       logPlatformLink(linkAttached, url);
-    } else if (wantsBooking) {
-      // DETERMINISTIC FENCE: a booking-intent reply must never ask the customer
-      // to pick service/day/time in chat — that's the website's job. Validation
-      // showed the model still slips a scheduling question in ~60-80% of the time
-      // even with the persona rules, so we strip it deterministically here.
+    } else if (linkKind === "booking") {
+      // A booking reply must never ask the customer to pick service/day/time in chat —
+      // that's the website's job. Strip any such question deterministically.
       const fenced = defuseSchedulingQuestion(replyText);
       if (fenced.defused) {
         console.log("[platform-turn] fence: stripped in-chat scheduling question (booking intent → link-first)");
@@ -315,6 +355,7 @@ export async function runPlatformTurn(
       linkAttached = "booking";
       logPlatformLink(linkAttached, url);
     }
+    // route === NONE → no link (any override reply replacement already applied above).
   }
 
   // ── LOW-SIGNAL GUARD: gently clarify, then set a polite boundary, so repeated
@@ -328,10 +369,15 @@ export async function runPlatformTurn(
     : "unclear";
   const lowSignal = decision.ok && !!decision.turn && countsTowardQuiet(kind);
   let newLowSignal = prevLowSignal;
+  // Greeting run: a greeting/meta turn that reached Gemini advances the counter
+  // (so a sustained loop eventually short-circuits, Risk C); any other turn resets
+  // it. System errors (!decision.ok) leave it unchanged — never penalize our fault.
+  let newGreeting = prevGreeting;
   let lowSignalAct: LowSignalAction = "none";
   let suppressReply = false;
   if (decision.ok && decision.turn) {
     newLowSignal = lowSignal ? prevLowSignal + 1 : 0;
+    newGreeting = (kind === "smalltalk" || kind === "meta") ? prevGreeting + 1 : 0;
     lowSignalAct = lowSignalActionFor(newLowSignal);
     // count 1 → keep the model's (friendly) clarification; escalate from 2 up.
     if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
@@ -356,8 +402,8 @@ export async function runPlatformTurn(
     linkWordingFenceApplied = true;
   }
 
-  // Persist the low-signal counter (platform state is always idle).
-  await upsertConversationState(db, businessId, customerId, "idle", { consecutiveLowSignalTurns: newLowSignal });
+  // Persist the counters (platform state is always idle; merge-safe + supersede-aware).
+  await persist(newLowSignal, newGreeting);
 
   if (ctx.aiSettings?.emoji_usage === "none") {
     replyText = stripEmojis(replyText);
@@ -366,11 +412,13 @@ export async function runPlatformTurn(
   await safeLog(businessId, customerId, decision);
   console.log(
     `[platform-turn] ai_called=${decision.geminiCalled} action=${u?.requestsBusinessAction ?? "-"}` +
-    ` intent=${u?.intent ?? "-"} appt_intent=${u?.appointmentIntent ?? "-"} link=${linkAttached ?? "-"}` +
+    ` intent=${u?.intent ?? "-"} appt_intent=${u?.appointmentIntent ?? "-"}` +
+    ` route=${platformRoute} route_reason=${platformRouteReason} link=${linkAttached ?? "-"}` +
     ` booking_evidence=${bookingEvidence} booking_evidence_reason=${bookingEvidenceReason}` +
     ` pre_gemini_guard=false pre_gemini_action=proceed_to_gemini gemini_skipped_reason=none` +
     ` low_signal=${lowSignal} low_signal_kind=${kind}` +
     ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newLowSignal}` +
+    ` greeting_count_before=${prevGreeting} greeting_count_after=${newGreeting}` +
     ` low_signal_action=${lowSignalAct} cooldown_short_circuit=false reply_suppressed=${suppressReply}` +
     ` link_wording_fence_applied=${linkWordingFenceApplied}` +
     ` src=${decision.replySource} memLines=${memory.turnsUsed}`
@@ -407,10 +455,60 @@ export const LOW_SIGNAL_QUIET_REMINDER =
 // mode — answered WITHOUT Gemini, and the counter resets (never silently dropped).
 export const QUIET_RESET =
   "אני כאן 🙂 אפשר לכתוב לי אם תרצה לקבוע תור או לשאול משהו על העסק.";
+// Short, distinct sparse reminder for a DEEP repeated-greeting loop — so we never spam
+// the identical full QUIET_RESET line every turn (BUG-009).
+export const GREETING_SPARSE_REMINDER = "אני כאן 🙂";
+
+// In a deep greeting loop, send a short reminder only every Nth turn (otherwise suppress).
+const GREETING_REMINDER_EVERY = 3;
+/**
+ * Plans the deterministic reply for a greeting/meta turn answered WITHOUT Gemini.
+ * The first few (a genuine recovery, or the first loop reset) get the full, friendly
+ * QUIET_RESET; a SUSTAINED repeated-greeting loop then goes sparse — mostly suppressed,
+ * with a SHORT reminder every Nth turn — so the bot never re-sends the identical full
+ * line on every "היי" (BUG-009). Never silent on the first reset, never cold.
+ * `greetingCount` is the NEW (post-increment) consecutive greeting count.
+ */
+export function greetingResetPlan(greetingCount: number): { reply: string; suppressReply: boolean } {
+  if (greetingCount <= 3) return { reply: QUIET_RESET, suppressReply: false };
+  const idx = greetingCount - 3; // 1, 2, 3, … into the deep loop
+  if (idx % GREETING_REMINDER_EVERY === 0) return { reply: GREETING_SPARSE_REMINDER, suppressReply: false };
+  return { reply: "", suppressReply: true };
+}
 
 export function readLowSignalCount(context: Record<string, unknown>): number {
   const n = context?.consecutiveLowSignalTurns;
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/** Consecutive greeting/meta turns (separate from low-signal — greetings are NOT
+ *  spam and never count toward quiet mode; this counter only caps a greeting LOOP's
+ *  Gemini cost). Reset to 0 by any non-greeting turn. */
+export function readGreetingCount(context: Record<string, unknown>): number {
+  const n = context?.consecutiveGreetingTurns;
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/**
+ * Persists platform state (always idle). MERGES `priorContext` so unrelated fields
+ * survive a low-signal update (Risk F). SKIPS the write entirely when `checkSuperseded`
+ * reports a newer inbound already arrived (Risk E) — the router will skip this turn's
+ * reply too, so a superseded burst turn must not mutate the counters. Returns whether
+ * the write happened. Exported so the contract is unit-testable without a live DB.
+ */
+export async function persistPlatformState(
+  db: DB, businessId: string, customerId: string,
+  low: number, greet: number, priorContext: Record<string, unknown>,
+  checkSuperseded?: () => Promise<boolean>
+): Promise<boolean> {
+  if (checkSuperseded && (await checkSuperseded())) {
+    console.log("[platform-turn] superseded before persist — state NOT mutated");
+    return false;
+  }
+  await upsertConversationState(db, businessId, customerId, "idle", {
+    ...priorContext, consecutiveLowSignalTurns: low, consecutiveGreetingTurns: greet,
+  });
+  return true;
 }
 
 // Compact recognizer for normal greetings / "are you there?" / follow-up meta — a
@@ -418,7 +516,7 @@ export function readLowSignalCount(context: Record<string, unknown>): number {
 // human cheaply instead of suppressing them. Only short messages qualify; anything
 // with a booking/service signal is productive, not a greeting.
 const GREETING_META_RE =
-  /^(היי+|הי|שלום|הלו+|אהלן|בוקר טוב|ערב טוב|צהריים טובים|מה קורה|מה נשמע|מה המצב|מה חדש|מה איתך|יש תשובה|יש מישהו|אתה שם|את שם|מישהו שם|למה לא ענית|למה אתה לא עונה|למה את לא עונה|מה קורה פה|מה קורה כאן|מה אתה עושה)(?=\s|$)/;
+  /^(היי+|הי|שלום|הלו+|אהלן|בוקר טוב|ערב טוב|צהריים טובים|מה קורה|מה נשמע|מה המצב|מה חדש|מה איתך|יש תשובה|יש מישהו|אתה שם|את שם|אתם שם|מישהו שם|את פה|אתה פה|אתם פה|למה לא ענית|למה אתה לא עונה|למה את לא עונה|מה קורה פה|מה קורה כאן|מה אתה עושה)(?=\s|$)/;
 export function looksLikeGreetingOrMeta(message: string, serviceNames: string[] = []): boolean {
   const t = (message ?? "").trim().replace(/[?!.…״"'\s]+$/g, "").trim();
   if (t.length === 0 || t.length > 22) return false; // greetings/meta are short
@@ -519,15 +617,40 @@ export function countsTowardQuiet(kind: LowSignalKind): boolean {
 
 export type PreGeminiAction = "skip_gemini_gibberish" | "cheap_reset_reply" | "proceed_to_gemini";
 
-/** Decides — BEFORE any model call — what to do with the incoming message. Quiet
- *  mode (3+ prior low-signal turns) short-circuits obvious gibberish (no Gemini) and
- *  answers a human greeting/meta cheaply (no Gemini, never silent). Everything else
- *  proceeds to Gemini, where recovery/normal handling happens. */
-export function preGeminiAction(prevLowSignal: number, message: string, serviceNames: string[] = []): PreGeminiAction {
-  if (prevLowSignal < 3) return "proceed_to_gemini";          // not in quiet mode
-  if (looksLikeNoise(message, serviceNames)) return "skip_gemini_gibberish";
-  if (looksLikeGreetingOrMeta(message, serviceNames)) return "cheap_reset_reply";
-  return "proceed_to_gemini";                                 // real-looking message
+// After this many consecutive greetings/meta that already went to Gemini, a further
+// greeting is answered deterministically (no Gemini) — caps a greeting-loop's cost
+// while keeping the FIRST couple of greetings warm/model-generated (Risk C).
+export const GREETING_DETERMINISTIC_AT = 2;
+
+/** Decides — BEFORE any model call — what to do with the incoming message. A clear
+ *  greeting/meta is answered cheaply (no Gemini, never silent) and de-escalates when:
+ *    (B) there's prior low-signal history (prevLowSignal ≥ 1),
+ *    (D) it's the recovery tail of an aggregated burst whose earlier fragments are
+ *        all noise/greeting (e.g. "חבצב\nאת פה?"), or
+ *    (C) it's a repeated-greeting loop (prevGreeting ≥ threshold).
+ *  Obvious gibberish short-circuits only inside quiet mode (prevLowSignal ≥ 3).
+ *  Anything with a real booking/service/FAQ signal ALWAYS proceeds to Gemini, and a
+ *  clean conversation's first greeting (no history, no loop) proceeds too (warm). */
+export function preGeminiAction(
+  prevLowSignal: number, prevGreeting: number, message: string, serviceNames: string[] = []
+): PreGeminiAction {
+  // Never short-circuit anything carrying a real booking/service/FAQ signal.
+  if (hasBookingSignal(message, serviceNames)) return "proceed_to_gemini";
+
+  // Greeting/meta — single message OR the recovery tail of an aggregated burst.
+  const frags = (message ?? "").split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const last = frags.length > 0 ? frags[frags.length - 1] : (message ?? "").trim();
+  if (looksLikeGreetingOrMeta(last, serviceNames)) {
+    const earlierAllNoise = frags.length > 1 &&
+      frags.slice(0, -1).every((f) => looksLikeNoise(f, serviceNames) || looksLikeGreetingOrMeta(f, serviceNames));
+    if (prevLowSignal >= 1 || earlierAllNoise || prevGreeting >= GREETING_DETERMINISTIC_AT) {
+      return "cheap_reset_reply";
+    }
+  }
+
+  // Obvious gibberish only short-circuits once the boundary was set (quiet mode).
+  if (prevLowSignal >= 3 && looksLikeNoise(message, serviceNames)) return "skip_gemini_gibberish";
+  return "proceed_to_gemini";                                 // real-looking / first greeting
 }
 
 /** Escalation tier for N consecutive low-signal turns. */
