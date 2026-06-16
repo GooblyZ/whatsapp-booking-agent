@@ -1569,6 +1569,56 @@ async function main() {
       proceeds === 1 ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 44: false action-refusal fence (platform link-first, BUG-011) ================");
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const rt = await import("../lib/ai/routing");
+    const route = (intent: string, appt: string, msg: string) =>
+      rt.resolveRoute(
+        ({ requestsBusinessAction: true, intent, appointmentIntent: appt }) as unknown as Parameters<typeof rt.resolveRoute>[0],
+        msg,
+      ).route;
+
+    // CANCEL turn: user clearly asks to cancel → system resolves CANCEL → a MANAGE link is
+    // the correct behavior. The model drifts into the legacy "אי אפשר לבטל בצ'אט" refusal.
+    // The fence must neutralize the refusal while the link decision stays UNCHANGED.
+    const cancelRoute = route("cancel_request", "CANCEL", "אני רוצה לבטל את התור שלי");
+    const cancelReply = "מצטערת, אי אפשר לבטל תור דרך הצ'אט.";
+    const cancelFixed = pt.defuseActionRefusal(cancelReply, cancelRoute);
+    console.log("  [pure] cancel-refusal neutralized; final reply has NO refusal; link stays MANAGE:",
+      pt.mentionsActionRefusal(cancelReply) === true &&
+      cancelFixed.defused === true &&
+      pt.mentionsActionRefusal(cancelFixed.text) === false &&   // final customer-facing reply: no refusal
+      rt.linkKindForRoute(cancelRoute) === "manage"             // correct link behavior remains
+        ? "PASS ✓" : `FAIL ✗ (route=${cancelRoute} text="${cancelFixed.text}")`);
+
+    // BOOK turn: "לקבוע" → BOOK → booking link. Model wrongly says "לא ניתן לקבוע פה".
+    const bookRoute = route("booking", "BOOK", "אפשר לקבוע תור?");
+    const bookFixed = pt.defuseActionRefusal("אשמח, אבל לא ניתן לקבוע תור כאן.", bookRoute);
+    console.log("  [pure] book-refusal neutralized; link stays BOOKING:",
+      bookFixed.defused === true && pt.mentionsActionRefusal(bookFixed.text) === false &&
+      rt.linkKindForRoute(bookRoute) === "booking" ? "PASS ✓" : `FAIL ✗ (route=${bookRoute})`);
+
+    // Reschedule refusal is detected too.
+    console.log("  [pure] reschedule-refusal detected:",
+      pt.mentionsActionRefusal("לא ניתן לשנות תור בצ'אט") === true ? "PASS ✓" : "FAIL ✗");
+
+    // FALSE-POSITIVE guards — honest 'no appointment', an offer to help (no negation), and a
+    // genuine NON-operation capability limit ('לראות' excluded) must all be LEFT UNTOUCHED.
+    const honest = [
+      "אין לך תור פעיל כרגע, רוצה שאזמין לך?",
+      "אשמח לעזור לך לבטל את התור דרך הקישור.",
+      "אני לא יכולה לראות את היסטוריית התשלומים שלך.",
+    ];
+    const wronglyFlagged = honest.filter((r) => pt.mentionsActionRefusal(r));
+    console.log("  [pure] honest non-refusals are NOT touched (no false positives):",
+      wronglyFlagged.length === 0 ? "PASS ✓" : `FAIL ✗ [${wronglyFlagged.join(" | ")}]`);
+
+    // A clean reply with no refusal is returned unchanged.
+    console.log("  [pure] a clean reply is returned unchanged:",
+      pt.defuseActionRefusal("בשמחה! הנה הקישור לניהול התור.", "CANCEL").defused === false ? "PASS ✓" : "FAIL ✗");
+  }
+
   console.log("\nDONE.");
 }
 

@@ -19,7 +19,7 @@ import {
   runReceptionistTurn, FALLBACK, classifyInput, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
-import { resolveRoute, linkKindForRoute } from "./routing";
+import { resolveRoute, linkKindForRoute, type Route } from "./routing";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
 import { buildMyAppointmentsLink } from "@/lib/booking/appointment-token";
@@ -340,6 +340,16 @@ export async function runPlatformTurn(
         console.log(`[platform-turn] fence: neutralized in-chat selection question (manage, ${upcoming.length} appts)`);
         replyText = fenced.text;
       }
+      // No false refusal when a MANAGE link is attached (the page does it). Skip the
+      // 0-upcoming case — there the honest "no appointment under this number" reply is
+      // correct (and it routes to a booking link, not a manage one).
+      if (upcoming.length > 0) {
+        const refused = defuseActionRefusal(replyText, route);
+        if (refused.defused) {
+          console.log("[platform-turn] fence: neutralized false action-refusal (manage link attached)");
+          replyText = refused.text;
+        }
+      }
       replyText = appendPlatformLink(replyText, label, url, lastAssistant, messageText);
       logPlatformLink(linkAttached, url);
     } else if (linkKind === "booking") {
@@ -349,6 +359,12 @@ export async function runPlatformTurn(
       if (fenced.defused) {
         console.log("[platform-turn] fence: stripped in-chat scheduling question (booking intent → link-first)");
         replyText = fenced.text;
+      }
+      // No false "I can't book" when a BOOKING link is attached (the page does it).
+      const refused = defuseActionRefusal(replyText, route);
+      if (refused.defused) {
+        console.log("[platform-turn] fence: neutralized false action-refusal (booking link attached)");
+        replyText = refused.text;
       }
       const url = buildBookingLink(ctx.business.slug, customerPhone);
       replyText = appendPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText);
@@ -423,6 +439,25 @@ export async function runPlatformTurn(
     ` link_wording_fence_applied=${linkWordingFenceApplied}` +
     ` src=${decision.replySource} memLines=${memory.turnsUsed}`
   );
+  logTurnTrace({
+    bookingMode: "platform",
+    geminiCalled: decision.geminiCalled,
+    route: platformRoute,
+    routeReason: platformRouteReason,
+    signalKind: kind,
+    linkKind: linkAttached,
+    linkAttached: linkAttached !== null,
+    suppressReply,
+    guardBranch: decision.branch,
+    bookingEvidence,
+    lowSignalBefore: prevLowSignal,
+    lowSignalAfter: newLowSignal,
+    greetingBefore: prevGreeting,
+    greetingAfter: newGreeting,
+    replySource: decision.replySource,
+    memLines: memory.turnsUsed,
+    action: `${suppressReply ? "suppressed" : "reply"}${linkAttached ? `+${linkAttached}` : ""}`,
+  });
 
   return { replyText, decision, linkAttached, suppressReply };
 }
@@ -903,6 +938,40 @@ export function defuseSchedulingQuestion(
   return { text, defused: true };
 }
 
+// ── Deterministic ACTION-REFUSAL fence (platform mode) ─────────────────────────
+// In platform mode the WEBSITE books / reschedules / cancels, so the assistant must
+// never tell the customer it "can't" do those — yet the model occasionally drifts into
+// the legacy "אי אפשר בצ'אט" refusal (a holdover instinct). When we are ALREADY
+// attaching the correct link for an operation, a refusal of that operation is, by
+// construction, false. This fence catches a NEGATION co-occurring with a book/reschedule/
+// cancel INFINITIVE in the SAME sentence and replaces the reply with the route's bridge
+// line (the same deterministic line the route-override path uses). Deliberately NARROW:
+//   • only book/reschedule/cancel verbs (LIST / "לראות" excluded — rarer, riskier);
+//   • requires BOTH a negation AND an operation infinitive in one sentence, so honest
+//     existence statements ("אין לך תור פעיל") and genuine capability limits
+//     ("לא יכולה לראות היסטוריה") never trip it;
+//   • invoked ONLY on turns where a booking/manage link is actually attached.
+const ACTION_REFUSAL_NEG =
+  /אי[\s-]?אפשר|לא\s+ניתן|לא\s+נית|לא\s+יכול(?:ה|ים)?|לא\s+אוכל|אינ(?:י|ני)\s+יכול(?:ה)?|לא\s+מתאפשר|can(?:'|’|`)?t|cannot|unable\s+to/i;
+const ACTION_REFUSAL_OP = /לקבוע|לקבע|לתאם|להזמין|לבטל|לבטול|לשנות|להזיז|לדחות|להקדים|לעדכן/;
+
+/** True when the reply REFUSES to book/reschedule/cancel (a negation + an operation verb
+ *  in one sentence) — a false claim in platform mode, where the website performs these. */
+export function mentionsActionRefusal(reply: string): boolean {
+  return (reply ?? "")
+    .split(/[.!?\n]/)
+    .some((s) => ACTION_REFUSAL_NEG.test(s) && ACTION_REFUSAL_OP.test(s));
+}
+
+/** If the reply refuses the operation, replace it with the route's bridge line so the
+ *  reply can never contradict the link being attached. No-op otherwise — good replies,
+ *  honest "no appointment" lines, and non-operation capability limits are untouched. */
+export function defuseActionRefusal(reply: string, route: Route): { text: string; defused: boolean } {
+  if (!mentionsActionRefusal(reply)) return { text: reply, defused: false };
+  const bridge = route === "BOOK" ? FENCE_BRIDGE_BOOK : FENCE_BRIDGE_MANAGE;
+  return { text: `בטח! ${bridge}`, defused: true };
+}
+
 /**
  * Diagnostics for the attached CTA: logs the link's base ORIGIN + PATH only.
  * Never logs the `?p=<phone>` query (dropped) or the full appointment-id access
@@ -921,6 +990,37 @@ function logPlatformLink(kind: PlatformLink, url: string): void {
   } catch {
     console.log(`[platform-turn] link_attached=${kind} (url parse failed)`);
   }
+}
+
+// ── Structured turn trace (debuggability; behavior-preserving) ─────────────────
+// One machine-parseable line per completed platform turn, COMPLEMENTING the existing
+// human-readable [platform-turn] log (it does not replace it and changes no behavior).
+// PII-safe by construction: only decision metadata — never the message/reply text,
+// never a phone number. Lets an incident be reconstructed from one JSON line instead
+// of grepping prose. (Emitted on the main post-Gemini path; the early-exit paths
+// already carry their own detailed [platform-turn] logs.)
+export interface TurnTrace {
+  bookingMode: "platform";
+  geminiCalled: boolean;
+  route: string;          // resolved route (BOOK/LIST/RESCHEDULE/CANCEL/NONE/-)
+  routeReason: string;    // not_actionable | message_verb | model_intent | -
+  signalKind: string;     // LowSignalKind for the turn
+  linkKind: PlatformLink; // booking | manage | null
+  linkAttached: boolean;
+  suppressReply: boolean;
+  guardBranch: string;    // decision.branch (which brain path produced the reply)
+  bookingEvidence: boolean;
+  lowSignalBefore: number;
+  lowSignalAfter: number;
+  greetingBefore: number;
+  greetingAfter: number;
+  replySource: string;    // gemini | fallback
+  memLines: number;
+  action: string;         // short human summary, e.g. "reply+booking" / "suppressed"
+}
+
+function logTurnTrace(t: TurnTrace): void {
+  console.log(`[turn-trace] ${JSON.stringify(t)}`);
 }
 
 function errorDecision(branch: string, ok = false): ReceptionistDecision {
