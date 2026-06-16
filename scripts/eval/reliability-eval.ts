@@ -199,12 +199,11 @@ function main(): void {
     check("time inside open hours (14:00) is allowed", verifyGrounding("אפשר ב 14:00", idx).ok === true);
     check("time outside open hours (22:00) is rejected", verifyGrounding("נתראה ב 22:00", idx).ok === false);
     check("fact-free warmth is always grounded", verifyGrounding("נשמח לראותך! 🙂", idx).ok === true);
-    // NEW FINDING (this eval surfaced it): the price fence misses the SINGULAR "שקל".
-    const singular = verifyGrounding("המחיר הוא 999 שקל", idx).ok; // currently true = NOT fenced
-    if (singular === true) {
-      gap("price fence misses singular 'שקל'",
-        "PRICE_RE matches ₪ / ש\"ח / שקלי(ם) / shekels / nis but NOT the singular 'שקל' (no yod), the most common Hebrew spelling — so '999 שקל' bypasses the price fence. Small, contained grounding fix (add 'שקל' to the regex). Candidate for Phase 4.");
-    }
+    // Singular "שקל" (no yod) — was a gap this eval surfaced; now fenced in grounding.ts.
+    check("invented price in singular 'שקל' is rejected", verifyGrounding("המחיר הוא 999 שקל", idx).ok === false);
+    check("invented price in plural 'שקלים' is rejected", verifyGrounding("המחיר 999 שקלים", idx).ok === false);
+    check("configured price in singular 'שקל' is allowed", verifyGrounding("תספורת עולה 80 שקל", idx).ok === true);
+    check("configured price in plural 'שקלים' is allowed", verifyGrounding("תספורת עולה 80 שקלים", idx).ok === true);
   }
 
   // ── 11. KNOWN GAPS (documented, not faked) ─────────────────────────────────────

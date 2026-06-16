@@ -27,7 +27,7 @@ export interface GroundingResult {
 }
 
 // Currency amounts: "₪80", "80 ₪", "80 שח", "80 ש\"ח", "80 שקל/שקלים".
-const PRICE_RE = /(?:₪\s*(\d{1,6}))|(?:(\d{1,6})\s*(?:₪|ש"?ח|שקלים?|shekels?|nis))/gi;
+const PRICE_RE = /(?:₪\s*(\d{1,6}))|(?:(\d{1,6})\s*(?:₪|ש"?ח|שקל(?:ים)?|shekels?|nis))/gi;
 // Clock times: "09:00", "9:30".
 const TIME_RE = /\b(\d{1,2}):(\d{2})\b/g;
 // Long digit runs that look like a phone number (>= 9 digits, allowing separators).
