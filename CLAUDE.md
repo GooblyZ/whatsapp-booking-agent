@@ -6,6 +6,27 @@ WhatsApp-first AI receptionist SaaS (Hebrew) for SMB appointment booking.
 **Read first:** `SESSION_HANDOFF.md` (2-min summary) → `CURRENT_STATE.md` (what works /
 what's next) → `PROJECT_CONTEXT.md` (full background) → `REPOSITORY_MAP.md` (where).
 
+## Repository Policy (mandatory)
+`main` is the canonical branch and source of truth for this repository.
+
+Unless the user explicitly approves otherwise:
+- All development work happens on `main`.
+- All commits and pushes target `main`.
+- Do not create, switch to, or work on another branch without approval.
+- Before any **checkout, switch, reset, rebase, merge, cherry-pick, force-push, branch
+  deletion, or history-altering operation**:
+  1. Explain why it is needed.
+  2. List affected branches.
+  3. Obtain explicit user approval.
+
+Backup and archival branches are read-only unless the user explicitly requests recovery work.
+
+Protected archival branches:
+- `backup/main-20260616`
+- `backup/infra-eval-harness-20260616`
+
+If there is uncertainty, stop and ask.
+
 ## Project goals
 A customer texts the business on WhatsApp in messy natural Hebrew; the bot answers,
 helps, and gets appointments booked reliably. Core law:
