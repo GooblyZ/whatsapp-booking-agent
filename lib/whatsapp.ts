@@ -28,6 +28,87 @@ export function classifySendFailure(httpStatus: number | null, errorMessage: str
   return "api";
 }
 
+// ── Interactive (clickable) messages ────────────────────────────────────────────
+// WhatsApp Cloud API interactive message shapes, business-agnostic. Limits enforced by
+// the BUILDER (lib/ai/continuity-menu.ts): reply buttons ≤3 (title ≤20 chars); list ≤10
+// rows total (row title ≤24); cta_url is a single URL button. Each option carries a stable
+// `id` (the payload echoed back when the customer taps) so a tap maps to a deterministic
+// menu action — independent of the visible label and the UI language.
+export type WhatsAppInteractive =
+  | { kind: "buttons"; body: string; buttons: { id: string; title: string }[] }
+  | { kind: "list"; body: string; button: string; rows: { id: string; title: string; description?: string }[] }
+  | { kind: "cta_url"; body: string; buttonText: string; url: string };
+
+/** Translates the business-agnostic interactive shape into the Meta `interactive` payload. */
+function buildInteractivePayload(i: WhatsAppInteractive): Record<string, unknown> {
+  if (i.kind === "buttons") {
+    return {
+      type: "button",
+      body: { text: i.body },
+      action: { buttons: i.buttons.map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
+    };
+  }
+  if (i.kind === "list") {
+    return {
+      type: "list",
+      body: { text: i.body },
+      action: {
+        button: i.button,
+        sections: [{ rows: i.rows.map((r) => ({ id: r.id, title: r.title, ...(r.description ? { description: r.description } : {}) })) }],
+      },
+    };
+  }
+  // cta_url — a single tappable URL button (the "לחץ כאן" booking/manage CTA).
+  return {
+    type: "cta_url",
+    body: { text: i.body },
+    action: { name: "cta_url", parameters: { display_text: i.buttonText, url: i.url } },
+  };
+}
+
+/**
+ * Sends an INTERACTIVE (clickable buttons / list / URL-button) WhatsApp message via the
+ * Meta Graph API. Same auth/error contract as sendWhatsAppTextMessage — never throws. The
+ * CALLER is responsible for a text fallback if this returns success:false (older clients or
+ * an unsupported interactive type still must get a reply).
+ */
+export async function sendWhatsAppInteractiveMessage(to: string, interactive: WhatsAppInteractive): Promise<SendResult> {
+  const accessToken   = process.env.META_ACCESS_TOKEN;
+  const phoneNumberId = process.env.META_PHONE_NUMBER_ID;
+  const apiVersion    = process.env.META_API_VERSION ?? DEFAULT_API_VERSION;
+  if (!accessToken)   return { success: false, error: "META_ACCESS_TOKEN is not set", kind: "config" };
+  if (!phoneNumberId) return { success: false, error: "META_PHONE_NUMBER_ID is not set", kind: "config" };
+
+  const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: "interactive",
+        interactive: buildInteractivePayload(interactive),
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const { message: errMsg, code: errCode } = extractMetaErrorDetail(errBody);
+      const kind = classifySendFailure(res.status, errMsg, errCode);
+      console.error(`[whatsapp] interactive send failed — status: ${res.status} kind: ${kind} error: ${errMsg}`);
+      return { success: false, error: `Meta API error: ${errMsg}`, kind, httpStatus: res.status };
+    }
+    const resBody   = await res.json().catch(() => ({}));
+    const messageId = extractMessageId(resBody);
+    console.log(`[whatsapp] interactive HTTP ${res.status} — wamid: ${messageId ?? "none"} kind=${interactive.kind}`);
+    return { success: true, messageId: messageId ?? undefined };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[whatsapp] interactive network error:", msg);
+    return { success: false, error: `Network error: ${msg}`, kind: "network" };
+  }
+}
+
 /**
  * Sends a plain-text WhatsApp message via the Meta Graph API.
  * Returns a result object — never throws.
@@ -104,6 +185,38 @@ export async function checkWhatsAppAuth(): Promise<{ ok: boolean; error?: string
   } catch (err) {
     return { ok: false, error: `Network error: ${err instanceof Error ? err.message : String(err)}` };
   }
+}
+
+// ── Inbound parsing (text + interactive replies) ────────────────────────────────
+// A WhatsApp inbound message is either plain text OR an interactive reply (the customer
+// TAPPED a button/list row). This pure parser normalizes both into { text, payloadId }:
+//   - text message            → { text: body }
+//   - button_reply / list_reply → { text: <visible title>, payloadId: <stable id> }
+// The title is what we save/show (a natural transcript); the payloadId is the machine token
+// the menu engine resolves. Returns null for unsupported/empty message types (caller skips).
+export interface InboundMessage { text: string; payloadId?: string }
+export function extractInboundMessage(msg: unknown): InboundMessage | null {
+  if (typeof msg !== "object" || msg === null) return null;
+  const m = msg as Record<string, unknown>;
+  const type = typeof m.type === "string" ? m.type : "";
+  if (type === "text") {
+    const body = (m.text as { body?: unknown } | undefined)?.body;
+    return typeof body === "string" && body.trim() ? { text: body } : null;
+  }
+  if (type === "interactive") {
+    const interactive = m.interactive as Record<string, unknown> | undefined;
+    const itype = typeof interactive?.type === "string" ? interactive.type : "";
+    const reply = (itype === "button_reply" ? interactive?.button_reply
+      : itype === "list_reply" ? interactive?.list_reply
+      : undefined) as { id?: unknown; title?: unknown } | undefined;
+    if (!reply) return null;
+    const id = typeof reply.id === "string" ? reply.id : undefined;
+    const title = typeof reply.title === "string" ? reply.title : "";
+    // Prefer the visible title for the transcript; fall back to the id if a title is absent.
+    const text = title.trim() || (id ?? "");
+    return text ? { text, payloadId: id } : null;
+  }
+  return null;
 }
 
 function extractMetaErrorDetail(body: unknown): { message: string; code: number | null } {

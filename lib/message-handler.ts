@@ -23,6 +23,8 @@ export interface IncomingWhatsAppMessage {
   waMessageId: string;
   waTimestamp: string | null; // Unix timestamp string from Meta payload
   rawPayload:  unknown;
+  /** Set when the inbound was a TAP on a clickable menu option — its stable payload id. */
+  interactivePayloadId?: string;
 }
 
 /**
@@ -40,7 +42,9 @@ export async function handleIncomingMessage(msg: IncomingWhatsAppMessage): Promi
   const db = supabaseServer();
   const maskedPhone = maskPhone(msg.fromPhone);
   const textPreview = msg.messageText.slice(0, 40) + (msg.messageText.length > 40 ? "…" : "");
-  console.log(`[message-handler] received — phone=${maskedPhone} text="${textPreview}"`);
+  // Surface the stable payload id on a menu TAP (proves the tap was handled by id, not title text).
+  const payloadPart = msg.interactivePayloadId ? ` payload=${msg.interactivePayloadId}` : "";
+  console.log(`[message-handler] received — phone=${maskedPhone} text="${textPreview}"${payloadPart}`);
 
   // 1+2. Dedup check and customer upsert are independent — run them in PARALLEL
   //       to shave a DB round-trip off the hot path (every real message lands
@@ -149,7 +153,10 @@ export async function handleIncomingMessage(msg: IncomingWhatsAppMessage): Promi
   // 6. Run the conversation/booking flow — handles all logic and outbound replies.
   //    Pass THIS fragment's created_at as the supersede anchor so the flow/turn skips
   //    (before Gemini) when a later fragment exists — serializing a burst to ONE turn.
-  await handleBookingFlow(db, msg.businessId, msg.fromPhone, customer.id, effectiveText, savedMsg.created_at as string);
+  await handleBookingFlow(
+    db, msg.businessId, msg.fromPhone, customer.id, effectiveText, savedMsg.created_at as string,
+    msg.interactivePayloadId
+  );
 }
 
 /**

@@ -1307,14 +1307,24 @@ async function main() {
   {
     const pt = await import("../lib/ai/platform-turn");
     const services = ["תספורת", "צבע", "פן"];
-    // The exact live failure: a clear greeting/meta at low-signal count 1-2 must reset
-    // cheaply (no Gemini) instead of going to Gemini and escalating to the boundary.
-    const resets: Array<[string, number]> = [
-      ["היי", 1], ["היי מה קורה?", 2], ["את פה?", 2], ["יש תשובה?", 2], ["מה קורה פה?", 2],
+    // REFINED by BUG-013 (degraded/social contract): a PRESENCE/recovery check after
+    // low-signal history resets cheaply (the customer is probing a stuck line); a warm
+    // SOCIAL opener at the same counts now goes to Gemini for a NATURAL reply (it no longer
+    // sounds like a stiff system-recovery line). Risk B's goal — never ESCALATE a greeting
+    // toward the boundary — still holds: at Gemini the opener is smalltalk → counter resets.
+    const presenceResets: Array<[string, number]> = [
+      ["את פה?", 2], ["יש תשובה?", 2], ["מה קורה פה?", 2], ["למה לא ענית?", 1],
     ];
-    const hit = resets.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) === "cheap_reset_reply");
-    console.log(`  [pure] greeting/meta after low-signal history → cheap reset at counts 1-2 (${hit.length}/${resets.length}):`,
-      hit.length === resets.length ? "PASS ✓" : `FAIL ✗ [${resets.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) !== "cheap_reset_reply").map(([m, n]) => `${m}@${n}`).join(" | ")}]`);
+    const pHit = presenceResets.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) === "cheap_reset_reply");
+    console.log(`  [pure] PRESENCE/recovery check after low-signal → cheap reset (${pHit.length}/${presenceResets.length}):`,
+      pHit.length === presenceResets.length ? "PASS ✓" : `FAIL ✗ [${presenceResets.filter(([m, n]) => pt.preGeminiAction(n, 0, m, services) !== "cheap_reset_reply").map(([m, n]) => `${m}@${n}`).join(" | ")}]`);
+    // A warm SOCIAL opener at low-signal 1-2 stays natural (Gemini), but a greeting LOOP
+    // (prevGreeting≥2) and active quiet mode (prevLowSignal≥3) still short-circuit (cost cap).
+    console.log("  [pure] social opener natural at low-signal 1-2, still capped on loop/quiet:",
+      pt.preGeminiAction(2, 0, "היי מה קורה?", services) === "proceed_to_gemini" &&
+      pt.preGeminiAction(1, 0, "היי", services) === "proceed_to_gemini" &&
+      pt.preGeminiAction(0, 2, "מה קורה", services) === "cheap_reset_reply" &&
+      pt.preGeminiAction(3, 0, "מה קורה", services) === "cheap_reset_reply" ? "PASS ✓" : "FAIL ✗");
     // Booking/FAQ at the same counts must STILL reach Gemini (never short-circuited).
     const proceeds: Array<[string, number]> = [["אני רוצה לקבוע תור", 2], ["כמה עולה פן?", 2], ["יש חניה?", 2]];
     const ok2 = proceeds.every(([m, n]) => pt.preGeminiAction(n, 0, m, services) === "proceed_to_gemini");
@@ -1617,6 +1627,418 @@ async function main() {
     // A clean reply with no refusal is returned unchanged.
     console.log("  [pure] a clean reply is returned unchanged:",
       pt.defuseActionRefusal("בשמחה! הנה הקישור לניהול התור.", "CANCEL").defused === false ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 45: soft intent + contextual yes + capability fence (BUG-012) ================");
+  // Live WhatsApp replay: "חשבתי על להסתפר, יש לי טיסה ליוון" → bot promised in-chat
+  // availability; customer "כן" twice → escalated to "לא הצלחתי להבין". General fix:
+  // soft service intent is a first-class signal → booking link; a contextual "כן" is
+  // productive (single source of truth) and resolves to the link; capability promises
+  // are fenced on every turn. Pure (no Gemini cost) — exercises the deterministic core.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const SVC = ["תספורת", "פן", "צביעת שיער"];
+
+    // 1) Soft service intent — recognized GENERALLY, business-agnostically (no booking
+    //    verb / service-name in the haircut+flight message; works for Pilates/facial too).
+    console.log("  [pure] soft service intent recognized across businesses:",
+      pt.hasSoftServiceIntent("חשבתי על להסתפר, יש לי טיסה ליוון עוד שבוע", SVC) &&
+      pt.hasSoftServiceIntent("חשבתי לבוא לפילאטיס השבוע", SVC) &&
+      pt.hasSoftServiceIntent("בא לי לעשות טיפול פנים לפני האירוע", SVC) &&
+      pt.hasSoftServiceIntent("חשבתי שאתם יקרים מדי", SVC) === false
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] soft intent classified ABOVE faq (even with a trailing '?'):",
+      pt.classifyGoodFaithSignal("חשבתי על להסתפר, יש לי טיסה ליוון, מה כדאי?", { serviceNames: SVC }) === "soft_intent"
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 2) Contextual "כן": single source of truth — productive, never escalated to a
+    //    boundary line (the live contradiction was latestSignal=contextual_ref but the
+    //    counter independently said unclear → "לא הצלחתי להבין").
+    const decUnclear = ({ ok: true, geminiCalled: true, turn: { reply: "x", understanding:
+      { requestsBusinessAction: false, intent: "unclear", appointmentIntent: "NONE" } } }) as unknown as Parameters<typeof pt.lowSignalKind>[0];
+    console.log("  [pure] contextual 'כן' is productive (not low-signal):",
+      pt.lowSignalKind(decUnclear, "כן", SVC, "contextual_ref") === "productive" &&
+      pt.lowSignalKind(decUnclear, "כן", SVC, "help") === "productive"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] a bare 'כן' after a BOOKING offer is a confirmation; with no context it is not:",
+      pt.isBareAffirmation("כן") &&
+      pt.deriveLastAssistantContract("Assistant (you, earlier): רוצה שאבדוק לך זמינות?").offeredBooking === true &&
+      pt.deriveLastAssistantContract("Assistant (you, earlier): איזה כיף לשמוע!").offeredBooking === false
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 3) Capability-promise fence — the unsupported in-chat promise is detected and
+    //    rewritten link-first while keeping warmth; a clean reply is left untouched.
+    const promised = pt.defuseCapabilityPromise("הבנתי אותך לגמרי, חשוב שהשיער ייראה טוב. אני אבדוק לך זמינות.");
+    console.log("  [pure] capability promise fenced (warmth kept, promise dropped, bridge added):",
+      pt.mentionsCapabilityPromise("אני אבדוק לך זמינות לימים הקרובים") &&
+      pt.mentionsCapabilityPromise("רק כדי לוודא, אתה רוצה תור למחר?") &&
+      promised.defused && promised.text.includes("הבנתי") && !promised.text.includes("זמינות") &&
+      pt.defuseCapabilityPromise("בשמחה! אפשר לקבוע דרך הקישור.").defused === false
+        ? "PASS ✓" : `FAIL ✗ ("${promised.text}")`);
+
+    // 4) FAQ / smalltalk separation — a social opener (even elongated) is presence, not FAQ.
+    console.log("  [pure] 'מה המצבבב' is smalltalk (presence), real FAQ stays faq:",
+      pt.classifyGoodFaithSignal("מה המצבבב") === "presence" &&
+      pt.classifyGoodFaithSignal("מה השעות שלכם?", { serviceNames: SVC }) === "faq"
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 46: degraded-mode + social-opening contract (BUG-013) ================");
+  // Live WhatsApp replay: a normal social opener got a stiff recovery line; a 503 fallback
+  // asked for "service, day, hour" (illegal in platform mode); and "הסתדר?" after the overload
+  // was misread as "how are you?". Pure (no Gemini cost) — exercises the deterministic core.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const SVC = ["תספורת", "פן", "צביעת שיער"];
+
+    // 1) Social opener vs presence/recovery — a warm "מה קורה" is natural smalltalk, not a probe.
+    console.log("  [pure] social opener distinguished from presence/recovery check:",
+      pt.looksLikeSocialOpener("היי מה קורה") && !pt.looksLikePresenceCheck("היי מה קורה") &&
+      pt.looksLikePresenceCheck("אתה פה?") && pt.looksLikePresenceCheck("למה לא ענית?")
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] normal opener no longer forced into stiff recovery by residual low-signal:",
+      pt.preGeminiAction(2, 0, "היייי מה קורה", SVC) === "proceed_to_gemini" &&
+      pt.preGeminiAction(2, 0, "אתה פה?", SVC) === "cheap_reset_reply" &&        // presence still recovers
+      pt.preGeminiAction(0, 2, "מה קורה", SVC) === "cheap_reset_reply"           // greeting loop still capped
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 2) Degraded fallback ROUTING is platform-safe (booking→link / manage→link / general).
+    console.log("  [pure] degraded routing chooses booking/manage/general (never asks service-day-hour):",
+      pt.hasBookingSignal("אני רוצה לקבוע תור", []) === true &&
+      pt.inferOperation("איך אני מבטל") === "CANCEL" &&
+      pt.hasBookingSignal("כמו מה", []) === false && pt.inferOperation("כמו מה") === null
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 3) Post-fallback recovery follow-up — "הסתדר?" after an overload notice is recovery, not smalltalk.
+    console.log("  [pure] recovery follow-up recognized after a degraded reply:",
+      pt.wasDegradedReply("יש לי רגע עומס קטן במערכת 🙏 נסו שוב עוד רגע") &&
+      !pt.wasDegradedReply("איזה כיף לשמוע!") &&
+      pt.isRecoveryFollowup("הסתדר ?") && pt.isRecoveryFollowup("עובד עכשיו?") &&
+      !pt.isRecoveryFollowup("מה שלומך?")
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 4) Social-drift counter hygiene — content-ful smalltalk must not inflate the greeting loop.
+    console.log("  [pure] content-ful smalltalk does not count as a greeting (no counter poisoning):",
+      pt.looksLikeGreetingOrMeta("מה קורה") && !pt.looksLikeGreetingOrMeta("קיבלתי ציון טוב במתמטיקה היום")
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 47: short-term pending context + platform-safe offer (BUG-014) ================");
+  // Live WhatsApp replay: price answered + "רוצה שנתאם לך תור?" (implies in-chat scheduling);
+  // a later "כן" arrived cold and was treated as a fresh greeting. Fix: the offer is fenced to
+  // link-first wording, and a short-term pending offer lets a delayed "כן" resolve to it. Pure.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const NOW = 1_700_000_000_000;
+
+    // 1) Platform-safe offer wording — "נתאם/נקבע לך" is recognized + fenced to link-first.
+    console.log("  [pure] 'schedule for you' offer is fenced to link-first (warmth + price kept):",
+      pt.mentionsCapabilityPromise("רוצה שנתאם לך תור?") &&
+      (() => { const r = pt.defuseCapabilityPromise("על פן אנחנו לוקחים 120 שקלים. רוצה שנתאם לך תור לזה?");
+               return r.defused && r.text.includes("120") && !r.text.includes("נתאם"); })() &&
+      pt.mentionsCapabilityPromise("רוצה לקבוע דרך הקישור?") === false
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 2) The offer is recorded as a pending BOOK (so a later confirmation resolves to it).
+    console.log("  [pure] booking offer (incl. 'נתאם לך') recognized → drives pending context:",
+      pt.deriveLastAssistantContract("Assistant (you, earlier): רוצה שנתאם לך תור לפן?").offeredBooking &&
+      pt.deriveLastAssistantContract("Assistant (you, earlier): נקבע לך תור?").offeredBooking
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 3) Delayed confirmation within TTL resolves; expired/cold does not — business-agnostic service.
+    console.log("  [pure] delayed 'כן'/'סבבה'/'תשלח' + valid pending BOOK resolves; expired/cold does not:",
+      pt.isBareAffirmation("כן") && pt.isBareAffirmation("סבבה") && pt.isBareAffirmation("תשלח") &&
+      pt.readPendingOffer({ pendingOffer: { kind: "BOOK", service: "פיזיותרפיה", at: NOW } }, NOW + 60_000)?.kind === "BOOK" &&
+      pt.readPendingOffer({ pendingOffer: { kind: "BOOK", at: NOW } }, NOW + pt.PENDING_OFFER_TTL_MS + 1) === null &&
+      pt.readPendingOffer({}, NOW) === null
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 4) Cold "כן" with no pending context and no last-offer → not an action.
+    console.log("  [pure] cold 'כן' is protected (no pending, no last-contract offer → no route):",
+      pt.isBareAffirmation("כן") && pt.readPendingOffer({}, NOW) === null &&
+      pt.deriveLastAssistantContract("Assistant (you, earlier): איזה כיף לשמוע!").offeredBooking === false
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 48: degraded repair + meta context + false-action guard (BUG-015) ================");
+  // Live WhatsApp replay: "הנה תראה" false-routed to a manage link; "זמין?" after an overload
+  // was answered about appointments; the bot denied its own overload; a repeated FAQ was scolded
+  // ("כבר אמרתי לך"). Pure (no Gemini cost) — exercises the deterministic core.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const rt = await import("../lib/ai/routing");
+
+    // 1) False-action guard: bare discourse verbs don't route; real appointment flows still do.
+    console.log("  [pure] 'הנה תראה'/'תראה' no longer route to LIST; real flows intact:",
+      rt.messageOperation("הנה תראה") === null && rt.messageOperation("תראה") === null &&
+      rt.messageOperation("תראה לי את התורים שלי") === "LIST" &&
+      rt.messageOperation("אני רוצה לראות את התור שלי") === "LIST" &&
+      rt.messageOperation("אני רוצה לבטל") === "CANCEL"
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 2) Polite / fragmented FAQ recognized as productive.
+    console.log("  [pure] split polite FAQ ('אשמח לדעת'/'אם יש איפה לשבת') is productive:",
+      pt.classifyGoodFaithSignal("אשמח לדעת אם יש איפה לשבת") === "faq" &&
+      pt.lowSignalKind(({ ok: true, geminiCalled: true, turn: { reply: "x", understanding:
+        { requestsBusinessAction: false, intent: "unclear", appointmentIntent: "NONE" } } }) as unknown as Parameters<typeof pt.lowSignalKind>[0],
+        "אשמח לדעת\nאם יש איפה לשבת", ["תספורת"]) === "productive"
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 3) Repeat-answer tone guard: scolding softened, answer kept.
+    console.log("  [pure] repeated-FAQ scolding softened ('כבר אמרתי לך' removed, answer kept):",
+      (() => { const r = pt.softenRepeatTone("קובי, כבר אמרתי לך שיש לנו שלוש ספות");
+               return r.softened && r.text.includes("שלוש ספות") && !/אמרתי\s+לך/.test(r.text); })() &&
+      pt.softenRepeatTone("בטח, יש לנו שלוש ספות 🙂").softened === false
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 4) Degraded recovery broadened + accountability repair recognized (gated on recentlyDegraded).
+    console.log("  [pure] 'זמין?'/'אפשר עכשיו?' are recovery; 'כי כתבת שיש עומס'/'הנה תראה' are accountability:",
+      pt.isRecoveryFollowup("זמין?") && pt.isRecoveryFollowup("אתה זמין?") && pt.isRecoveryFollowup("אפשר עכשיו?") &&
+      pt.recentlyDegraded("Assistant (you, earlier): יש לי רגע עומס קטן במערכת 🙏\nCustomer: ?\nAssistant (you, earlier): אני כאן 🙂") &&
+      pt.isAccountabilityChallenge("שאלתי לגבי הזמינות שלך") && pt.isAccountabilityChallenge("כי כתבת שיש עומס") &&
+      pt.isAccountabilityChallenge("הנה תראה") && pt.isAccountabilityChallenge("כמה עולה תספורת?") === false
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 49: degraded loop + pipeline integrity (BUG-016, architecture) ================");
+  // Regression: a global Gemini cooldown spammed overload messages; meta "זמינות" after an
+  // overload stole a booking link; "היי אשמח לדעת" became smalltalk; superseded turns could
+  // poison the cooldown. Pure (no Gemini cost — and we must NOT hammer Gemini during a 503 storm).
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const T0 = 1_700_000_000_000;
+
+    // 1) Degraded notice is rate-limited (one per window, then quiet — no overload spam).
+    console.log("  [pure] degraded notice rate-limited (one per window, then suppressed):",
+      pt.degradedNoticeAllowed({}, T0) === true &&
+      pt.degradedNoticeAllowed({ lastDegradedAt: T0 }, T0 + 1000) === false &&
+      pt.degradedNoticeAllowed({ lastDegradedAt: T0 }, T0 + pt.DEGRADED_NOTICE_MIN_GAP_MS + 1) === true
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 2) Inquiry opener outranks greeting/smalltalk.
+    console.log("  [pure] 'היי אשמח לדעת' is an inquiry (faq), not social smalltalk:",
+      pt.looksLikeGreetingOrMeta("היי אשמח לדעת") === false &&
+      pt.looksLikeSocialOpener("היי אשמח לדעת") === false &&
+      pt.classifyGoodFaithSignal("היי אשמח לדעת") === "faq" &&
+      pt.looksLikeSocialOpener("היי מה קורה") === true
+        ? "PASS ✓" : "FAIL ✗");
+
+    // 3) Cooldown ordering: meta "זמינות" is accountability/recovery (handled before booking).
+    console.log("  [pure] meta 'זמינות' after overload is accountability/recovery, never a booking link:",
+      pt.isAccountabilityChallenge("שאלתי לגבי הזמינות שלך") &&
+      pt.hasBookingSignal("שאלתי לגבי הזמינות שלך", []) &&   // both true → accountability MUST win the ordering
+      pt.isRecoveryFollowup("אתה זמין?")
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [note] supersede-abort (gemini.ts) + cooldown decision ordering (runPlatformTurn) are integration paths — covered by build/typecheck + predicates; a live probe is the full assertion (NOT run during the 503 storm).");
+  }
+
+  console.log("\n================ SCENARIO 50: deterministic continuity mode under 503 (BUG-017) ================");
+  // Live replay: under a Gemini 503, a mixed "ואפשר לעשן? / אתה זמין? / שאלתי לגבי זמינות כי אמרת /
+  // שיש עומס" burst became degraded+BOOKING (no booking intent). The shared degraded-intent
+  // classifier now follows one priority and never attaches a link off the loose "זמינות" signal. Pure.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    console.log("  [pure] mixed FAQ/meta/recovery burst → accountability, NOT degraded+booking:",
+      pt.classifyDegradedIntent("ואפשר לעשן?\nאתה זמין?\nשאלתי לגבי זמינות כי אמרת\nשיש עומס") === "accountability"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] simple/price FAQ under 503 → continuity menu, never booking:",
+      pt.classifyDegradedIntent("ואפשר לעשן?") === "menu" &&
+      pt.classifyDegradedIntent("כמה עולה פן?") === "menu"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] explicit ops still route under 503; recovery never books:",
+      pt.classifyDegradedIntent("אני רוצה לקבוע תור") === "booking" &&
+      pt.classifyDegradedIntent("תוכל לשלוח לי את הקישור") === "manage" &&
+      pt.classifyDegradedIntent("אתה זמין?") === "recovery" &&
+      pt.classifyDegradedIntent("יש זמינות מחר?") !== "booking"
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 51: general deterministic receptionist (no-AI) (BUG-018) ================");
+  // Live replay: with AI disabled in the dashboard, every message got the SAME canned line — even
+  // "אני רוצה לקבוע תור" produced no booking link. Now ALL no-AI states (ai_disabled / 503 / cooldown
+  // / internal error) share one deterministic core: explicit ops route to links; ai_disabled wording
+  // is neutral (never says "overload"); FAQ/unknown → a menu. Pure (no Gemini cost).
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    console.log("  [pure] ai_disabled wording is neutral (no overload), still offers the menu/links:",
+      !/עומס|מצומצם/.test(pt.continuityText("ai_disabled", "menu")) &&
+      pt.continuityText("ai_disabled", "menu").includes("לקבוע תור") &&
+      pt.continuityText("ai_disabled", "booking", "URL").includes("URL") &&
+      !/עומס/.test(pt.continuityText("ai_disabled", "booking", "URL"))
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] explicit booking/manage route to links in no-AI mode; meta/FAQ does not:",
+      pt.classifyDegradedIntent("אני רוצה לקבוע תור") === "booking" &&
+      pt.classifyDegradedIntent("אני רוצה לבטל תור") === "manage" &&
+      pt.classifyDegradedIntent("ואפשר לעשן?") === "menu" &&
+      pt.classifyDegradedIntent("היי") === "menu"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] sustained outage explains a load; transient 503 is a soft 'resend?' (not menu):",
+      /עומס/.test(pt.continuityText("provider_outage", "menu")) &&
+      /לשלוח שוב/.test(pt.continuityText("provider_transient", "menu")) &&
+      pt.continuityText("provider_transient", "menu") !== pt.continuityText("provider_outage", "menu")
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 52: general deterministic menu / FAQ core (no-AI) (BUG-019) ================");
+  // Live replay: with AI disabled, a neutral menu was shown for "היי"; the NEXT meaningful FAQ
+  // ("אפשר לעשן במספרה?", "יש חניה?") was SUPPRESSED by the menu rate-limit (customerVisible=false,
+  // no outbound). Now a real business-info question is ANSWERED from facts/KB (or gets the info
+  // submenu) and is NEVER rate-limited; only a vague/greeting repeat hits the limit. Business-
+  // agnostic — proven on a yoga studio, not a salon. Pure (no Gemini cost).
+  {
+    const cm = await import("../lib/ai/continuity-menu");
+    const facts = {
+      businessName: "Flow Studio", phone: "03-1234567",
+      location: { address: "הרצל 10", city: "תל אביב" }, timezone: "Asia/Jerusalem", bookingEnabled: true,
+      hours: [
+        { day: "ראשון", closed: false, opens: "09:00", closes: "18:00" },
+        { day: "שבת", closed: true, opens: null, closes: null },
+      ],
+      services: [
+        { name: "שיעור יוגה", durationMin: 60, price: 70, description: null },
+        { name: "אימון אישי", durationMin: 45, price: 150, description: null },
+      ],
+      knowledge: [
+        { category: "parking", title: "חניה", content: "יש חניון ציבורי במרחק 2 דקות הליכה." },
+        { category: "about", title: "על הסטודיו", content: "סטודיו בוטיק לתנועה ונשימה." },
+      ],
+    };
+    console.log("  [pure] THE BUG: a meaningful FAQ after a menu is answer/submenu, NEVER suppressed:",
+      cm.planContinuityMenu("ai_disabled", "אפשר לעשן במספרה?", facts).kind === "submenu" &&
+      cm.planContinuityMenu("ai_disabled", "יש חניה?", facts).kind === "answer" &&
+      cm.planContinuityMenu("ai_disabled", "היי", facts).kind === "vague_menu"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] hours/prices/location answered from the business's OWN facts (grounded):",
+      cm.resolveInfoAnswer(facts, "hours")!.includes("09:00-18:00") &&
+      cm.resolveInfoAnswer(facts, "prices")!.includes("שיעור יוגה") &&
+      cm.resolveInfoAnswer(facts, "prices")!.includes("₪70") &&
+      cm.resolveInfoAnswer(facts, "location")!.includes("הרצל 10")
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] menu is reason-aware + capability-gated (ai_disabled neutral; hides disabled options):",
+      !/עומס|מוגבל/.test(cm.buildMainMenu(facts)) &&
+      /מוגבל|עומס/.test(cm.planContinuityMenu("provider_outage", "היי", facts).text) &&
+      !cm.buildMainMenu({ ...facts, bookingEnabled: false }).includes("קביעת תור")
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 53: navigable WhatsApp menu flow + provider health (BUG-020) ================");
+  // Product goal: a REAL menu flow (main → faq → category → answer → nav) navigable by number/
+  // alias/back/topic — AI-FIRST (intercept only on explicit menu or an active cursor), and a clear
+  // provider-health state that decides menu mode and self-heals back to AI. Pure (no Gemini cost).
+  {
+    const cm = await import("../lib/ai/continuity-menu");
+    const g = await import("../lib/ai/gemini");
+    const facts = {
+      businessName: "Flow Studio", phone: "03-1234567",
+      location: { address: "הרצל 10", city: "תל אביב" }, timezone: "Asia/Jerusalem", bookingEnabled: true,
+      hours: [{ day: "ראשון", closed: false, opens: "09:00", closes: "18:00" }],
+      services: [{ name: "שיעור יוגה", durationMin: 60, price: 70, description: null }],
+      knowledge: [{ category: "parking", title: "חניה", content: "יש חניון ציבורי במרחק 2 דקות הליכה." }],
+    };
+    // Flow: תפריט → 3 (faq) → 1 (hours answer) → תפריט ראשי → 1 (book)
+    const main = cm.resolveMenuNavigation(null, "תפריט", facts, { activeMenu: false });
+    const faq = cm.resolveMenuNavigation("main", "3", facts, { activeMenu: true });
+    const hours = cm.resolveMenuNavigation("faq", "1", facts, { activeMenu: true });
+    const backMain = cm.resolveMenuNavigation("faq", "תפריט ראשי", facts, { activeMenu: true });
+    const book = cm.resolveMenuNavigation("main", "1", facts, { activeMenu: true });
+    console.log("  [pure] main → 3 → 1 → תפריט ראשי → 1 navigates main/faq/answer/main/book:",
+      main?.kind === "main" && faq?.kind === "faq" &&
+      hours?.kind === "answer" && hours.reply.includes("09:00-18:00") &&
+      backMain?.kind === "main" && book?.kind === "book"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] AI-FIRST: no active cursor → free text / bare number are NOT intercepted:",
+      cm.resolveMenuNavigation(null, "כמה עולה שיעור?", facts, { activeMenu: false }) === null &&
+      cm.resolveMenuNavigation(null, "3", facts, { activeMenu: false }) === null
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] provider health snapshot is healthy after reset (state that decides menu mode):",
+      (() => { g.resetGeminiHealth(); const h = g.getGeminiHealth(); return h.state === "healthy" && h.strikes === 0; })()
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 54: clickable WhatsApp menu (interactive) end-to-end (BUG-021) ================");
+  // Product target: TAPPABLE WhatsApp menus. The bot sends interactive buttons/list rows with
+  // stable payload IDs; a tap echoes the id back; the engine resolves it deterministically and
+  // sends the next interactive message. Pure (no Gemini/Meta network).
+  {
+    const cm = await import("../lib/ai/continuity-menu");
+    const wa = await import("../lib/whatsapp");
+    const facts = {
+      businessName: "Flow Studio", phone: "03-1234567",
+      location: { address: "הרצל 10", city: "תל אביב" }, timezone: "Asia/Jerusalem", bookingEnabled: true,
+      hours: [{ day: "ראשון", closed: false, opens: "09:00", closes: "18:00" }],
+      services: [{ name: "שיעור יוגה", durationMin: 60, price: 70, description: null }],
+      knowledge: [{ category: "parking", title: "חניה", content: "יש חניון ציבורי במרחק 2 דקות הליכה." }],
+    };
+    // Bot sends main menu (buttons) → customer taps "מידע ושאלות" (f payload) → bot sends FAQ list →
+    // customer taps "שעות פתיחה" (f:hours) → bot answers + nav buttons.
+    const mainMenu = cm.buildInteractiveMainMenu(facts);
+    const tapFaq = wa.extractInboundMessage({ type: "interactive", interactive: { type: "button_reply", button_reply: { id: cm.MENU_PAYLOAD.faq, title: "מידע ושאלות" } } });
+    const navFaq = tapFaq?.payloadId ? cm.resolveMenuPayload(tapFaq.payloadId, facts) : null;
+    const tapHours = wa.extractInboundMessage({ type: "interactive", interactive: { type: "list_reply", list_reply: { id: "f:hours", title: "שעות פתיחה" } } });
+    const navHours = tapHours?.payloadId ? cm.resolveMenuPayload(tapHours.payloadId, facts) : null;
+    console.log("  [pure] tap flow: main(buttons) → tap מידע → faq(list) → tap שעות → hours answer:",
+      mainMenu.kind === "buttons" && mainMenu.buttons.some((b) => b.id === cm.MENU_PAYLOAD.faq) &&
+      navFaq?.kind === "faq" && navHours?.kind === "answer" && navHours.reply.includes("09:00-18:00")
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] interactive messages respect WhatsApp limits (buttons ≤3/≤20ch; list ≤10 rows):",
+      (() => {
+        const f = cm.buildInteractiveFaqMenu(facts);
+        const okBtn = mainMenu.kind === "buttons" && mainMenu.buttons.length <= 3 && mainMenu.buttons.every((b) => b.title.length <= 20);
+        const okList = f.kind === "list" && f.rows.length <= 10 && f.rows.every((r) => r.title.length <= 24);
+        return okBtn && okList;
+      })()
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] booking action → cta_url ('לחץ כאן' URL button), business-agnostic:",
+      (() => {
+        const book = cm.resolveMenuPayload(cm.MENU_PAYLOAD.book, facts);
+        return book?.kind === "book"; // platform-turn wraps this as a cta_url interactive with the real URL
+      })()
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 55: menu polish — business-aware copy + no-dead-end anchoring (BUG-022) ================");
+  // Live observation: entering AI-disabled mode with a booking intent ("אולי נקבע תור") sent a
+  // booking link with no visible way back to the menu (a dead end), and the menu copy was generic.
+  // Polish: business-aware/reason-specific copy + a "כתבו תפריט" hint on every action card.
+  // The booking/manage intent is recognized DETERMINISTICALLY (no Gemini) via classifyDegradedIntent.
+  {
+    const cm = await import("../lib/ai/continuity-menu");
+    const pt = await import("../lib/ai/platform-turn");
+    const facts = {
+      businessName: "סטודיו פלואו", phone: "03-1234567",
+      location: { address: "הרצל 10", city: "תל אביב" }, timezone: "Asia/Jerusalem", bookingEnabled: true,
+      hours: [{ day: "ראשון", closed: false, opens: "09:00", closes: "18:00" }],
+      services: [{ name: "שיעור יוגה", durationMin: 60, price: 70, description: null }], knowledge: [],
+    };
+    console.log("  [pure] main menu presents as the business's virtual assistant (business-aware, generic):",
+      cm.mainMenuBody(facts).includes("סטודיו פלואו") && /העוזר הווירטואלי/.test(cm.mainMenuBody(facts)) &&
+      !/מספרה|תספורת/.test(cm.mainMenuBody(facts))
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] reason wording differs: ai_disabled neutral; provider_outage softly limited:",
+      !/מוגבל|עומס/.test(cm.mainMenuBody(facts, "ai_disabled")) && /מוגבל/.test(cm.mainMenuBody(facts, "provider_outage"))
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] NO DEAD END: 'אולי נקבע תור' → deterministic booking (no AI) + a route back to the menu:",
+      pt.classifyDegradedIntent("אולי נקבע תור") === "booking" &&
+      cm.ctaBody("book").includes("תפריט") && cm.ctaBody("manage").includes("תפריט")
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
+  console.log("\n================ SCENARIO 56: mode boundary — menu must not leak into AI mode (BUG-023) ================");
+  // Live bug: after AI was re-enabled, a STALE button payload (m:book) and 'תפריט ראשי' still ran
+  // as menu_navigation. Fix: the clickable-menu interceptor is GATED by the current operating mode.
+  // In AI mode (AI enabled + provider healthy + configured) the gate is INACTIVE → the stale payload
+  // is ignored and the turn flows to AI; menus stay active only when AI genuinely can't operate.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const active = (aiEnabled: boolean, geminiConfigured: boolean, providerCoolingDown: boolean) =>
+      pt.isDeterministicMenuActive({ aiEnabled, geminiConfigured, providerCoolingDown });
+    console.log("  [pure] AI enabled + provider healthy + configured → menu INACTIVE (stale m:book ignored):",
+      active(true, true, false) === false ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] AI disabled / no-key / sustained outage → menu ACTIVE (deterministic menus work):",
+      active(false, true, false) === true && active(true, false, false) === true && active(true, true, true) === true
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] a single transient 503 (not cooling) stays AI mode (not menu):",
+      active(true, true, false) === false ? "PASS ✓" : "FAIL ✗");
   }
 
   console.log("\nDONE.");

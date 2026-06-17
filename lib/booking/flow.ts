@@ -8,7 +8,7 @@ import {
   isBookingEnabled,
 } from "./helpers";
 import { getAvailableSlots, isIntervalFree, parseHebrewDate, businessTimeToUTC, todayInTZ } from "./availability";
-import { sendOutbound } from "./outbound";
+import { sendOutbound, sendOutboundInteractive } from "./outbound";
 import { runConversationTurn } from "@/lib/ai/idle-handler";
 import { runPlatformTurn } from "@/lib/ai/platform-turn";
 import { loadBookingSession } from "@/lib/ai/booking-session";
@@ -76,7 +76,8 @@ async function reply(
  */
 export async function handleBookingFlow(
   db: DB, businessId: string, fromPhone: string, customerId: string, messageText: string,
-  triggerCreatedAt: string | null = null
+  triggerCreatedAt: string | null = null,
+  interactivePayloadId?: string
 ): Promise<void> {
   const { state: rawState, context: rawContext, expiresAt } = await getConversationState(db, businessId, customerId);
   const timezone = await getBusinessTimezone(db, businessId);
@@ -107,7 +108,8 @@ export async function handleBookingFlow(
     // counters if a newer inbound already arrived (Risk E — no over-count drift).
     const outcome = await runPlatformTurn(
       db, businessId, customerId, fromPhone, messageText, state, context,
-      () => hasNewerInbound(db, businessId, customerId, turnAnchor)
+      () => hasNewerInbound(db, businessId, customerId, turnAnchor),
+      interactivePayloadId
     );
     if (await hasNewerInbound(db, businessId, customerId, turnAnchor)) {
       console.log(`[router] superseded by newer inbound message — reply skipped`);
@@ -119,7 +121,13 @@ export async function handleBookingFlow(
       console.log(`[router] platform reply suppressed (quiet mode) — no outbound sent`);
       return;
     }
-    await replyFn(outcome.replyText);
+    // A menu turn ships a CLICKABLE interactive message (with a guaranteed text fallback);
+    // everything else sends plain text.
+    if (outcome.interactive) {
+      await sendOutboundInteractive(db, businessId, customerId, fromPhone, outcome.interactive, outcome.replyText);
+    } else {
+      await replyFn(outcome.replyText);
+    }
     return;
   }
 

@@ -52,6 +52,10 @@ const RESCHEDULE_RE = reFrom(RESCHEDULE_VERBS);
 // Multi-word phrases the single-token matcher can't express.
 const LIST_PHRASE_RE = /כל\s+ה?תורים|ה?תורים\s+שלי|מה\s+ה?תורים|אילו\s+ה?תורים|איזה\s+ה?תורים|ה?תורים\s+הקיימים/;
 const RESCHEDULE_PHRASE_RE = /מחדש|מחודש/;
+// An appointment REFERENCE — required to read a GENERIC view-verb ("תראה"/"לראות") as a LIST
+// request. Without it, bare "תראה"/"הנה תראה" is discourse ("look here"), not "show my
+// appointments" (the live false-route). The explicit LIST_PHRASE_RE stands on its own.
+const APPT_REF_RE = /תור|פגיש|הזמנ|מועד/;
 
 /**
  * Classifies the OPERATION from the user's own words, or null if no operation verb is
@@ -63,7 +67,10 @@ export function messageOperation(message: string): Route | null {
   if (!t) return null;
   if (RESCHEDULE_RE.test(t) || RESCHEDULE_PHRASE_RE.test(t)) return "RESCHEDULE";
   if (CANCEL_RE.test(t)) return "CANCEL";
-  if (LIST_RE.test(t) || LIST_PHRASE_RE.test(t)) return "LIST";
+  // LIST is the most over-triggered op: a generic view-verb counts only WITH an appointment
+  // reference ("תראה לי את התור"); the explicit phrase ("התורים שלי") stands alone. Bare
+  // "תראה"/"הנה תראה" (discourse "look here") no longer false-routes to a manage link.
+  if (LIST_PHRASE_RE.test(t) || (LIST_RE.test(t) && APPT_REF_RE.test(t))) return "LIST";
   if (CREATE_RE.test(t)) return "BOOK";
   return null;
 }

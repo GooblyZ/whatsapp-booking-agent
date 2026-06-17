@@ -52,6 +52,28 @@ export function geminiCooldownRemainingMs(): number {
   return Math.max(0, cooldownUntil - Date.now());
 }
 
+// ── Provider-health SNAPSHOT (explainable + testable) ────────────────────────────
+// One typed view of the process-global breaker, so callers/observability read a single
+// state instead of poking at isGeminiCoolingDown() in scattered places:
+//   healthy   — no recent overload; the AI path is fully trusted.
+//   transient — ≥1 overload strike but below the cooldown threshold: a brief/ FLAKY blip.
+//               The engine keeps the AI experience (soft recovery), NOT deterministic menu.
+//   outage    — cooldown active: a SUSTAINED outage → serve deterministically (menu mode).
+// AI-disabled / config / parse errors are NOT provider health — they're decision branches
+// handled upstream; this snapshot is only about the live provider.
+export type GeminiHealthState = "healthy" | "transient" | "outage";
+export interface GeminiHealth {
+  state: GeminiHealthState;
+  strikes: number;
+  cooldownRemainingMs: number;
+}
+export function getGeminiHealth(): GeminiHealth {
+  const cooldownRemainingMs = geminiCooldownRemainingMs();
+  const state: GeminiHealthState =
+    cooldownRemainingMs > 0 ? "outage" : overloadStrikes > 0 ? "transient" : "healthy";
+  return { state, strikes: overloadStrikes, cooldownRemainingMs };
+}
+
 /** Test/ops hook: clears overload strikes and any active cooldown. */
 export function resetGeminiHealth(): void {
   overloadStrikes = 0;
@@ -62,16 +84,31 @@ function noteOverload(model: string): void {
   overloadStrikes++;
   if (overloadStrikes >= OVERLOAD_STRIKES) {
     cooldownUntil = Date.now() + cooldownMs();
+    // healthy/transient → OUTAGE: a sustained provider problem. The engine now serves
+    // deterministic menu mode until a recovery probe succeeds (see RECOVERY PROBE below).
     console.warn(
-      `[gemini] DEGRADED — model=${model} overloaded (strike ${overloadStrikes});` +
-      ` cooldown ${Math.round(cooldownMs() / 1000)}s — engine serves deterministically`
+      `[gemini] OUTAGE — model=${model} overloaded (strike ${overloadStrikes});` +
+      ` cooldown ${Math.round(cooldownMs() / 1000)}s — engine serves deterministically until recovery`
+    );
+  } else {
+    // healthy → FLAKY/transient: ONE blip. Stay AI-first (soft recovery / resend), do NOT
+    // drop into deterministic menu mode over a single 503.
+    console.warn(
+      `[gemini] FLAKY — model=${model} transient overload (strike ${overloadStrikes}/${OVERLOAD_STRIKES});` +
+      ` staying AI-first (soft recovery)`
     );
   }
 }
 
 function noteSuccess(): void {
-  if (cooldownUntil > 0 || overloadStrikes >= OVERLOAD_STRIKES) {
-    console.log("[gemini] RECOVERED — overload state cleared, normal AI behavior resumed");
+  // A live call SUCCEEDED. If we were degraded (transient or full outage), this is the
+  // RECOVERY transition → clear the breaker and resume normal AI-first behavior. Logged so
+  // the healthy → degraded → recovered lifecycle is reconstructable from logs.
+  if (cooldownUntil > 0 || overloadStrikes > 0) {
+    console.log(
+      `[gemini] RECOVERED — provider healthy again (was ${cooldownUntil > 0 ? "outage" : "transient"});` +
+      ` overload state cleared, AI-first resumed`
+    );
   }
   overloadStrikes = 0;
   cooldownUntil = 0;
@@ -144,9 +181,20 @@ export async function geminiGenerateJSON(
  * current customer message as the final "user" turn. Forces JSON output.
  * Never throws. Never logs the API key.
  */
+/** Optional per-call hooks. `abortIfSuperseded` lets the CALLER cancel an obsolete turn on a
+ *  503: a superseded turn must not retry and must NOT count toward the (process-global) overload
+ *  cooldown — otherwise stale/aggregated burst work amplifies a provider incident. */
+export interface GeminiCallOptions {
+  abortIfSuperseded?: () => Promise<boolean>;
+  /** Caller's supersede signal (per-conversation single-flight). When it fires, the in-flight
+   *  request is CANCELLED and returns a benign error — never a 503/overload strike. */
+  signal?: AbortSignal;
+}
+
 export async function geminiGenerateConversation(
   systemInstruction: string,
-  turns: GeminiTurn[]
+  turns: GeminiTurn[],
+  opts: GeminiCallOptions = {}
 ): Promise<GeminiResult> {
   const contents = turns
     .filter((t) => t.text.trim().length > 0)
@@ -154,7 +202,7 @@ export async function geminiGenerateConversation(
   if (contents.length === 0) {
     return { ok: false, code: "empty", error: "No conversation turns provided" };
   }
-  return callGemini(systemInstruction, contents);
+  return callGemini(systemInstruction, contents, opts);
 }
 
 // ── Core call ─────────────────────────────────────────────────────────────────
@@ -164,7 +212,9 @@ interface GeminiContent {
   parts: { text: string }[];
 }
 
-async function callGemini(systemInstruction: string, contents: GeminiContent[]): Promise<GeminiResult> {
+async function callGemini(
+  systemInstruction: string, contents: GeminiContent[], opts: GeminiCallOptions = {}
+): Promise<GeminiResult> {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     return { ok: false, code: "not_configured", error: "GEMINI_API_KEY is not set" };
@@ -204,10 +254,29 @@ async function callGemini(systemInstruction: string, contents: GeminiContent[]):
     return { ok: false, code: "overloaded", error: "Simulated 503 (high demand)" };
   }
 
+  // HALF-OPEN recovery probe: if we're still carrying overload strikes (the cooldown just
+  // expired, or we're in the transient/flaky window) this live call is the probe that decides
+  // whether AI is restored (noteSuccess) or we stay degraded (noteOverload). Logged so the
+  // recovery attempt is explicit, not implicit.
+  if (overloadStrikes > 0) {
+    console.log(
+      `[gemini] RECOVERY PROBE — live call after degraded state (strikes=${overloadStrikes},` +
+      ` cooldown ${isGeminiCoolingDown() ? "active" : "expired"})`
+    );
+  }
+
   // One quick in-call retry on overload — most 503s are per-request transients.
   for (let attempt = 1; attempt <= 2; attempt++) {
+  // Superseded before this attempt (e.g. during the retry backoff) → stop, benignly.
+  if (opts.signal?.aborted) {
+    return { ok: false, code: "network", error: "Gemini request superseded (newer turn)" };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  // Link the caller's supersede signal: a newer turn for the same conversation cancels this
+  // in-flight request (no completion, no retry, no overload strike).
+  const onSupersede = () => controller.abort();
+  if (opts.signal) opts.signal.addEventListener("abort", onSupersede, { once: true });
 
   try {
     const res = await fetch(url, {
@@ -225,6 +294,13 @@ async function callGemini(systemInstruction: string, contents: GeminiContent[]):
         `${overloaded ? " (overloaded)" : ""} msg=${safeMsg}`
       );
       if (overloaded) {
+        // A turn the caller has already SUPERSEDED (a newer inbound arrived) must not retry and
+        // must not count toward the global cooldown — otherwise obsolete/aggregated burst work
+        // amplifies the incident. Checked only on the (rare) failure path.
+        if (opts.abortIfSuperseded && (await opts.abortIfSuperseded())) {
+          console.warn(`[gemini] overloaded turn is SUPERSEDED — aborting (no retry, no cooldown strike)`);
+          return { ok: false, code: "overloaded", error: "superseded during overload" };
+        }
         if (attempt === 1) {
           await sleep(RETRY_DELAY_MS);
           continue;
@@ -270,12 +346,18 @@ async function callGemini(systemInstruction: string, contents: GeminiContent[]):
 
     return { ok: true, text, usage };
   } catch (err) {
+    // A caller-supersede abort is NOT a provider failure — return benign, no retry, no strike.
+    if (opts.signal?.aborted) {
+      console.warn(`[gemini] request superseded by a newer turn — cancelled (no retry, no cooldown strike)`);
+      return { ok: false, code: "network", error: "Gemini request superseded (newer turn)" };
+    }
     const msg = redact(err instanceof Error ? err.message : String(err));
     const aborted = err instanceof Error && err.name === "AbortError";
     console.error(`[gemini] request failed${aborted ? " (timeout)" : ""}: ${msg}`);
     return { ok: false, code: "network", error: aborted ? "Gemini request timed out" : "Gemini request failed" };
   } finally {
     clearTimeout(timer);
+    if (opts.signal) opts.signal.removeEventListener("abort", onSupersede);
   }
   }
   // Unreachable (the loop always returns) — satisfies the compiler.

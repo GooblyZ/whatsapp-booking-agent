@@ -90,6 +90,12 @@ export interface TurnInput {
   /** The customer's own phone — exempt from the business-phone grounding fence
    *  (it identifies the customer; it is not a business-contact claim). */
   customerPhone?: string;
+  /** Caller's supersede check. On a Gemini 503 it lets an obsolete (superseded) turn abort
+   *  instead of retrying / tripping the global overload cooldown. */
+  abortIfSuperseded?: () => Promise<boolean>;
+  /** Per-conversation single-flight signal. When a newer turn supersedes this one, the in-flight
+   *  Gemini request is cancelled (no completion, no retry, no overload strike). */
+  abortSignal?: AbortSignal;
 }
 
 export interface ReceptionistDecision {
@@ -252,7 +258,10 @@ export async function runReceptionistTurn(
     );
   }
 
-  const res = await geminiGenerateConversation(instruction, turns);
+  const res = await geminiGenerateConversation(instruction, turns, {
+    abortIfSuperseded: input.abortIfSuperseded,
+    signal: input.abortSignal,
+  });
   if (!res.ok) {
     if (res.code === "not_configured") {
       return fallback(FALLBACK.error, "not_configured", "not_configured", { skipReason: "not_configured", fallbackReason: "not_configured" });

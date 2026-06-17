@@ -14,16 +14,23 @@ import { getBusinessAIContext } from "./context";
 import {
   getConversationContext, renderUpcomingAppointments, renderCustomerState, didLastReplyFailToSend,
 } from "./conversation";
-import { isGeminiCoolingDown, geminiCooldownRemainingMs } from "./gemini";
+import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured } from "./gemini";
 import {
   runReceptionistTurn, FALLBACK, classifyInput, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
-import { resolveRoute, linkKindForRoute, type Route } from "./routing";
+import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
 import { buildMyAppointmentsLink } from "@/lib/booking/appointment-token";
 import { listUpcomingByCustomer } from "@/lib/booking/appointments";
+import { beginTurn, isCurrentTurn } from "./turn-registry";
+import { buildFacts, type BusinessFacts } from "./facts";
+import {
+  planContinuityMenu, resolveMenuNavigation, resolveMenuPayload, readMenuState,
+  buildInteractiveForNav, ctaBody, type MenuState, type MenuNav,
+} from "./continuity-menu";
+import type { WhatsAppInteractive } from "@/lib/whatsapp";
 
 export type PlatformLink = "booking" | "manage" | null;
 
@@ -34,6 +41,27 @@ export interface PlatformTurnOutcome {
   /** Quiet mode: the router should NOT send a WhatsApp reply this turn (inbound is
    *  already saved; state is persisted). Used to stop replying to endless nonsense. */
   suppressReply?: boolean;
+  /** CLICKABLE menu message for this turn (deterministic menu mode / navigation). When set,
+   *  the router sends it as an interactive WhatsApp message; `replyText` is the text fallback. */
+  interactive?: WhatsAppInteractive;
+}
+
+// ── OPERATING-MODE GATE — is the deterministic clickable menu authoritative this turn? ──────
+// Two modes: AI mode (Gemini owns the conversation) and deterministic menu mode. The menu is
+// authoritative ONLY when AI genuinely cannot operate:
+//   • the owner DISABLED AI, or
+//   • no API key is configured (AI can't run), or
+//   • the provider is in a SUSTAINED outage (cooldown active).
+// A single transient 503 is NOT here (it's handled as soft AI recovery downstream, not menu mode).
+// Pure + decided from CURRENT-turn signals, so re-enabling AI or a provider recovery flips it on the
+// next turn — a stale menu cursor / old button payload is therefore never trusted in AI mode.
+export function isDeterministicMenuActive(opts: {
+  aiEnabled: boolean; geminiConfigured: boolean; providerCoolingDown: boolean;
+}): boolean {
+  if (!opts.aiEnabled) return true;          // owner disabled AI
+  if (!opts.geminiConfigured) return true;   // no API key → AI cannot operate
+  if (opts.providerCoolingDown) return true; // sustained provider outage
+  return false;                              // AI enabled + provider healthy → AI mode (menu inactive)
 }
 
 // WhatsApp renders *…* as bold and auto-links a bare URL on its own line. A bold
@@ -43,6 +71,86 @@ export interface PlatformTurnOutcome {
 const BOOK_LINE = "*לקביעת תור — מהיר ופשוט:*";
 const MANAGE_LINE = "*לניהול התור (צפייה · שינוי · ביטול):*";
 const MY_APPTS_LINE = "*כל התורים שלך — לבחירה וניהול:*";
+
+// ── Degraded-mode (Gemini overload/error) — PLATFORM-SAFE lines ─────────────────
+// The fallback is part of the product surface: even when the model is down it must obey
+// platform architecture — NEVER ask for service/day/time in chat, never promise to "check
+// availability". For booking/manage intent it routes to the link; otherwise it stays a
+// short, useful, safe acknowledgement.
+const DEGRADED_NOTICE = "יש לי רגע עומס קטן במערכת 🙏";
+// Brain branches that mean "no usable AI answer" → route through the deterministic continuity
+// core. Deliberate guard replies (abuse/noise) and grounding deflections are intentionally NOT here.
+const CONTINUITY_BRANCHES = new Set(["ai_disabled", "not_configured", "api_overloaded", "api_error", "parse_error"]);
+
+// ── DETERMINISTIC RECEPTIONIST — reason-specific wording ─────────────────────────
+// The SAME deterministic core (classifyDegradedIntent + booking/manage links) serves every
+// no-AI state; only the WORDING differs by reason. ai_disabled is the owner's deliberate choice
+// → neutral, never mentions "overload"/limited AI. Provider states explain a momentary limit.
+// Provider health is graded, not binary: a SINGLE transient 503 must NOT dump the customer into
+// full deterministic menu mode (that would destroy the AI experience over one blip). Only a
+// SUSTAINED outage (cooldown active) or an owner-disabled/internal-error state does that.
+export type DegradedReason = "ai_disabled" | "provider_transient" | "provider_outage" | "ai_error";
+const CONTINUITY_MENU_BODY =
+  "אפשר לקבוע תור, לנהל תור קיים (שינוי או ביטול), או לשאול על שעות, מחירים, כתובת וחניה.";
+/** The customer-facing line for a deterministic-continuity turn, by reason + resolved kind. */
+export function continuityText(reason: DegradedReason, kind: "booking" | "manage" | "menu", url?: string): string {
+  if (reason === "ai_disabled") {
+    if (kind === "booking") return `בשמחה! לקביעת תור:\n${url}`;
+    if (kind === "manage") return `לניהול התור — צפייה, שינוי או ביטול:\n${url}`;
+    return `אני כאן 🙂 ${CONTINUITY_MENU_BODY} מה נוח לך?`;
+  }
+  if (reason === "provider_transient") {
+    // ONE brief glitch — keep the AI experience alive: acknowledge + invite a resend (so the need
+    // is preserved, NOT pretended-answered) rather than dropping into the full FAQ menu. An explicit
+    // booking/manage op still routes to its link (no point asking the customer to resend that).
+    if (kind === "booking") return `הייתה לי תקלה רגעית 🙏 לקביעת תור אפשר ישירות בקישור:\n${url}`;
+    if (kind === "manage") return `הייתה לי תקלה רגעית 🙏 לניהול התור — צפייה, שינוי או ביטול — בקישור:\n${url}`;
+    return "הייתה לי תקלה רגעית 🙏 אפשר לשלוח שוב את ההודעה? ואם זה לגבי תור — אפשר לקבוע או לנהל גם דרך הקישור.";
+  }
+  // provider_outage (sustained) / ai_error — explain a momentary limit (never "ask me service/day/
+  // time"); ai_error is a softer "limited mode" rather than an overload claim.
+  const notice = reason === "ai_error" ? "אני במצב מצומצם כרגע 🙏" : DEGRADED_NOTICE;
+  if (kind === "booking") return `${notice} אפשר בינתיים לקבוע ישירות בקישור:\n${url}`;
+  if (kind === "manage") return `${notice} לניהול התור — צפייה, שינוי או ביטול — אפשר ישירות בקישור:\n${url}`;
+  return `${notice} נסו שוב עוד רגע. בינתיים ${CONTINUITY_MENU_BODY}`;
+}
+const STILL_DEGRADED_ACK =
+  "עדיין יש קצת עומס במערכת 🙏 אפשר להמשיך — אם מדובר בתור, הכי מהיר דרך הקישור. נסו שוב עוד רגע ואשמח לעזור.";
+const RECOVERY_ACK =
+  "כן, נראה שחזרתי 🙂 תודה על הסבלנות! אפשר להמשיך — לקבוע תור, לנהל תור קיים, או לשאול כל דבר על העסק.";
+// A bare "כן"/"סבבה" with NO resolvable context (no pending offer, our last reply neither
+// asked nor offered anything) — give ONE useful clarification instead of routing a cold action.
+const COLD_YES_CLARIFY =
+  "לא בטוח/ה למה התכוונת 🙂 רוצה לקבוע תור, לנהל תור קיים, או לשאול משהו על העסק?";
+// Accountability repair: the user references our earlier overload/system message. ACKNOWLEDGE it
+// (never deny, never blame the user), say it was momentary, bridge back to the task.
+const ACCOUNTABILITY_REPAIR =
+  "צודק, הייתה אצלי הודעת עומס רגעית קודם 🙏 נראה שעכשיו חזרתי — בוא נמשיך, במה אוכל לעזור?";
+
+// ── REPEAT-ANSWER TONE GUARD ─────────────────────────────────────────────────────
+// Even when the customer asks something already answered, the receptionist must NOT sound
+// annoyed/corrective. Strips a scolding lead-in ("כבר אמרתי לך ש…", "כמו שאמרתי", "שוב…") while
+// KEEPING the actual answer + any vocative ("קובי, …"). General class, not a per-phrase patch.
+const SCOLDING_RE =
+  /כבר\s+אמרתי\s+לך|אמרתי\s+לך\s+כבר|כבר\s+אמרתי|הרי\s+אמרתי(?:\s+לך)?|כמו\s+שאמרתי|כפי\s+שאמרתי|שוב\s+אני\s+אומר(?:ת)?/;
+export function mentionsRepeatScolding(reply: string): boolean {
+  return SCOLDING_RE.test(reply ?? "");
+}
+/** Softens a corrective "I already told you…" lead-in to plain customer-service tone, keeping
+ *  the answer. No-op when no scolding is present (good replies untouched). */
+export function softenRepeatTone(reply: string): { text: string; softened: boolean } {
+  const r = reply ?? "";
+  if (!SCOLDING_RE.test(r)) return { text: r, softened: false };
+  const out = r
+    .replace(/([,!.]\s*|^|\s)(כבר\s+אמרתי\s+לך|אמרתי\s+לך\s+כבר|כבר\s+אמרתי|הרי\s+אמרתי(?:\s+לך)?|כמו\s+שאמרתי|כפי\s+שאמרתי|שוב\s+אני\s+אומר(?:ת)?)\s*ש?/g, "$1")
+    .replace(/(^|[\n.!?]\s*)שוב[,!.\s]+/g, "$1")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.!?])/g, "$1")
+    .replace(/^[\s,–-]+/, "")
+    .trim();
+  if (out.replace(/\s/g, "").length < 2) return { text: r, softened: false }; // never blank the reply
+  return { text: out, softened: out !== r };
+}
 
 /**
  * Runs one platform-mode turn. Persists nothing except a state reset for
@@ -56,17 +164,35 @@ export async function runPlatformTurn(
   messageText: string,
   rawState: string,
   priorContext: Record<string, unknown> = {},
-  checkSuperseded?: () => Promise<boolean>
+  checkSuperseded?: () => Promise<boolean>,
+  /** When the inbound was a TAP on a clickable menu option, this is its stable payload id
+   *  (e.g. "f:hours"). Resolved deterministically BEFORE any AI — a tap always acts. */
+  interactivePayloadId?: string
 ): Promise<PlatformTurnOutcome> {
   // Low-signal + greeting escalation counters — persisted in the (always-idle) platform state.
   const prevLowSignal = readLowSignalCount(priorContext);
   const prevGreeting = readGreetingCount(priorContext);
+  // Short-term pending offer (still within TTL) — lets a LATER bare "כן" resolve to the
+  // booking/manage action we offered earlier, even across intervening turns / a time gap.
+  const now = Date.now();
+  const prevPending = readPendingOffer(priorContext, now);
+
+  // ── PER-CONVERSATION SINGLE-FLIGHT (turn ownership). Claim this conversation; aborting any
+  //    OLDER in-flight turn for the same customer (its Gemini call is cancelled via turn.signal —
+  //    no completion, no retry, no overload strike). `superseded()` is the authoritative,
+  //    race-free supersede check: this turn is obsolete if a newer turn has taken over (in-process)
+  //    OR the DB shows a newer inbound (cross-check). Replaces the bare DB poll everywhere.
+  const turn = beginTurn(businessId, customerId);
+  const superseded = async (): Promise<boolean> =>
+    !isCurrentTurn(turn) || (checkSuperseded ? await checkSuperseded() : false);
 
   // Persists platform state (always idle), merging priorContext (Risk F) and skipping
-  // the write when a newer inbound already superseded this turn (Risk E). See
-  // persistPlatformState for the (unit-tested) contract.
-  const persist = (low: number, greet: number): Promise<boolean> =>
-    persistPlatformState(db, businessId, customerId, low, greet, priorContext, checkSuperseded);
+  // the write when this turn is superseded (Risk E). The optional `pending` arg sets/clears
+  // the pendingOffer (undefined ⇒ carry forward). See persistPlatformState for the contract.
+  const persist = (low: number, greet: number, pending?: PendingOffer | null, lastDegradedAt?: number, failedNeed?: PendingFailedNeed | null, menu?: MenuState | null): Promise<boolean> =>
+    persistPlatformState(db, businessId, customerId, low, greet, priorContext, superseded, pending, lastDegradedAt, failedNeed, menu);
+  // A message that hit a TRANSIENT 503 last turn and was never answered — recovered this turn.
+  const prevFailedNeed = readPendingFailedNeed(priorContext, now);
 
   // Legacy conversational-booking states cannot continue in platform mode —
   // reset once so the customer starts clean after the flip (but carry the
@@ -98,10 +224,49 @@ export async function runPlatformTurn(
     didLastReplyFailToSend(db, businessId, customerId),
   ]);
   const lastAssistant = lastAssistantLine(memory.transcript);
+  // Were we recently degraded/overloaded? Scans the last few assistant lines (robust to the
+  // degraded notice being followed by superseded/recovered turns). Drives recovery follow-ups
+  // ("הסתדר?"/"זמין?") and accountability repair ("כי כתבת שיש עומס").
+  const lastReplyWasDegraded = recentlyDegraded(memory.transcript);
   const bookingBlock = [customerBlock, upcomingBlock].filter(Boolean).join("\n\n");
   // A booking link was sent earlier iff our transcript already carries a URL — only
   // we ever send links. Lets the reply legitimately reference "the link I sent".
   const previousBookingLinkSent = /https?:\/\/\S+/.test(memory.transcript);
+
+  // ── DETERMINISTIC MENU NAVIGATION — gated by the CURRENT operating mode (mode-boundary fix).
+  //    The clickable menu is authoritative ONLY in a deterministic operating state (owner disabled
+  //    AI, no API key, or sustained provider outage). In AI mode (AI enabled + provider healthy) the
+  //    interceptor is SKIPPED entirely: a stale menu cursor or an old button payload ("m:book",
+  //    "m:main") must NOT pull the customer back into menu mode — the visible text flows to the
+  //    model / normal platform routing, and the cursor is cleared by the healthy persist below.
+  //    Decided from THIS turn's facts (ctx.aiSettings.ai_enabled + live provider health), so toggling
+  //    AI back on or a provider recovery flips the gate on the very next turn — no stale state trusted.
+  const deterministicMenu = isDeterministicMenuActive({
+    aiEnabled: ctx.aiSettings?.ai_enabled !== false,
+    geminiConfigured: isGeminiConfigured(),
+    providerCoolingDown: isGeminiCoolingDown(),
+  });
+  if (deterministicMenu) {
+    const facts = buildFacts(ctx);
+    const menuState = readMenuState(priorContext, now);
+    // A TAPPED option (payload id) acts; otherwise navigation on an explicit menu request or an
+    // active cursor. Free text returns null → falls through to deterministic handling (runContinuity).
+    const nav: MenuNav | null =
+      (interactivePayloadId ? resolveMenuPayload(interactivePayloadId, facts) : null)
+      ?? resolveMenuNavigation(menuState?.node ?? null, messageText, facts, { activeMenu: !!menuState });
+    if (nav && !(await superseded())) {
+      return runMenuNavigation(nav, {
+        db, businessId, customerId, customerPhone, slug: ctx.business.slug, facts,
+        emojiNone: ctx.aiSettings?.emoji_usage === "none",
+        prevLowSignal, prevGreeting, memLines: memory.turnsUsed, persist,
+        interactivePayloadId,
+      });
+    }
+  } else if (interactivePayloadId || readMenuState(priorContext, now)) {
+    // AI mode but a STALE tap/cursor arrived (menu was shown before AI was re-enabled / before the
+    // provider recovered) — ignore it as stale and let the AI/platform path own the turn.
+    console.log(`[platform-turn] AI mode active — ignoring STALE menu payload/cursor (interactivePayloadId=${interactivePayloadId ?? "-"}); routing to AI`);
+  }
 
   // ── EMOJI-ONLY messages (e.g. "🙏🏻", "😊😊"): contentless but legitimate. NEVER
   //    call Gemini, and route them through the SAME low-signal counter + escalation
@@ -183,25 +348,88 @@ export async function runPlatformTurn(
     // else: real-looking message → fall through to Gemini (recovery happens there).
   }
 
-  // DEGRADED MODE: during a Gemini overload cooldown the platform story is
-  // simple — the booking page IS the deterministic path. Route to it directly.
+  // ── DETERMINISTIC RECEPTIONIST CORE — shared by EVERY no-AI state (owner-disabled AI, provider
+  //    503, cooldown, internal AI error). One classifier + one link policy; only the WORDING varies
+  //    by `reason`. accountability/recovery apply only to provider states (system frame); booking/
+  //    manage attach the right link on an EXPLICIT operation; FAQ/mixed/unknown → a rate-limited
+  //    continuity menu (one per window, then quiet) so a provider incident can't spam — while
+  //    booking/manage/recovery always answer. Never attaches a link off a loose signal.
+  const runContinuity = async (reason: DegradedReason, decision: ReceptionistDecision): Promise<PlatformTurnOutcome> => {
+    const emojiNone = ctx.aiSettings?.emoji_usage === "none";
+    const degIntent = classifyDegradedIntent(messageText);
+    const isProvider = reason !== "ai_disabled";
+    let text = ""; let link: PlatformLink = null; let suppress = false; let persistNotice = false;
+    let menuKind = "-";
+    let interactive: WhatsAppInteractive | undefined;
+    // Menu cursor to persist (so a follow-up numeric/alias resolves): undefined ⇒ carry, object ⇒ set.
+    let menuNode: MenuState | null | undefined = undefined;
+    if (isProvider && degIntent === "accountability") text = ACCOUNTABILITY_REPAIR;
+    else if (isProvider && degIntent === "recovery") text = STILL_DEGRADED_ACK;
+    else if (degIntent === "booking") {
+      const url = buildBookingLink(ctx.business.slug, customerPhone);
+      text = continuityText(reason, "booking", url); link = "booking"; logPlatformLink("booking", url);
+      interactive = { kind: "cta_url", body: ctaBody("book"), buttonText: "לחץ כאן", url };
+      menuNode = { node: "main", at: now };
+    } else if (degIntent === "manage") {
+      const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
+      const m = manageLinkFor(upcoming, ctx.business.slug, customerPhone, customerId);
+      text = continuityText(reason, m.kind === "booking" ? "booking" : "manage", m.url);
+      link = m.kind; logPlatformLink(m.kind, m.url);
+      interactive = { kind: "cta_url", body: ctaBody(m.kind === "booking" ? "book" : "manage"), buttonText: "לחץ כאן", url: m.url };
+      menuNode = { node: "main", at: now };
+    } else if (reason === "provider_transient") {
+      // ONE brief blip — keep the AI experience: a soft "resend?" (rate-limited like the notice),
+      // and PRESERVE the original need below so the next healthy turn recovers it. We deliberately
+      // do NOT switch to the full deterministic FAQ menu over a single 503 (no permanent downgrade).
+      if (degradedNoticeAllowed(priorContext, now)) { text = continuityText(reason, "menu"); persistNotice = true; menuKind = "transient_soft"; }
+      else { suppress = true; menuKind = "transient_quiet"; }
+    } else {
+      // SUSTAINED outage / owner-disabled AI / internal error → the GENERAL deterministic menu.
+      // A real business-info question is ANSWERED from facts/KB (or gets the info submenu) and is
+      // NEVER rate-limited; only a vague/contentless repeat falls to the one-menu-per-window limit.
+      const plan = planContinuityMenu(reason, messageText, buildFacts(ctx));
+      menuKind = plan.kind;
+      if (plan.kind === "vague_menu") {
+        if (degradedNoticeAllowed(priorContext, now)) { text = plan.text; interactive = plan.interactive; persistNotice = true; menuNode = { node: "main", at: now }; }
+        else suppress = true;                                     // genuinely vague repeat → quiet (anti-spam)
+      } else {
+        text = plan.text;                                         // answer / submenu / explicit menu → ALWAYS reply
+        interactive = plan.interactive;                           // clickable buttons/list version
+        // answer/submenu put the customer in the FAQ node; an explicit main menu → main node.
+        menuNode = { node: plan.kind === "main_menu_explicit" ? "main" : "faq", at: now };
+      }
+    }
+    if (!suppress && emojiNone) text = stripEmojis(text);
+    // A TRANSIENT 503 on a FAQ/unclear message (the "menu" kind) — PRESERVE the original text so
+    // the next healthy turn can recover it. Explicit booking/manage or recovery already handled it.
+    const storeFailedNeed: PendingFailedNeed | undefined =
+      reason === "provider_transient" && degIntent === "menu" ? { text: messageText.slice(0, 300), at: now } : undefined;
+    await persist(prevLowSignal, prevGreeting, undefined, persistNotice ? now : undefined, storeFailedNeed, menuNode);
+    await safeLog(businessId, customerId, decision);
+    const lc = deriveLastAssistantContract(memory.transcript);
+    console.log(`[platform-turn] continuity reason=${reason} intent=${degIntent} menu=${menuKind} link=${link ?? "-"} suppressed=${suppress} branch=${decision.branch}`);
+    logTurnTrace({
+      bookingMode: "platform", geminiCalled: decision.geminiCalled,
+      route: link === "booking" ? "BOOK" : link === "manage" ? "MANAGE" : "NONE",
+      routeReason: `continuity_${reason}`, signalKind: "unclear", linkKind: link, linkAttached: link !== null,
+      suppressReply: suppress, guardBranch: decision.branch, bookingEvidence: false,
+      lowSignalBefore: prevLowSignal, lowSignalAfter: prevLowSignal,
+      greetingBefore: prevGreeting, greetingAfter: prevGreeting,
+      replySource: "fallback", memLines: memory.turnsUsed,
+      latestSignal: classifyGoodFaithSignal(latestFragment(messageText), { serviceNames: activeServiceNames }),
+      aggregateSignal: classifyGoodFaithSignal(messageText, { serviceNames: activeServiceNames }),
+      lastAssistant: `${lc.sentBookingLink ? "B" : ""}${lc.sentManageLink ? "M" : ""}${lc.offeredHelp ? "H" : ""}${lc.offeredBooking ? "K" : ""}${lc.askedQuestion ? "Q" : ""}` || "-",
+      staleTopicGuard: false, softIntent: false, contextualConfirmation: false,
+      capabilityFence: false, recoveryFollowup: degIntent === "recovery", pendingResolved: false, coldYes: false,
+      customerVisible: !suppress, action: suppress ? "continuity_suppressed" : `continuity_${reason}${link ? `+${link}` : menuKind !== "-" ? `+${menuKind}` : ""}`,
+    });
+    return { replyText: text, decision, linkAttached: link, suppressReply: suppress, interactive: suppress ? undefined : interactive };
+  };
+
+  // DEGRADED MODE (provider cooldown active) — serve deterministically via the shared core.
   if (isGeminiCoolingDown() && classifyInput(messageText) === "ok") {
     console.warn(`[platform-turn] DEGRADED MODE — cooldown ${Math.ceil(geminiCooldownRemainingMs() / 1000)}s left`);
-    // Even during an outage, only attach the link on a real booking signal — never
-    // spam a link onto small talk just because the AI is down.
-    if (hasBookingSignal(messageText, activeServiceNames)) {
-      const link = buildBookingLink(ctx.business.slug, customerPhone);
-      let replyText = `יש לי רגע עומס קטן במערכת 🙏 אפשר בינתיים לקבוע, לשנות או לבדוק זמינות כאן:\n${link}`;
-      if (ctx.aiSettings?.emoji_usage === "none") replyText = stripEmojis(replyText);
-      const decision = errorDecision("gemini_cooldown", true);
-      await safeLog(businessId, customerId, decision);
-      return { replyText, decision, linkAttached: "booking" };
-    }
-    let replyText = "יש לי רגע עומס קטן במערכת 🙏 אחזור אלייך עוד רגע — אפשר גם לכתוב לי שוב בעוד דקה.";
-    if (ctx.aiSettings?.emoji_usage === "none") replyText = stripEmojis(replyText);
-    const decision = errorDecision("gemini_cooldown", true);
-    await safeLog(businessId, customerId, decision);
-    return { replyText, decision, linkAttached: null };
+    return runContinuity("provider_outage", errorDecision("gemini_cooldown", true));
   }
 
   let replyGuidance: string | undefined;
@@ -209,17 +437,40 @@ export async function runPlatformTurn(
     replyGuidance =
       `NOTE: your PREVIOUS reply FAILED to deliver (technical issue on our side — the customer never saw it). Open with a brief, warm acknowledgement of a small hiccup ("הייתה לי תקלה קטנה קודם") before continuing.`;
   }
+  // RECOVER a transient-503 need: a recent earlier message went unanswered due to a brief glitch.
+  // Re-surface it to the (now healthy) model so it isn't silently swallowed.
+  if (prevFailedNeed) {
+    const recover =
+      `NOTE: an earlier customer message ("${prevFailedNeed.text.replace(/"/g, "'")}") was NOT answered due to a brief technical glitch. If the CURRENT message does not already move past it, gently address that earlier question too.`;
+    replyGuidance = replyGuidance ? `${recover}\n${replyGuidance}` : recover;
+  }
+
+  // ── CUSTOMER SAFETY CONTRACT v1: classify the LATEST message + derive what our last
+  //    reply did, BEFORE the model call — so a topic-switch FOCUS note can steer the reply.
+  const latest = latestFragment(messageText);
+  const latestSignalRaw = classifyGoodFaithSignal(latest, { serviceNames: activeServiceNames });
+  const lastContract = deriveLastAssistantContract(memory.transcript);
+  // Topic switch (latest wins): a NEW non-manage topic while our recent reply was a
+  // manage/cancel/link/help thread → tell the model to answer THIS message, not the thread.
+  const topicSwitch =
+    (latestSignalRaw === "faq" || latestSignalRaw === "soft_intent"
+      || (latestSignalRaw === "action" && inferOperation(latest) === "BOOK")) &&
+    !isManageHelpTopic(latest) && (lastContract.sentManageLink || lastContract.offeredHelp);
+  if (topicSwitch) {
+    const focus = "FOCUS: the customer's CURRENT message is a NEW topic — answer THIS message from the BUSINESS FACTS. Do NOT continue an earlier cancellation / manage / link / help thread unless this message refers to it.";
+    replyGuidance = replyGuidance ? `${focus}\n${replyGuidance}` : focus;
+  }
 
   // FINAL supersede gate BEFORE the (expensive) Gemini call. A newer fragment that
   // arrived during the debounce / aggregation / context-load means a later turn will
   // answer the full aggregate — so THIS turn must not also call Gemini. This guarantees a
   // burst costs ONE Gemini call (the last fragment's), not one per fragment. State is left
   // untouched (no persist) and the reply is suppressed (the router skips it anyway).
-  if (checkSuperseded && (await checkSuperseded())) {
+  if (await superseded()) {
     console.log("[platform-turn] superseded before Gemini call — skipping model call (burst coalesced to a later turn)");
-    const superseded = errorDecision("superseded", true);
-    await safeLog(businessId, customerId, superseded);
-    return { replyText: "", decision: superseded, linkAttached: null, suppressReply: true };
+    const supersededDecision = errorDecision("superseded", true);
+    await safeLog(businessId, customerId, supersededDecision);
+    return { replyText: "", decision: supersededDecision, linkAttached: null, suppressReply: true };
   }
 
   const decision = await runReceptionistTurn(ctx, {
@@ -230,7 +481,33 @@ export async function runPlatformTurn(
     replyGuidance,
     platformMode: true,
     customerPhone,
+    // Single-flight: a newer turn for this conversation CANCELS this in-flight Gemini call
+    // (no completion, no retry, no overload strike). abortIfSuperseded is the 503-path backstop.
+    abortSignal: turn.signal,
+    abortIfSuperseded: superseded,
   });
+
+  // ── DETERMINISTIC RECEPTIONIST for EVERY no-AI outcome (owner disabled AI, provider 503,
+  //    internal AI/parse error) — route through the SHARED continuity core with reason-specific
+  //    wording, so the product stays a useful receptionist (book/manage/recovery/menu) instead of
+  //    a dead canned line. Deliberate guard replies (abuse/noise) and grounding deflections are
+  //    left as-is. A turn that became superseded mid-call just suppresses (the router skips it).
+  if (!decision.ok && CONTINUITY_BRANCHES.has(decision.branch)) {
+    if (await superseded()) {
+      const sup = errorDecision("superseded", true);
+      await safeLog(businessId, customerId, sup);
+      return { replyText: "", decision: sup, linkAttached: null, suppressReply: true };
+    }
+    // Grade provider failures by HEALTH: a 503 that left us still-healthy (no cooldown) is a
+    // TRANSIENT blip → soft "resend?" that keeps the AI experience and preserves the need; a 503
+    // that tipped us into cooldown is a SUSTAINED outage → deterministic menu. (The pre-call
+    // cooldown block already routes subsequent in-cooldown turns to provider_outage.)
+    const reason: DegradedReason =
+      decision.branch === "ai_disabled" ? "ai_disabled"
+      : decision.branch === "api_overloaded" ? (isGeminiCoolingDown() ? "provider_outage" : "provider_transient")
+      : "ai_error"; // api_error | parse_error | not_configured
+    return runContinuity(reason, decision);
+  }
 
   let replyText = decision.replyText;
 
@@ -245,6 +522,23 @@ export async function runPlatformTurn(
   if (decision.ok && sameOutboundText(replyText, lastAssistant)) {
     replyText = "אני כאן 🙂 אפשר לשאול אותי כל דבר על העסק, או לקבוע תור מתי שתרצה.";
   }
+  // Repeat-answer tone guard: even for an already-answered question, never scold ("כבר אמרתי
+  // לך…"). Soften to plain customer-service tone while keeping the answer + vocative.
+  if (decision.ok) {
+    const toned = softenRepeatTone(replyText);
+    if (toned.softened) {
+      replyText = toned.text;
+      console.log("[platform-turn] tone guard: softened a repeat-answer scolding lead-in");
+    }
+  }
+
+  // ── POST-FALLBACK RECOVERY / ACCOUNTABILITY (detection): after a degraded/overload reply,
+  //    "הסתדר?"/"זמין?" is a SYSTEM-recovery question (not "how are you?"), and "כי כתבת שיש
+  //    עומס"/"הנה תראה" is an accountability challenge (acknowledge, never deny/blame). Resolved
+  //    AUTHORITATIVELY at the end of the turn (override any routing/low-signal). Accountability
+  //    takes precedence over recovery. Recognized ONLY after a degraded reply (context-gated).
+  const accountabilityRepair = decision.ok && lastReplyWasDegraded && isAccountabilityChallenge(latest);
+  const recoveryFollowup = decision.ok && lastReplyWasDegraded && !accountabilityRepair && isRecoveryFollowup(latest);
 
   // ── Outbound URL safety: strip any URL the MODEL wrote (echoed from history or
   //    invented) so the final message carries AT MOST the one deterministic link.
@@ -261,6 +555,14 @@ export async function runPlatformTurn(
     const ev = applyBookingEvidenceGate(decision.turn.understanding, messageText, activeServiceNames);
     bookingEvidence = ev.evidence;
     bookingEvidenceReason = ev.reason;
+  }
+
+  // Good-faith category of the LATEST message (classified pre-Gemini). A bare "כן"
+  // inherits the prior assistant trajectory: after a help offer → help; otherwise a
+  // contextual follow-up (never an action route on its own).
+  let latestSignal: GoodFaithSignal = decision.ok && decision.turn ? latestSignalRaw : "none";
+  if (latestSignal === "none" && decision.ok && decision.turn && isBareAffirmation(latest)) {
+    latestSignal = lastContract.offeredHelp ? "help" : "contextual_ref";
   }
 
   // ── Deterministic link control (OVERRIDES Gemini's intent). Complaints about
@@ -340,6 +642,12 @@ export async function runPlatformTurn(
         console.log(`[platform-turn] fence: neutralized in-chat selection question (manage, ${upcoming.length} appts)`);
         replyText = fenced.text;
       }
+      // Rewrite an in-chat "I'll schedule/manage it for you" promise to link-first wording.
+      const capM = defuseCapabilityPromise(replyText, { bridge: FENCE_BRIDGE_MANAGE });
+      if (capM.defused) {
+        console.log("[platform-turn] fence: rewrote in-chat capability promise (manage link → link-first)");
+        replyText = capM.text;
+      }
       // No false refusal when a MANAGE link is attached (the page does it). Skip the
       // 0-upcoming case — there the honest "no appointment under this number" reply is
       // correct (and it routes to a booking link, not a manage one).
@@ -360,6 +668,12 @@ export async function runPlatformTurn(
         console.log("[platform-turn] fence: stripped in-chat scheduling question (booking intent → link-first)");
         replyText = fenced.text;
       }
+      // Rewrite an in-chat "I'll book it for you" promise ("נתאם לך") to link-first wording.
+      const capB = defuseCapabilityPromise(replyText);
+      if (capB.defused) {
+        console.log("[platform-turn] fence: rewrote in-chat capability promise (booking link → link-first)");
+        replyText = capB.text;
+      }
       // No false "I can't book" when a BOOKING link is attached (the page does it).
       const refused = defuseActionRefusal(replyText, route);
       if (refused.defused) {
@@ -374,6 +688,111 @@ export async function runPlatformTurn(
     // route === NONE → no link (any override reply replacement already applied above).
   }
 
+  // ── ACTION / HELP ESCAPE (Customer Safety Contract): a help request, OR an operation
+  //    the model MISSED, gets the RIGHT link + TRUTH-SAFE guidance. The website performs
+  //    the action; chat NEVER does and never claims it did. Latest-message-driven; a
+  //    QUESTION about an operation ("כמה עולה לבטל?") is faq, not action — never forced.
+  const escapeOp = inferOperation(latest);
+  const affirm = isBareAffirmation(latest);
+  // IMMEDIATE context: our LAST reply offered/sent a booking. DELAYED context: a still-valid
+  // pending offer from earlier (survives intervening turns + a time gap, TTL-bounded) — this is
+  // what makes a later "כן" resolve to the action we discussed instead of arriving cold.
+  const immediateBookCtx = lastContract.sentBookingLink || lastContract.offeredBooking;
+  const pendingBookConfirm = affirm && !immediateBookCtx && prevPending?.kind === "BOOK";
+  const pendingManageConfirm = affirm && !immediateBookCtx && prevPending?.kind === "MANAGE";
+  const confirmIntoBooking = affirm && (immediateBookCtx || pendingBookConfirm);
+  const wantsManage = latestSignal === "help"
+    || (latestSignal === "action" && (escapeOp === "CANCEL" || escapeOp === "RESCHEDULE" || escapeOp === "LIST"))
+    || pendingManageConfirm;
+  const wantsBook = (latestSignal === "action" && escapeOp === "BOOK") || confirmIntoBooking;
+  const pendingResolved = pendingBookConfirm || pendingManageConfirm;
+  let softIntentLink = false;
+  if (decision.ok && !suppressLinkFor(latest) && wantsManage && (latestSignal === "help" || linkAttached === null)) {
+    // HELP overrides even an attached link (truth-safe guidance beats a vague model reply);
+    // a MISSED manage operation fires only when nothing was attached.
+    const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
+    const m = manageLinkFor(upcoming, ctx.business.slug, customerPhone, customerId);
+    replyText = appendPlatformLink(buildManageHelpReply(upcoming.length, escapeOp), m.label, m.url, lastAssistant, messageText);
+    linkAttached = m.kind;
+    platformRoute = escapeOp ?? "HELP";
+    platformRouteReason = "help_escape";
+    logPlatformLink(m.kind, m.url);
+    console.log(`[platform-turn] help-escape: truth-safe manage/help (op=${escapeOp ?? "-"}, upcoming=${upcoming.length})`);
+  } else if (decision.ok && linkAttached === null && wantsBook && !suppressLinkFor(latest)) {
+    const url = buildBookingLink(ctx.business.slug, customerPhone);
+    replyText = appendPlatformLink(`בטח! ${FENCE_BRIDGE_BOOK}`, BOOK_LINE, url, lastAssistant, messageText);
+    linkAttached = "booking";
+    platformRoute = "BOOK";
+    platformRouteReason = pendingBookConfirm ? "pending_confirm" : confirmIntoBooking ? "contextual_confirm" : "action_escape";
+    logPlatformLink("booking", url);
+    console.log(`[platform-turn] ${pendingBookConfirm ? "pending-confirm: 'כן' resolved a still-open booking offer" : confirmIntoBooking ? "contextual-confirm: 'כן' after a booking offer" : "action-escape: model missed a booking imperative"} → booking link`);
+  } else if (decision.ok && linkAttached === null && latestSignal === "soft_intent" && !suppressLinkFor(latest)) {
+    // SOFT SERVICE INTENT ("חשבתי על להסתפר, יש לי טיסה..."): keep the model's WARMTH,
+    // strip any in-chat scheduling question / availability promise, and route to the
+    // booking page (the safe universal entry — link-first, never an in-chat flow).
+    let warm = defuseSchedulingQuestion(replyText).text;
+    warm = defuseCapabilityPromise(warm).text;
+    const refused = defuseActionRefusal(warm, "BOOK");
+    if (refused.defused) warm = refused.text;
+    const url = buildBookingLink(ctx.business.slug, customerPhone);
+    replyText = appendPlatformLink(warm, BOOK_LINE, url, lastAssistant, messageText);
+    linkAttached = "booking";
+    platformRoute = "BOOK";
+    platformRouteReason = "soft_intent";
+    softIntentLink = true;
+    logPlatformLink("booking", url);
+    console.log("[platform-turn] soft-intent: indirect service intent → booking link (warmth kept)");
+  }
+
+  // ── CAPABILITY-PROMISE FENCE (route-agnostic backstop): the model promised an in-chat
+  //    booking/availability flow it can't run. If nothing was attached, either route to
+  //    booking (when there's intent/booking context) or neutralize the promise — so an
+  //    unsupported "אני אבדוק לך זמינות" never ships and never dangles an unanswerable yes.
+  let capabilityFenceApplied = false;
+  if (decision.ok && linkAttached === null && mentionsCapabilityPromise(replyText)) {
+    const bookingContext = latestSignal === "soft_intent"
+      || hasBookingSignal(messageText, activeServiceNames)
+      || (affirm && (lastContract.sentBookingLink || lastContract.offeredBooking || prevPending?.kind === "BOOK"));
+    if (bookingContext && !suppressLinkFor(latest)) {
+      const url = buildBookingLink(ctx.business.slug, customerPhone);
+      replyText = appendPlatformLink(defuseCapabilityPromise(replyText).text, BOOK_LINE, url, lastAssistant, messageText);
+      linkAttached = "booking";
+      platformRoute = "BOOK";
+      platformRouteReason = "capability_fence";
+      logPlatformLink("booking", url);
+      console.log("[platform-turn] capability fence: unsupported in-chat promise → booking link");
+    } else {
+      replyText = defuseCapabilityPromise(replyText).text;
+      console.log("[platform-turn] capability fence: neutralized unsupported in-chat promise (no link)");
+    }
+    capabilityFenceApplied = true;
+  }
+
+  // ── COLD AFFIRMATION GUARD: a bare "כן"/"סבבה" with NO resolvable context (no still-valid
+  //    pending offer, and our last reply neither asked nor offered anything actionable) must
+  //    NOT route to an action — give ONE safe clarification instead of a cold guess. (A pending
+  //    offer, or a last-reply question/offer, is resolved above and never reaches here.)
+  let coldYes = false;
+  if (decision.ok && linkAttached === null && affirm && !prevPending
+      && !(lastContract.askedQuestion || lastContract.offeredHelp || lastContract.offeredBooking
+           || lastContract.sentBookingLink || lastContract.sentManageLink)) {
+    replyText = COLD_YES_CLARIFY;
+    coldYes = true;
+    console.log("[platform-turn] cold affirmation with no pending context → safe clarification (no action)");
+  }
+
+  // ── STALE-TOPIC GUARD (deterministic backstop): the latest message is a clear NEW
+  //    non-manage business question, but the reply continued an old cancellation/manage/
+  //    link thread → latest wins; don't answer the stale topic. (FOCUS guidance prevents
+  //    most of these pre-Gemini; this catches the rest.)
+  let staleTopicGuard = false;
+  if (decision.ok && latestSignal === "faq" && !isManageHelpTopic(latest)
+      && linkAttached === null && replyLooksStaleManage(replyText)) {
+    replyText = STALE_TOPIC_PIVOT;
+    staleTopicGuard = true;
+    console.log("[platform-turn] stale-topic guard: reply continued a stale manage thread → pivot to latest question");
+  }
+
   // ── LOW-SIGNAL GUARD: gently clarify, then set a polite boundary, so repeated
   //    no-intent / gibberish messages don't loop forever. Any productive turn (a
   //    real business question or an operation) resets the counter. Friendly first.
@@ -381,7 +800,7 @@ export async function runPlatformTurn(
   // escalate. Greetings/smalltalk/meta are legitimate human turns — they reset the
   // counter and keep the model's friendly reply (BUG-005). Productive resets too.
   const kind: LowSignalKind = decision.ok && decision.turn
-    ? lowSignalKind(decision, messageText, activeServiceNames)
+    ? lowSignalKind(decision, messageText, activeServiceNames, latestSignal)
     : "unclear";
   const lowSignal = decision.ok && !!decision.turn && countsTowardQuiet(kind);
   let newLowSignal = prevLowSignal;
@@ -393,10 +812,16 @@ export async function runPlatformTurn(
   let suppressReply = false;
   if (decision.ok && decision.turn) {
     newLowSignal = lowSignal ? prevLowSignal + 1 : 0;
-    newGreeting = (kind === "smalltalk" || kind === "meta") ? prevGreeting + 1 : 0;
+    // Greeting LOOP counter (cost cap) advances ONLY on an actual bare opener — NOT on
+    // content-ful smalltalk. A warm exchange ("ציון טוב במתמטיקה") must not inflate the
+    // counter and risk later suppressing a real greeting (assistant-driven social drift).
+    newGreeting = looksLikeGreetingOrMeta(latest, activeServiceNames) ? prevGreeting + 1 : 0;
     lowSignalAct = lowSignalActionFor(newLowSignal);
     // count 1 → keep the model's (friendly) clarification; escalate from 2 up.
-    if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
+    // Gibberish must NEVER reach the customer as a model-authored semantic guess
+    // ("במבח" → "אתה מתכוון למחר?"). Use the deterministic clarify even at tier 1.
+    if (lowSignalAct === "normal_clarify" && kind === "gibberish") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
+    else if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
     else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
     else if (lowSignalAct === "quiet_mode") {
       // Reached via Gemini (the message wasn't obvious local nonsense). Go sparse:
@@ -410,6 +835,24 @@ export async function runPlatformTurn(
   // !decision.ok (system fallback) leaves the counter unchanged — never penalize a
   // customer for our own error.
 
+  // ── RECOVERY / ACCOUNTABILITY OVERRIDE (authoritative): after a degraded reply, a recovery
+  //    question ("הסתדר?"/"זמין?") or an accountability challenge ("כי כתבת שיש עומס"/"הנה תראה")
+  //    gets a deterministic calm reply and NO link — overriding any routing/low-signal mutation
+  //    above. A recovery/repair exchange is productive (never escalate the counter).
+  if (recoveryFollowup || accountabilityRepair) {
+    replyText = accountabilityRepair
+      ? ACCOUNTABILITY_REPAIR
+      : (isGeminiCoolingDown() ? STILL_DEGRADED_ACK : RECOVERY_ACK);
+    // A recovery/accountability reply replaces the model's — so if an earlier message went
+    // unanswered (transient 503), bridge to it here so it isn't lost ("answer recovery but do not
+    // lose the original failed need").
+    if (prevFailedNeed) replyText += " דרך אגב, הייתה הודעה קודמת שלא הספקתי לענות עליה — אפשר לשלוח אותה שוב 🙂";
+    linkAttached = null;
+    newLowSignal = 0;
+    suppressReply = false;
+    console.log(`[platform-turn] ${accountabilityRepair ? "accountability repair" : "recovery follow-up"}: degraded context → calm repair/recovery reply, no link`);
+  }
+
   // ── LINK-WORDING FENCE: never imply a link is present/sent unless one was
   //    actually attached this turn or sent earlier in the conversation.
   let linkWordingFenceApplied = false;
@@ -418,8 +861,25 @@ export async function runPlatformTurn(
     linkWordingFenceApplied = true;
   }
 
-  // Persist the counters (platform state is always idle; merge-safe + supersede-aware).
-  await persist(newLowSignal, newGreeting);
+  // ── SET / CARRY the short-term pending offer: remember a platform-safe action we offered or
+  //    attached this turn, so a LATER bare "כן" resolves to it. undefined ⇒ carry the existing
+  //    one forward; object ⇒ refresh. Never set on a cold-yes clarification or a low-signal
+  //    (gibberish/unclear) turn. Offer detection reads the MODEL's ORIGINAL reply (not a fence-
+  //    rewritten clarify line) so a deterministic clarification can't fabricate a pending offer.
+  const discussedService = (u?.serviceName ?? prevPending?.service) || undefined;
+  let newPending: PendingOffer | null | undefined = undefined;
+  if (!coldYes && kind !== "gibberish" && kind !== "unclear") {
+    if (linkAttached === "booking") newPending = { kind: "BOOK", service: discussedService, at: now };
+    else if (linkAttached === "manage") newPending = { kind: "MANAGE", service: discussedService, at: now };
+    else if (decision.ok && BOOKING_OFFER_RE.test(decision.replyText)) newPending = { kind: "BOOK", service: discussedService, at: now };
+  }
+
+  // Persist the counters + pending offer (platform state is always idle; merge-safe + supersede-aware).
+  // Clear any preserved transient-503 need — this healthy turn had its chance to recover it
+  // (re-injected as guidance above / bridged into a recovery reply below), so consume it once.
+  // AI-FIRST: a healthy free-text turn means the customer is conversing, not navigating — EXIT any
+  // menu cursor (a later numeric/alias won't be hijacked into menu mode; the AI owns the turn).
+  await persist(newLowSignal, newGreeting, newPending, undefined, prevFailedNeed ? null : undefined, null);
 
   if (ctx.aiSettings?.emoji_usage === "none") {
     replyText = stripEmojis(replyText);
@@ -456,10 +916,81 @@ export async function runPlatformTurn(
     greetingAfter: newGreeting,
     replySource: decision.replySource,
     memLines: memory.turnsUsed,
+    latestSignal,
+    aggregateSignal: decision.ok && decision.turn
+      ? classifyGoodFaithSignal(messageText, { serviceNames: activeServiceNames }) : "none",
+    lastAssistant: `${lastContract.sentBookingLink ? "B" : ""}${lastContract.sentManageLink ? "M" : ""}${lastContract.offeredHelp ? "H" : ""}${lastContract.offeredBooking ? "K" : ""}${lastContract.askedQuestion ? "Q" : ""}` || "-",
+    staleTopicGuard,
+    softIntent: latestSignal === "soft_intent" || softIntentLink,
+    contextualConfirmation: confirmIntoBooking,
+    capabilityFence: capabilityFenceApplied,
+    recoveryFollowup,
+    pendingResolved,
+    coldYes,
+    customerVisible: !suppressReply && replyText.trim().length > 0,
     action: `${suppressReply ? "suppressed" : "reply"}${linkAttached ? `+${linkAttached}` : ""}`,
   });
 
   return { replyText, decision, linkAttached, suppressReply };
+}
+
+// ── DETERMINISTIC MENU NAVIGATION runner ──────────────────────────────────────────
+// Executes a resolved menu-navigation action with NO Gemini call: book/manage attach the
+// real, sized link (neutral wording — a menu pick is reason-agnostic); main/faq/answer just
+// reply with the menu text. Always persists the new menu cursor so the next numeric/alias/
+// topic resolves against the right node. Kept separate so runPlatformTurn stays readable.
+interface MenuNavDeps {
+  db: DB; businessId: string; customerId: string; customerPhone: string; slug: string; facts: BusinessFacts;
+  emojiNone: boolean; prevLowSignal: number; prevGreeting: number; memLines: number;
+  /** Stable payload id when the turn was a TAP (vs typed text) — surfaced in logs/trace. */
+  interactivePayloadId?: string;
+  persist: (
+    low: number, greet: number, pending?: PendingOffer | null, lastDegradedAt?: number,
+    failedNeed?: PendingFailedNeed | null, menu?: MenuState | null,
+  ) => Promise<boolean>;
+}
+async function runMenuNavigation(nav: MenuNav, deps: MenuNavDeps): Promise<PlatformTurnOutcome> {
+  const { db, businessId, customerId, customerPhone, slug, facts, emojiNone, prevLowSignal, prevGreeting, memLines, persist, interactivePayloadId } = deps;
+  const now = Date.now();
+  let text = "";
+  let link: PlatformLink = null;
+  let interactive: WhatsAppInteractive | undefined;
+  if (nav.kind === "book") {
+    const url = buildBookingLink(slug, customerPhone);
+    text = continuityText("ai_disabled", "booking", url); link = "booking"; logPlatformLink("booking", url);
+    interactive = { kind: "cta_url", body: ctaBody("book"), buttonText: "לחץ כאן", url };
+  } else if (nav.kind === "manage") {
+    const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
+    const m = manageLinkFor(upcoming, slug, customerPhone, customerId);
+    text = continuityText("ai_disabled", m.kind === "booking" ? "booking" : "manage", m.url);
+    link = m.kind; logPlatformLink(m.kind, m.url);
+    interactive = { kind: "cta_url", body: ctaBody(m.kind === "booking" ? "book" : "manage"), buttonText: "לחץ כאן", url: m.url };
+  } else {
+    text = nav.reply;
+    interactive = buildInteractiveForNav(nav, facts) ?? undefined; // clickable buttons/list (settings enforced at chokepoint)
+  }
+  if (emojiNone) text = stripEmojis(text); // text FALLBACK only; the interactive is enforced at sendOutboundInteractive
+  const decision = errorDecision("menu_navigation", true);
+  // Carry the counters; set the new menu cursor (TTL refreshed) so navigation continues next turn.
+  await persist(prevLowSignal, prevGreeting, undefined, undefined, undefined, { node: nav.node, at: now });
+  await safeLog(businessId, customerId, decision);
+  // Prove in live logs that the tap was handled by STABLE PAYLOAD ID (not only the visible title).
+  console.log(`[platform-turn] menu-nav kind=${nav.kind} node=${nav.node} link=${link ?? "-"} interactive=${interactive?.kind ?? "-"} interactivePayloadId=${interactivePayloadId ?? "-"}`);
+  logTurnTrace({
+    bookingMode: "platform", geminiCalled: false,
+    route: link === "booking" ? "BOOK" : link === "manage" ? "MANAGE" : "NONE",
+    routeReason: `menu_${nav.kind}`, signalKind: "productive", linkKind: link, linkAttached: link !== null,
+    suppressReply: false, guardBranch: "menu_navigation", bookingEvidence: false,
+    lowSignalBefore: prevLowSignal, lowSignalAfter: prevLowSignal,
+    greetingBefore: prevGreeting, greetingAfter: prevGreeting,
+    replySource: "fallback", memLines,
+    latestSignal: "none", aggregateSignal: "none", lastAssistant: "-",
+    staleTopicGuard: false, softIntent: false, contextualConfirmation: false,
+    capabilityFence: false, recoveryFollowup: false, pendingResolved: false, coldYes: false,
+    customerVisible: true, action: `menu_${nav.kind}${link ? `+${link}` : ""}`,
+    interactivePayloadId,
+  });
+  return { replyText: text, decision, linkAttached: link, suppressReply: false, interactive };
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -524,6 +1055,60 @@ export function readGreetingCount(context: Record<string, unknown>): number {
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+// ── SHORT-TERM PENDING OFFER (conversation continuity — NOT a CRM / not long-term memory) ──
+// A tiny per-customer record of the LAST platform-safe action we offered or attached, so a
+// LATER bare confirmation ("כן", "סבבה", "תשלח") — even after intervening turns or a time gap —
+// resolves to THAT offer instead of arriving cold. Lives in the EXISTING (always-idle) platform
+// conversation_states.context (one object, merge-safe) and is TTL-bounded. Business-agnostic:
+// it records the OPERATION kind + the discussed service NAME (whatever the business configured),
+// never an industry assumption. We deliberately store NO personal/off-topic detail here.
+export const PENDING_OFFER_TTL_MS = 3 * 60 * 60 * 1000; // 3h — a booking offer stays warm for hours, not days
+export interface PendingOffer {
+  kind: "BOOK" | "MANAGE";
+  service?: string;   // last discussed service name (for warmth), or undefined
+  at: number;         // epoch ms when offered
+}
+/** Reads a still-VALID pending offer (within TTL), or null. Expiry is enforced on read so we
+ *  never delete state — a stale offer simply stops counting as pending. */
+export function readPendingOffer(context: Record<string, unknown>, now: number = Date.now()): PendingOffer | null {
+  const p = context?.pendingOffer as Partial<PendingOffer> | undefined;
+  if (!p || (p.kind !== "BOOK" && p.kind !== "MANAGE")) return null;
+  if (typeof p.at !== "number" || !Number.isFinite(p.at)) return null;
+  if (now - p.at > PENDING_OFFER_TTL_MS || now - p.at < 0) return null; // expired (or clock skew)
+  return { kind: p.kind, service: typeof p.service === "string" && p.service.trim() ? p.service : undefined, at: p.at };
+}
+
+// ── DEGRADED-NOTICE RATE LIMIT (degraded = state, not per-inbound spam) ──────────
+// The provider cooldown is process-global, so during an incident EVERY inbound would
+// otherwise emit another "יש לי רגע עומס…". We send at most ONE generic degraded notice per
+// conversation per window, then go quiet — a direct recovery/accountability answer or an
+// explicit booking link is still allowed. Stored in the existing per-customer state.
+export const DEGRADED_NOTICE_MIN_GAP_MS = 90 * 1000; // ≥ the 60s provider cooldown, so a burst stays quiet
+export function readLastDegradedAt(context: Record<string, unknown>): number {
+  const n = context?.lastDegradedAt;
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
+}
+/** True when a fresh generic degraded notice is allowed (none sent within the window). */
+export function degradedNoticeAllowed(context: Record<string, unknown>, now: number = Date.now()): boolean {
+  const last = readLastDegradedAt(context);
+  return last === 0 || now - last >= DEGRADED_NOTICE_MIN_GAP_MS || now - last < 0;
+}
+
+// ── PENDING FAILED NEED (transient-503 message preservation) ─────────────────────
+// When a FAQ/unclear message hits a TRANSIENT 503 (one blip, provider still healthy), we keep
+// the customer's original text so the NEXT healthy turn can recover it (re-injected as model
+// guidance, or bridged into the recovery reply) — the message is never silently swallowed.
+// Short TTL because a transient blip recovers fast; the saved transcript is the durable record.
+export const PENDING_FAILED_NEED_TTL_MS = 10 * 60 * 1000;
+export interface PendingFailedNeed { text: string; at: number; }
+export function readPendingFailedNeed(context: Record<string, unknown>, now: number = Date.now()): PendingFailedNeed | null {
+  const p = context?.pendingFailedNeed as Partial<PendingFailedNeed> | undefined;
+  if (!p || typeof p.text !== "string" || !p.text.trim()) return null;
+  if (typeof p.at !== "number" || !Number.isFinite(p.at)) return null;
+  if (now - p.at > PENDING_FAILED_NEED_TTL_MS || now - p.at < 0) return null;
+  return { text: p.text.slice(0, 300), at: p.at };
+}
+
 /**
  * Persists platform state (always idle). MERGES `priorContext` so unrelated fields
  * survive a low-signal update (Risk F). SKIPS the write entirely when `checkSuperseded`
@@ -534,15 +1119,35 @@ export function readGreetingCount(context: Record<string, unknown>): number {
 export async function persistPlatformState(
   db: DB, businessId: string, customerId: string,
   low: number, greet: number, priorContext: Record<string, unknown>,
-  checkSuperseded?: () => Promise<boolean>
+  checkSuperseded?: () => Promise<boolean>,
+  pending?: PendingOffer | null,
+  lastDegradedAt?: number,
+  failedNeed?: PendingFailedNeed | null,
+  menu?: MenuState | null
 ): Promise<boolean> {
   if (checkSuperseded && (await checkSuperseded())) {
     console.log("[platform-turn] superseded before persist — state NOT mutated");
     return false;
   }
-  await upsertConversationState(db, businessId, customerId, "idle", {
+  // priorContext is merged (Risk F) so an existing pendingOffer survives a low-signal/greeting
+  // update. Each optional field: undefined ⇒ leave as-is (carry forward), object ⇒ set, null ⇒ clear.
+  const next: Record<string, unknown> = {
     ...priorContext, consecutiveLowSignalTurns: low, consecutiveGreetingTurns: greet,
-  });
+  };
+  if (pending !== undefined) {
+    if (pending === null) delete next.pendingOffer;
+    else next.pendingOffer = pending;
+  }
+  if (lastDegradedAt !== undefined) next.lastDegradedAt = lastDegradedAt;
+  if (failedNeed !== undefined) {
+    if (failedNeed === null) delete next.pendingFailedNeed;
+    else next.pendingFailedNeed = failedNeed;
+  }
+  if (menu !== undefined) {
+    if (menu === null) delete next.menu;            // exit the menu cursor (back to AI-first)
+    else next.menu = menu;                          // enter/advance the menu cursor
+  }
+  await upsertConversationState(db, businessId, customerId, "idle", next);
   return true;
 }
 
@@ -552,11 +1157,108 @@ export async function persistPlatformState(
 // with a booking/service signal is productive, not a greeting.
 const GREETING_META_RE =
   /^(היי+|הי|שלום|הלו+|אהלן|בוקר טוב|ערב טוב|צהריים טובים|מה קורה|מה נשמע|מה המצב|מה חדש|מה איתך|יש תשובה|יש מישהו|אתה שם|את שם|אתם שם|מישהו שם|את פה|אתה פה|אתם פה|למה לא ענית|למה אתה לא עונה|למה את לא עונה|מה קורה פה|מה קורה כאן|מה אתה עושה)(?=\s|$)/;
+/** Collapses 3+ repeated characters to one ("מצבבב"→"מצב", "היייי"→"היי"→"הי"+) so a
+ *  social opener / greeting survives WhatsApp elongation. General — no per-word list. */
+export function collapseElongation(s: string): string {
+  return (s ?? "").replace(/(.)\1{2,}/gu, "$1");
+}
 export function looksLikeGreetingOrMeta(message: string, serviceNames: string[] = []): boolean {
-  const t = (message ?? "").trim().replace(/[?!.…״"'\s]+$/g, "").trim();
+  // Collapse elongation first so "מה המצבבב" / "נשמעעע" still read as social openers
+  // (the live FAQ-contamination bug: "מה המצבבב" fell through to a business-FAQ label).
+  const t = collapseElongation((message ?? "").trim().replace(/[?!.…״"'\s]+$/g, "").trim());
   if (t.length === 0 || t.length > 22) return false; // greetings/meta are short
   if (hasBookingSignal(t, serviceNames)) return false; // productive, not a greeting
+  if (hasPoliteInquiry(t)) return false;               // inquiry opener ("היי אשמח לדעת") outranks greeting
   return GREETING_META_RE.test(t);
+}
+
+// PRESENCE / RECOVERY checks vs warm SOCIAL openers — both are "greetings", but they
+// deserve DIFFERENT handling. A presence check ("אתה פה?", "למה לא ענית?") is the customer
+// probing a silent/stuck line → the deterministic recovery reply is appropriate. A warm
+// social opener ("היי מה קורה") is normal smalltalk → it should feel NATURAL (go to Gemini),
+// not a stiff "system is here" line, unless we're genuinely recovering (quiet/loop/burst).
+const PRESENCE_CHECK_RE =
+  /^(הלו+|יש תשובה|יש מישהו|אתה שם|את שם|אתם שם|מישהו שם|את פה|אתה פה|אתם פה|למה לא ענית|למה אתה לא עונה|למה את לא עונה|מה קורה פה|מה קורה כאן)(?=\s|$)/;
+const SOCIAL_OPENER_RE =
+  /^(היי+|הי|שלום|אהלן|בוקר טוב|ערב טוב|צהריים טובים|מה קורה|מה נשמע|מה המצב|מה חדש|מה איתך|מה הולך|מה אתה עושה|מה העניינים|מה קורה אחי|מה נשמע אחי)(?=\s|$)/;
+/** True for a presence/recovery check ("are you there?", "why no answer?"). */
+export function looksLikePresenceCheck(message: string): boolean {
+  const t = collapseElongation((message ?? "").trim().replace(/[?!.…״"'\s]+$/g, "").trim());
+  if (t.length === 0 || t.length > 22) return false;
+  return PRESENCE_CHECK_RE.test(t);
+}
+/** True for a warm social opener ("hey, what's up") — natural smalltalk, not a presence probe. */
+export function looksLikeSocialOpener(message: string, serviceNames: string[] = []): boolean {
+  const t = collapseElongation((message ?? "").trim().replace(/[?!.…״"'\s]+$/g, "").trim());
+  if (t.length === 0 || t.length > 22) return false;
+  if (hasBookingSignal(t, serviceNames)) return false;
+  if (hasPoliteInquiry(t)) return false;   // "היי אשמח לדעת" is an inquiry opener, not a social hello
+  return SOCIAL_OPENER_RE.test(t);
+}
+
+// ── Degraded-mode / recovery follow-up recognizers ─────────────────────────────
+// After we sent a degraded/overload notice, a short "did it recover?" question
+// ("הסתדר?", "עובד עכשיו?", "עדיין יש עומס?") is a SYSTEM-recovery follow-up — not
+// "how are you?" smalltalk. Detected only WHEN our last reply was degraded, so the
+// context disambiguates; kept general (no single-phrase overfit).
+const DEGRADED_MARKER_RE = /עומס|שיהוק|השתבש|תקלה|אחזור אלי|נסו?\s+שוב\s+עוד\s+רגע|בעוד\s+דקה/;
+// Broad recovery class — "are you back / working / available now?". "זמינ" (available) is
+// included on purpose: it's ambiguous with appointment-availability, but this regex is ONLY
+// consulted AFTER a degraded reply (recentlyDegraded), where it unambiguously means "are you back".
+const RECOVERY_FOLLOWUP_RE =
+  /הסתדר|עובד\s+עכשיו|עכשיו\s+עובד|עובד\??$|זה\s+עבד|חזרת|חזרנו|חזר\s|תקין|נפתר|עדיין\s+(יש\s+)?עומס|עבר\s+ה?עומס|הכל\s+(בסדר|עובד)\s+עכשיו|זמי[נן]|אפשר\s+עכשיו|אפשר\s+להמשיך/;
+// The user REFERENCES / quotes / corrects us about a PRIOR system/overload message ("שאלתי לגבי
+// הזמינות שלך", "כי כתבת שיש עומס", "הנה תראה", "זה מה שאמרת"). After a degraded reply this is an
+// accountability challenge → acknowledge + repair, never deny or blame.
+const ACCOUNTABILITY_RE =
+  /הזמינות\s+שלך|שאלתי\s+(על\s+|לגבי\s+)?ה?זמינות|כי\s+כתבת|כתבת\s+ש?\s*(יש|היה)?\s*עומס|אמרת\s+ש?\s*(יש|היה|לך)?\s*עומס|אמרת\s+ש?יש\s+לך|זה\s+מה\s+ש(אמרת|כתבת)|אמרת\s+(קודם|לפני)|לזה\s+התכוונתי|הנה\s+תראה|תראה\s+מה\s+ש(אמרת|כתבת)/;
+/** True when OUR most recent reply was a degraded/overload/error notice. */
+export function wasDegradedReply(lastAssistant: string | null | undefined): boolean {
+  return !!lastAssistant && DEGRADED_MARKER_RE.test(lastAssistant);
+}
+/** True when ANY of our last few assistant lines were degraded notices — robust to a degraded
+ *  reply being followed by superseded/recovered turns (the last line alone may not be degraded). */
+export function recentlyDegraded(transcript: string, lookback: number = 3): boolean {
+  const lines = (transcript ?? "").split("\n").filter((l) => l.startsWith("Assistant (you, earlier): "));
+  return lines.slice(-lookback).some((l) => DEGRADED_MARKER_RE.test(l));
+}
+/** True when the message asks whether the system recovered (only meaningful after a degraded
+ *  reply — the caller gates on recentlyDegraded). */
+export function isRecoveryFollowup(message: string): boolean {
+  const t = (message ?? "").trim();
+  if (t.length === 0 || t.length > 30) return false;
+  return RECOVERY_FOLLOWUP_RE.test(t);
+}
+/** True when the message references/quotes/corrects us about a prior system message (gated on
+ *  recentlyDegraded by the caller). "הנה תראה" lives here — it's the user pointing at our message. */
+export function isAccountabilityChallenge(message: string): boolean {
+  const t = (message ?? "").trim();
+  if (!t || t.length > 60) return false;
+  return ACCOUNTABILITY_RE.test(t);
+}
+
+// ── DETERMINISTIC CONTINUITY MODE (AI unavailable) — one shared intent classifier ─
+// When Gemini is overloaded/cooling down we cannot understand free text, so the degraded path
+// must NOT guess. It follows an EXPLICIT priority, identical in the pre-call cooldown path and
+// the in-call 503 path (no separate ad-hoc branches): system frame first, then an EXPLICIT
+// appointment operation, else a neutral continuity menu. Crucially it NEVER uses the loose
+// booking SIGNAL ("זמינות"/service words) to attach a link — only an explicit operation verb —
+// so a mixed FAQ/meta/recovery burst can never be misframed as a booking (the live degraded+booking bug).
+export type DegradedIntent = "accountability" | "recovery" | "booking" | "manage" | "menu";
+// No serviceNames param BY DESIGN — the degraded path must NEVER infer booking from a service
+// word; only an explicit operation verb attaches a link.
+export function classifyDegradedIntent(messageText: string): DegradedIntent {
+  const latest = latestFragment(messageText);
+  const either = (fn: (s: string) => boolean): boolean => fn(latest) || fn(messageText);
+  // 1) The customer is asking/repairing about OUR overload — answer in the system frame.
+  if (either(isAccountabilityChallenge)) return "accountability";
+  if (either(isRecoveryFollowup)) return "recovery";
+  // 2) EXPLICIT appointment operation only (never the ambiguous "זמינות"/hasBookingSignal).
+  const op = inferOperation(latest) ?? inferOperation(messageText);
+  if (op === "BOOK") return "booking";
+  if (op === "CANCEL" || op === "RESCHEDULE" || op === "LIST" || either(isManageHelpTopic)) return "manage";
+  // 3) FAQ / mixed / meta / unknown → neutral continuity menu (NO link).
+  return "menu";
 }
 
 // ── Cheap LOCAL low-signal detector (no Gemini) ────────────────────────────────
@@ -634,14 +1336,165 @@ export type LowSignalKind = "gibberish" | "emoji" | "unclear" | "smalltalk" | "m
 
 /** Fine-grained kind for logging + counting. gibberish/unclear push toward quiet
  *  mode; smalltalk/meta/productive do not. */
-export function lowSignalKind(d: ReceptionistDecision, message: string, serviceNames: string[] = []): LowSignalKind {
+// ── CUSTOMER SAFETY: good-faith signal classifier (Platform Safety Contract v1) ──
+// ONE typed classifier instead of scattered ad-hoc detectors: given the customer's
+// LATEST message, name the good-faith category it carries. A turn with ANY good-faith
+// signal is PRODUCTIVE and must NEVER be suppressed/escalated as spam — even when the
+// model mislabeled it `unclear`. Live failures this fixes: a price question and "the
+// first one" answers escalated toward quiet/boundary; a help request after the bot
+// offered help became a cold boundary; "אוקיי בוא נקבע" after noise was silently
+// swallowed by quiet mode (no reply at all).
+
+// Price/cost FAQ signal.
+const FAQ_PRICE_RE = /כמה.{0,8}(עולה|יעלה|עולים|מחיר|עלות)|מה\s+ה?(מחיר|עלות|מחירים)|בכמה|(?:^|[\s,])ה?(מחיר|עלות|מחירון)(?=$|[\s,.!?])/;
+/** True when the message is (most likely) a business price/cost QUESTION. */
+export function hasFaqSignal(message: string): boolean {
+  return FAQ_PRICE_RE.test((message ?? "").trim());
+}
+
+// Short ORDINAL / referential follow-up ("הראשון", "השני מביניהם", typo "הראשו7").
+// "השני" (with ה) is required so "יום שני" (Monday) does not false-match.
+const REFERENCE_RE = /ראשו[ןנ7]|ראשונה|שנייה|שניה|השני(?=$|[\s,.!?])|שליש|רביעי|חמישי|שישי|אחרונה|אחרון|אמצע|מביניהם|מבניהם|ביניהם|מהם/;
+/** True for a short ordinal/referential answer (refers to a prior listed option). */
+export function looksLikeContextualReference(message: string): boolean {
+  const t = (message ?? "").trim();
+  if (!t || t.length > 30) return false; // referential follow-ups are short
+  return REFERENCE_RE.test(t);
+}
+
+// HELP / link-trouble / conversation-repair ("צריך עזרה", "איך אני מבטל", "לא נפתח",
+// "מסתבך עם הקישור", "אמרת שתעזור"). The customer is asking for help in good faith.
+const HELP_RE = /צריך\s+עזרה|רוצה\s+עזרה|אפשר\s+עזרה|תעזור|תעזרי|עזור\s+לי|עזרי\s+לי|איך\s+(אני\s+)?(מבטל|מבטלים|מזיז|מזיזים|משנה|משנים|קובע|קובעים|מזמין|לבטל|לשנות|לקבוע|להזיז)|איך\s+(זה\s+)?עובד|איפה\s+(לוחצים|ללחוץ|הקישור|הלינק)|לא\s+(נפתח|עובד|מצליח|הצלחתי|עובדת|רואה)|מסתבך|לא\s+מבין(\s+איך|\s+אותי)?|שלחת\s+(לי\s+)?שוב|אותו\s+(דבר|קישור|לינק)|אמרת\s+ש|זה\s+לא\s+מה\s+ששאלתי|אתה\s+לא\s+מבין|למה\s+(אתה|את)\s+לא\s+(עונה|ענית|עונים)|אני\s+לא\s+מצליח|לא\s+רואה\s+(את\s+)?ה?כפתור/;
+/** True when the message asks for help, reports a link problem, or repairs/expresses
+ *  frustration about the conversation ("אמרת שתעזור", "אתה לא מבין", "למה לא ענית"). */
+export function hasHelpSignal(message: string): boolean {
+  return HELP_RE.test((message ?? "").trim());
+}
+
+// Colloquial booking IMPERATIVES the operation-verb list (routing.ts) doesn't cover
+// ("בוא נקבע", "תקבע לי", "נסגור תור"). Used only for the good-faith ACTION category.
+const BOOKING_IMPERATIVE_RE = /בוא\s+נקבע|בוא\s+נסגור|בוא\s+נזמין|בוא\s+נתאם|נקבע\s+תור|נסגור\s+תור|תקבע(י)?\s+לי|קבע(י)?\s+לי|רוצה\s+לסגור\s+תור/;
+
+const QUESTION_WORD_RE = /^(כמה|מה|האם|למה|מדוע|איך|כיצד|איפה|היכן|מתי|אילו|איז[הו])(\s|$|[?？])/;
+/** A question (has '?' or opens with a question word) — keeps a QUESTION about an
+ *  operation ("כמה עולה לבטל?") OUT of the imperative ACTION category. */
+export function isQuestionLike(message: string): boolean {
+  const t = (message ?? "").trim();
+  return /[?？]/.test(t) || QUESTION_WORD_RE.test(t);
+}
+
+// Business-FAQ openers that don't need a "?" ("יש חניה", "מקבלים ביט", "אתם פתוחים
+// היום", "אפשר לשלם", "מה כולל השירות"). Business-agnostic — generic question shapes.
+const FAQ_OPENER_RE = /^(אפשר|מקבלים|מקבל|אתם|פתוחים|פתוח|האם)(\s|$|[?？])|^(יש|מה|כמה|מתי|איפה|כיצד)(\s|[?？])/;
+// Polite / fragmented business-inquiry openers ("אשמח לדעת אם…", "רציתי לשאול אם…",
+// "אפשר לדעת איפה…") — a productive FAQ even when split across WhatsApp messages and the LAST
+// fragment alone looks incomplete ("אם יש איפה לשבת"). General class, not a per-question list.
+const POLITE_INQUIRY_RE =
+  /אשמח\s+(לדעת|לשמוע|לברר|לשאול)|רצית[יה]\s+(לשאול|לדעת|לברר)|אפשר\s+(לדעת|לשאול|לברר)|רוצה\s+(לדעת|לשאול|לברר)|תהית[יי]|מעניין\s+אותי|השאלה\s+(שלי\s+)?היא|שאלה\s+קצרה/;
+/** True for a polite/indirect business inquiry opener (often the first fragment of a split FAQ). */
+export function hasPoliteInquiry(message: string): boolean {
+  return POLITE_INQUIRY_RE.test((message ?? "").trim());
+}
+/** A genuine multi-word business QUESTION (not a bare meta "מה?", not gibberish) — a
+ *  productive FAQ even when the model can't answer it or mislabels it `unclear`. */
+export function isGenuineQuestion(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (t.length < 4 || !/\s/.test(t)) return false;          // multi-word only
+  if (!isQuestionLike(t) && !FAQ_OPENER_RE.test(t)) return false; // a question OR a FAQ opener
+  if (META_ONLY_RE.test(t)) return false;                   // bare meta is handled separately
+  if (looksLikeGreetingOrMeta(t, serviceNames)) return false; // social opener ("מה המצב"), not a business Q
+  if (looksLikeNoise(t, serviceNames)) return false;        // not gibberish
+  return true;
+}
+
+// ── SOFT SERVICE INTENT (Customer Safety Contract v1 — soft intent) ──────────────
+// Indirect "I'm considering a service / coming in" messages that carry NO explicit
+// booking verb and NO literal service-name match — so the verb/noun booking-signal
+// misses them and the model often can't name a clean operation ("חשבתי על להסתפר,
+// יש לי טיסה ליוון..."). Business-AGNOSTIC by construction: a generic DESIRE /
+// consideration cue PLUS a service/visit/event CONTEXT cue. NEVER industry verbs.
+// BOTH are required, so a desire with no service context ("חשבתי שאתם יקרים") is NOT
+// soft intent. Works the same for a haircut, a Pilates class, a physio session, a facial.
+// NOTE: Hebrew final forms — masc "צריך"/"מתכנן"/"מעוניין" end in a FINAL letter (ך/ן),
+// so the stems must allow both the regular and final glyph ([כך]/[נן]) or they silently
+// miss the masculine ("אני צריך" was the live eval miss).
+const SOFT_DESIRE_RE =
+  /חשבתי\s+(על|ל|לבוא|לקפוץ)|בא\s+לי|מתחשק\s+לי|מעוניי[נן]|הייתי\s+רוצ|רוצה\s+ל|אני\s+צרי[כך]|מתלבט|מתכנ[נן]|שוקל(ת)?|אשמח\s+ל|נראה\s+לי\s+ש?אני/;
+const SOFT_CONTEXT_RE =
+  /לפני\s+ה|יש\s+לי\s+(אירוע|חתונה|טיסה|חג|משחק|פגישה|ראיון|תאריך|בר\s*מצווה)|השבוע|השבת|עוד\s+מעט|בקרוב|לבוא\s+אליכם|להגיע\s+אליכם|לבוא\s+אצלכם|לקפוץ\s+אליכם/;
+/**
+ * True for an INDIRECT service/booking-intent message: a desire/consideration cue PLUS
+ * a service/visit/event context (a generic service noun / configured service name /
+ * booking verb via hasBookingSignal, OR an event/visit cue). Both required → narrow.
+ * Business-agnostic; never keys on industry-specific verbs.
+ */
+export function hasSoftServiceIntent(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (!t || !SOFT_DESIRE_RE.test(t)) return false;
+  return hasBookingSignal(t, serviceNames) || SOFT_CONTEXT_RE.test(t);
+}
+
+export type GoodFaithSignal = "action" | "help" | "presence" | "soft_intent" | "faq" | "contextual_ref" | "none";
+
+/**
+ * THE good-faith classifier (Customer Safety Contract v1). Operates on the customer's
+ * LATEST message. Returns the highest-priority good-faith category, in contract order:
+ *   action > help > presence > faq > contextual_ref > none.
+ * Any non-"none" result means the turn is good-faith and must NOT be suppressed.
+ */
+export function classifyGoodFaithSignal(message: string, opts: { serviceNames?: string[] } = {}): GoodFaithSignal {
+  const t = (message ?? "").trim();
+  if (!t) return "none";
+  const serviceNames = opts.serviceNames ?? [];
+  // 1) explicit action INTENT (imperative) — but never a QUESTION about an operation.
+  if (!isQuestionLike(t) && (messageOperation(t) !== null || BOOKING_IMPERATIVE_RE.test(t))) return "action";
+  // 2) help / link-trouble / conversation-repair.
+  if (hasHelpSignal(t)) return "help";
+  // 3) presence / "are you there?".
+  if (looksLikeGreetingOrMeta(t, serviceNames)) return "presence";
+  // 4) soft service/booking intent — indirect "considering a service / coming in".
+  //    Ranked ABOVE faq so "חשבתי להסתפר... מה כדאי?" is soft intent, not a generic FAQ.
+  if (hasSoftServiceIntent(t, serviceNames)) return "soft_intent";
+  // 5) productive business question (price, any genuine multi-word question, OR a polite
+  //    inquiry opener like "אשמח לדעת אם…" — which may arrive split across messages).
+  if (hasFaqSignal(t) || isGenuineQuestion(t, serviceNames) || hasPoliteInquiry(t)) return "faq";
+  // 6) short ordinal/contextual reference to a prior listed option.
+  if (looksLikeContextualReference(t)) return "contextual_ref";
+  return "none";
+}
+
+/** The customer's LATEST message inside an aggregated burst ("frag1\nfrag2\n…") — the
+ *  latest actionable/help/FAQ line must win over earlier noise (Contract: latest wins). */
+export function latestFragment(message: string): string {
+  const frags = (message ?? "").split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  return frags.length > 0 ? frags[frags.length - 1] : (message ?? "").trim();
+}
+
+export function lowSignalKind(
+  d: ReceptionistDecision, message: string, serviceNames: string[] = [], latestSignal?: GoodFaithSignal
+): LowSignalKind {
   if (!d.ok || !d.turn) return "unclear";
   const u = d.turn.understanding;
+  const latest = latestFragment(message);
   if (u.intent === "faq") return "productive";
   if (claimsOperation(u)) return "productive";          // evidence gate already ran upstream
-  if (looksLikeNoise(message, serviceNames)) return "gibberish";
+  // Gibberish wins over a model smalltalk/meta MISLABEL ("חבצב" labeled smalltalk is
+  // still noise) — checked on the LATEST fragment so a burst's last line decides.
+  if (looksLikeNoise(latest, serviceNames)) return "gibberish";
+  // Respect the model's conversational labels: a greeting/smalltalk/meta is not spam and
+  // must keep feeding the greeting-loop counter (never flattened to "productive").
   if (u.intent === "smalltalk") return "smalltalk";
   if (u.intent === "meta") return "meta";
+  // Only `unclear` / `out_of_scope` remain → rescue a good-faith signal the model
+  // MISLABELED. SINGLE SOURCE OF TRUTH: prefer the caller's already-RESOLVED latestSignal
+  // (which folds in bare-affirmation context + soft intent), so the low-signal counter can
+  // NEVER disagree with the main flow's classification — the live "כן" contradiction, where
+  // latestSignal=contextual_ref but this returned unclear and escalated to a boundary line.
+  const sig = latestSignal ?? classifyGoodFaithSignal(latest, { serviceNames });
+  if (sig !== "none") return "productive";
+  // Fragmented/polite inquiry: the AGGREGATE may be a clear business question even when the
+  // LAST fragment alone is incomplete ("אשמח לדעת" / "אם יש איפה לשבת"). Rescue on the whole msg.
+  if (classifyGoodFaithSignal(message, { serviceNames }) !== "none") return "productive";
   return "unclear";
 }
 
@@ -649,6 +1502,108 @@ export function lowSignalKind(d: ReceptionistDecision, message: string, serviceN
 export function countsTowardQuiet(kind: LowSignalKind): boolean {
   return kind === "gibberish" || kind === "unclear";
 }
+
+// ── CUSTOMER SAFETY: trajectory, operation inference & TRUTH-SAFE manage/help ─────
+// These power the link/help TRAJECTORY of the Safety Contract: a help / manage request
+// (or one the model missed) gets the RIGHT link plus guidance that matches the ACTUAL
+// pages — /appointment/[id] (one appointment: buttons "שינוי מועד" / "ביטול התור") and
+// /appointments/[token] (a list: pick one → its page). Nothing here claims an action
+// happened in chat; the website performs it.
+
+const CANCEL_HELP_RE = /לבטל|ביטול|מבטל|לבטול/;
+const RESCHEDULE_HELP_RE = /להזיז|מזיז|לשנות|משנה|מזיזים|לדחות|להקדים|לעדכן|מחדש/;
+const LIST_HELP_RE = /התורים\s+שלי|לראות\s+(את\s+)?ה?תור|רשימת\s+ה?תור/;
+
+/** The appointment operation a message is about (imperative OR colloquial help form),
+ *  or null. Keeps messageOperation()'s precedence (RESCHEDULE>CANCEL>LIST>BOOK). */
+export function inferOperation(message: string): "BOOK" | "CANCEL" | "RESCHEDULE" | "LIST" | null {
+  const t = (message ?? "").trim();
+  const mo = messageOperation(t);
+  if (mo && mo !== "NONE") return mo;
+  if (RESCHEDULE_HELP_RE.test(t)) return "RESCHEDULE";
+  if (CANCEL_HELP_RE.test(t)) return "CANCEL";
+  if (LIST_HELP_RE.test(t)) return "LIST";
+  if (BOOKING_IMPERATIVE_RE.test(t)) return "BOOK";
+  return null;
+}
+
+const MANAGE_TOPIC_RE = /לבטל|ביטול|מבטל|לבטול|להזיז|מזיז|לשנות|משנה|לדחות|מחדש|התורים\s+שלי|לנהל|הקישור|הלינק|נפתח|לוחצים|כפתור|מסתבך/;
+/** True when the message references cancel / reschedule / list / link-help / manage. */
+export function isManageHelpTopic(message: string): boolean {
+  return MANAGE_TOPIC_RE.test((message ?? "").trim());
+}
+
+const BARE_AFFIRMATION_RE = /^(כן|כן\s+בבקשה|כן\s+תודה|כן\s+כן|כן\s+אני\s+רוצה|כן\s+בטח|כן\s+תשלח|אוקיי|אוקי|בטח|סבבה|נכון|בהחלט|יאללה|קדימה|זורם|אפשר|בוא|תשלח|תשלחי|שלח|שלחי)$/;
+/** A bare "yes" with no content of its own — its meaning comes from the prior turn. */
+export function isBareAffirmation(message: string): boolean {
+  const t = (message ?? "").trim().replace(/[!?.…\s]+$/g, "");
+  return BARE_AFFIRMATION_RE.test(t);
+}
+
+// ── LAST-ASSISTANT CONTRACT (derived from transcript — no new stored state) ───────
+// What did our most recent reply actually DO? Used to interpret terse follow-ups
+// ("כן") and to detect a topic switch. Derived from the last assistant line.
+export interface LastAssistantContract {
+  sentBookingLink: boolean;
+  sentManageLink: boolean;
+  offeredHelp: boolean;
+  offeredBooking: boolean;
+  askedQuestion: boolean;
+}
+const HELP_OFFER_RE = /אם\s+תצטרך\s+עזרה|אם\s+צריך\s+עזרה|במה\s+אוכל\s+לעזור|במה\s+אפשר\s+לעזור|תגיד\s+לי\s+ואשלח|אשמח\s+לעזור|רק\s+תגיד|אני\s+כאן\s+לכל\s+שאלה|אם\s+משהו\s+לא\s+ברור/;
+const ASKED_WHICH_RE = /איזה\s+תור|מה\s+מעניין|מה\s+תרצ|לאיזה|איזה\s+שירות/;
+// Did OUR last reply offer to book / propose scheduling? Lets a terse "כן" that follows
+// be resolved into a booking confirmation (→ booking link), distinct from a help offer.
+const BOOKING_OFFER_RE = /לקבוע|לקבע|קביעת|זמינות|תור\s+חדש|רוצה\s+ש?(אקבע|אבדוק|אסדר|אזמין|נתאם|נקבע|נסגור|אתאם)|שאקבע\s+לך|לבדוק\s+לך|נקבע\s+לך|אבדוק\s+לך|אסדר\s+לך|אזמין\s+לך|נתאם\s+לך|אתאם\s+לך|נסגור\s+לך\s+תור/;
+export function deriveLastAssistantContract(transcript: string): LastAssistantContract {
+  const last = lastAssistantLine(transcript) ?? "";
+  return {
+    sentBookingLink: /\/book\//.test(last),
+    sentManageLink: /\/appointment/.test(last), // matches /appointment/ and /appointments/
+    offeredHelp: HELP_OFFER_RE.test(last),
+    offeredBooking: BOOKING_OFFER_RE.test(last),
+    askedQuestion: last.includes("?") || ASKED_WHICH_RE.test(last),
+  };
+}
+
+interface ManageLink { url: string; label: string; kind: PlatformLink; }
+/** Picks the manage link sized by REAL upcoming count (never the model): 0 → booking,
+ *  1 → that appointment's page, 2+ → the My-Appointments list. */
+function manageLinkFor(
+  upcoming: Array<{ id: string }>, slug: string, customerPhone: string, customerId: string
+): ManageLink {
+  if (upcoming.length === 0) return { url: buildBookingLink(slug, customerPhone), label: BOOK_LINE, kind: "booking" };
+  if (upcoming.length === 1) return { url: buildAppointmentLink(upcoming[0].id), label: MANAGE_LINE, kind: "manage" };
+  return { url: buildMyAppointmentsLink(customerId), label: MY_APPTS_LINE, kind: "manage" };
+}
+
+/**
+ * TRUTH-SAFE manage/help text — describes ONLY what the real pages do (the two buttons
+ * "שינוי מועד" / "ביטול התור" on /appointment/[id]; pick-from-list on /appointments).
+ * Never claims the action happened in chat. `op` tailors the steps; null = generic help.
+ */
+export function buildManageHelpReply(upcomingCount: number, op: "BOOK" | "CANCEL" | "RESCHEDULE" | "LIST" | null): string {
+  if (upcomingCount === 0) {
+    return "אני לא רואה תור פעיל על המספר הזה כרגע 🙂 אם בא לך לקבוע תור חדש, אפשר דרך הקישור.";
+  }
+  if (upcomingCount === 1) {
+    if (op === "CANCEL") return "כדי לבטל את התור: נכנסים לקישור, ושם יש כפתור *ביטול התור* — לוחצים עליו ומאשרים. הביטול מתבצע בעמוד, לא כאן בצ׳אט.";
+    if (op === "RESCHEDULE") return "כדי לשנות מועד: נכנסים לקישור, לוחצים *שינוי מועד*, ובוחרים יום ושעה חדשים.";
+    return "בקישור רואים את התור שלך, עם כפתורים ל*שינוי מועד* ול*ביטול התור*.";
+  }
+  if (op === "CANCEL") return "כדי לבטל: נכנסים לקישור, בוחרים את התור מהרשימה, ואז לוחצים *ביטול התור* ומאשרים.";
+  if (op === "RESCHEDULE") return "כדי לשנות מועד: נכנסים לקישור, בוחרים את התור מהרשימה, ולוחצים *שינוי מועד* כדי לבחור יום ושעה.";
+  return "בקישור רואים את כל התורים הקרובים — בוחרים תור, ואז אפשר *לשנות מועד* או *לבטל*.";
+}
+
+// ── STALE-TOPIC guard ────────────────────────────────────────────────────────────
+const STALE_MANAGE_RE = /לבטל\s+את\s+ה?תור|ביטול\s+ה?תור|לגבי\s+ה?ביטול|הקישור\s+ש?שלחתי|לניהול\s+ה?תור|לשנות\s+את\s+ה?תור/;
+/** True when a reply continues a cancellation/manage/link thread — used ONLY when the
+ *  customer's LATEST message is a NEW non-manage business question (latest wins). */
+export function replyLooksStaleManage(reply: string): boolean {
+  return STALE_MANAGE_RE.test(reply ?? "");
+}
+export const STALE_TOPIC_PIVOT = "רגע, אני רוצה לענות בדיוק על מה ששאלת 🙂 אפשר לכתוב לי שוב את השאלה במשפט קצר?";
 
 export type PreGeminiAction = "skip_gemini_gibberish" | "cheap_reset_reply" | "proceed_to_gemini";
 
@@ -675,10 +1630,19 @@ export function preGeminiAction(
   // Greeting/meta — single message OR the recovery tail of an aggregated burst.
   const frags = (message ?? "").split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
   const last = frags.length > 0 ? frags[frags.length - 1] : (message ?? "").trim();
-  if (looksLikeGreetingOrMeta(last, serviceNames)) {
+  const isPresence = looksLikePresenceCheck(last);
+  const isSocial = looksLikeSocialOpener(last, serviceNames);
+  if (isPresence || isSocial) {
     const earlierAllNoise = frags.length > 1 &&
       frags.slice(0, -1).every((f) => looksLikeNoise(f, serviceNames) || looksLikeGreetingOrMeta(f, serviceNames));
-    if (prevLowSignal >= 1 || earlierAllNoise || prevGreeting >= GREETING_DETERMINISTIC_AT) {
+    // PRESENCE/recovery check → deterministic recovery on ANY recovery context (the customer
+    // is probing a silent line). A WARM social opener is gentler: it only short-circuits on a
+    // genuine greeting LOOP (cost cap), active quiet mode, or a noise-burst recovery tail —
+    // NOT on mere residual low-signal, so "היי מה קורה" feels natural (the live stiff-reset bug).
+    if (isPresence && (prevLowSignal >= 1 || earlierAllNoise || prevGreeting >= GREETING_DETERMINISTIC_AT)) {
+      return "cheap_reset_reply";
+    }
+    if (isSocial && (earlierAllNoise || prevGreeting >= GREETING_DETERMINISTIC_AT || prevLowSignal >= 3)) {
       return "cheap_reset_reply";
     }
   }
@@ -899,6 +1863,10 @@ const SCHEDULING_Q = new RegExp(
     "באיז[הו]\\s+(תאריך|שעה|שירות|יום|תור)",
     "לאיז[הו]\\s+(שעה|תאריך|יום|שירות|תור)",
     "איז[הו]\\s+\\S{1,12}\\s+(את|אתה)\\s+(רוצ|מעוניינ|תרצ)",
+    // Soft preference-collection — the PAGE collects service/day/time, so the chat must
+    // not (live: "יש לך העדפה לגבי יום או שעה...?" slipped through the scheduling fence).
+    "יש\\s+לך\\s+העדפ",
+    "העדפ\\S*\\s+(לגבי\\s+)?(יום|שעה|תאריך|מועד|שירות|טיפול)",
     // English forms — the model occasionally answers in English on thin context.
     "\\bwhich\\s+(appointment|service|one|day|time|date)",
     "\\bwhat\\s+(date|time|service)\\b",
@@ -932,6 +1900,52 @@ export function defuseSchedulingQuestion(
     .split(/(?<=[.!?])\s+|\n+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && !SCHEDULING_Q.test(s) && !s.includes("?") && !s.includes("？"))
+    .join(" ")
+    .trim();
+  const text = warmth.length >= 8 ? `${warmth} ${bridge}` : `בטח! ${bridge}`;
+  return { text, defused: true };
+}
+
+// ── CAPABILITY-PROMISE fence (platform mode) ───────────────────────────────────
+// Beyond explicit scheduling QUESTIONS, the model sometimes PROMISES an in-chat
+// booking/availability flow it cannot run in platform mode ("אני אבדוק לך זמינות",
+// "אני יכול לקבוע לך", "רק כדי לוודא, אתה רוצה תור?"). The website performs scheduling,
+// so these promises are unsupported. This catches them ANYWHERE (not only inside the
+// link branches — the live miss was on a route=NONE turn) and bridges to link-first,
+// keeping the model's non-promise warmth (same shape as defuseSchedulingQuestion).
+const CAPABILITY_PROMISE_RE = new RegExp(
+  [
+    "א?בדוק\\s+(לך\\s+)?(את\\s+ה)?זמינות",
+    "לבדוק\\s+(לך\\s+)?(את\\s+ה)?זמינות",
+    "(אני\\s+)?יכול(ה)?\\s+לקבוע\\s+לך",
+    "אקבע\\s+לך",
+    "אסדר\\s+לך\\s+(את\\s+ה)?תור",
+    "אזמין\\s+לך\\s+תור",
+    // "we/I will schedule for you" OFFER class — implies in-chat scheduling. Platform-unsafe
+    // wording even though it's phrased as a friendly offer (the live "רוצה שנתאם לך תור?").
+    "נתאם\\s+לך",
+    "אתאם\\s+לך",
+    "נקבע\\s+לך",
+    "נסגור\\s+לך\\s+תור",
+    "רוצה\\s+ש(אקבע|אבדוק|אסדר|אזמין|נתאם|נקבע|נסגור|אתאם)",
+    "רק\\s+כדי\\s+לוודא[^?]{0,24}רוצה\\s+ת",
+  ].join("|")
+);
+/** True when the reply PROMISES an unsupported in-chat booking/availability flow. */
+export function mentionsCapabilityPromise(reply: string): boolean {
+  return CAPABILITY_PROMISE_RE.test(reply ?? "");
+}
+/** Neutralizes an unsupported in-chat capability promise → a link-first bridge, keeping
+ *  the model's non-promise warmth. No-op when no promise is present (good replies untouched). */
+export function defuseCapabilityPromise(
+  reply: string, opts: { bridge?: string } = {}
+): { text: string; defused: boolean } {
+  if (!mentionsCapabilityPromise(reply)) return { text: reply, defused: false };
+  const bridge = opts.bridge ?? FENCE_BRIDGE_BOOK;
+  const warmth = (reply ?? "")
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !CAPABILITY_PROMISE_RE.test(s) && !SCHEDULING_Q.test(s) && !s.includes("?") && !s.includes("？"))
     .join(" ")
     .trim();
   const text = warmth.length >= 8 ? `${warmth} ${bridge}` : `בטח! ${bridge}`;
@@ -1016,7 +2030,19 @@ export interface TurnTrace {
   greetingAfter: number;
   replySource: string;    // gemini | fallback
   memLines: number;
+  latestSignal: GoodFaithSignal;    // good-faith category of the customer's LATEST message
+  aggregateSignal: GoodFaithSignal; // signal of the FULL aggregate (vs the latest fragment)
+  lastAssistant: string;            // prior-reply contract flags: B(ooking)/M(anage)/H(elp)/Q(uestion)
+  staleTopicGuard: boolean;         // true ⇒ a stale manage thread was overridden by the latest topic
+  softIntent: boolean;              // true ⇒ latest message classified as indirect service intent
+  contextualConfirmation: boolean;  // true ⇒ a bare "כן" resolved via the last-assistant booking contract
+  capabilityFence: boolean;         // true ⇒ an unsupported in-chat promise was redirected/neutralized
+  recoveryFollowup: boolean;        // true ⇒ a "did it recover?" question after a degraded reply
+  pendingResolved: boolean;         // true ⇒ a bare affirmation resolved a still-valid pending offer
+  coldYes: boolean;                 // true ⇒ a bare affirmation with NO context → safe clarification
+  customerVisible: boolean;         // false ⇒ this turn sent the customer nothing (silence)
   action: string;         // short human summary, e.g. "reply+booking" / "suppressed"
+  interactivePayloadId?: string;    // stable id when this turn was a TAP on a clickable option
 }
 
 function logTurnTrace(t: TurnTrace): void {

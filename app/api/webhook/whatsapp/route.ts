@@ -11,6 +11,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { handleIncomingMessage } from "@/lib/message-handler";
+import { extractInboundMessage } from "@/lib/whatsapp";
 
 // ── GET: Meta webhook verification ──────────────────────────────────────────
 
@@ -96,15 +97,19 @@ async function processPayload(body: unknown, businessId: string): Promise<void> 
       }
 
       for (const msg of change.value?.messages ?? []) {
-        if (msg.type !== "text" || !msg.text?.body) continue;
+        // Accept plain text AND interactive replies (a TAP on a button/list row). The pure
+        // parser normalizes both into { text, payloadId? }; unsupported types return null.
+        const parsed = extractInboundMessage(msg);
+        if (!parsed) continue;
 
         await handleIncomingMessage({
           businessId,
           fromPhone:   msg.from,
-          messageText: msg.text.body,
+          messageText: parsed.text,
           waMessageId: msg.id,
           waTimestamp: msg.timestamp ?? null,
           rawPayload:  body,
+          interactivePayloadId: parsed.payloadId,
         });
       }
     }
