@@ -939,6 +939,34 @@ function main(): void {
   gap("notification SEND path (cancel/reschedule) is an integration path",
     "The pure message builders + dedupe predicates are unit-asserted here. The actual send (sendOutbound after a successful conditional DB update; cancel deduped by the .select('id') rowcount, reschedule by rescheduleChanged) lives in lib/booking/platform.ts and needs a live DB + WhatsApp. It reuses the exact fail-open booking-confirmation pattern; a manual manage-page test is the full assertion.");
 
+  // ── 13. Mode boundaries — model-blocked stays AI-first; outage enters via MAIN menu ──
+  // Axis B: a single blocked/empty/RECITATION/parse response in HEALTHY AI mode is a per-turn glitch,
+  // NOT a no-AI state → soft AI fallback, never the deterministic menu. Axis C: a provider-outage
+  // ENTRY anchors to the MAIN menu (book/manage/FAQ), VISIBLY — not the FAQ submenu, not silence.
+  section("13. ai_error stays AI-first (Axis B) + provider-outage enters via MAIN menu (Axis C)");
+  // Axis B — the gate is INACTIVE in healthy AI mode, which is exactly the condition that routes a
+  // model blocked/empty/RECITATION (branch=ai_error) to a soft fallback instead of the menu.
+  check("Axis B: healthy AI mode → deterministic gate INACTIVE (ai_error → soft fallback, not menu)",
+    isDeterministicMenuActive({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false }) === false);
+  check("Axis B: a genuine no-AI state (no key) keeps the gate ACTIVE (severe failure CAN use the menu)",
+    isDeterministicMenuActive({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: false }) === true);
+  // Axis C — the outage ENTRY message is the MAIN menu (clickable buttons), NOT the FAQ submenu (list).
+  check("Axis C: provider_outage MAIN-menu entry is clickable buttons (book/manage/faq), not a FAQ list",
+    (() => {
+      const main = buildInteractiveMainMenu(FACTS, "provider_outage");
+      return main.kind === "buttons"
+        && main.buttons.some((b) => b.id === MENU_PAYLOAD.book)
+        && main.buttons.some((b) => b.id === MENU_PAYLOAD.manage)
+        && main.buttons.some((b) => b.id === MENU_PAYLOAD.faq);
+    })());
+  check("Axis C: the outage main-menu entry is VISIBLE (non-empty text + interactive) and notes the limit",
+    buildMainMenu(FACTS, "provider_outage").length > 0
+    && /מוגבל|עומס/.test(buildInteractiveMainMenu(FACTS, "provider_outage").body));
+  check("Axis C: the FAQ submenu (the thing NOT shown on entry) is a list — distinct from the main menu",
+    buildInteractiveFaqMenu(FACTS).kind === "list" && buildInteractiveMainMenu(FACTS, "provider_outage").kind === "buttons");
+  gap("Axis B/C entry routing is integration-wired in runPlatformTurn/runContinuity",
+    "The unit pieces are asserted here (the gate's healthy-mode value; the main-menu vs submenu builders + outage wording). The actual routing — ai_error→soft-fallback when the gate is inactive, and provider_outage 'outage_entry' anchoring to the main menu (bypassing the vague rate-limit, set cursor, then rate-limit follow-ups) — lives in runPlatformTurn/runContinuity and needs a live DB + provider state. A live RECITATION + a real 503-storm entry are the full assertions.");
+
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
   console.log("(GAP lines are intentional known limitations, not failures — they scope the next reliability work.)");

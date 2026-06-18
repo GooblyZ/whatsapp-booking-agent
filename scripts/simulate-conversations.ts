@@ -2062,6 +2062,34 @@ async function main() {
         ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 58: mode boundaries — ai_error stays AI-first; outage enters via MAIN menu (BUG-024) ================");
+  // Live bugs: (B) 'כמה אנשים יש בכדור הארץ?' → Gemini RECITATION/empty → ai_error → opened the FAQ
+  // submenu in HEALTHY AI mode (wrong). (C) provider_outage entry was suppressed (silence) and opened
+  // the FAQ submenu instead of the main menu. Pure (no Gemini/Meta network).
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const cm = await import("../lib/ai/continuity-menu");
+    const facts = {
+      businessName: "סטודיו פלואו", phone: "03-1234567",
+      location: { address: "הרצל 10", city: "תל אביב" }, timezone: "Asia/Jerusalem", bookingEnabled: true,
+      hours: [{ day: "ראשון", closed: false, opens: "09:00", closes: "18:00" }],
+      services: [{ name: "שיעור יוגה", durationMin: 60, price: 70, description: null }], knowledge: [],
+    };
+    console.log("  [pure] Axis B: healthy AI mode → deterministic gate inactive (ai_error → soft fallback, NOT menu):",
+      pt.isDeterministicMenuActive({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false }) === false
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] Axis C: provider_outage entry is the MAIN menu (book/manage/faq buttons), not the FAQ list:",
+      (() => {
+        const main = cm.buildInteractiveMainMenu(facts, "provider_outage");
+        return main.kind === "buttons" &&
+          main.buttons.some((b) => b.id === cm.MENU_PAYLOAD.book) &&
+          main.buttons.some((b) => b.id === cm.MENU_PAYLOAD.faq) &&
+          /מוגבל|עומס/.test(main.body) &&
+          cm.buildInteractiveFaqMenu(facts).kind === "list";
+      })()
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
   console.log("\nDONE.");
 }
 

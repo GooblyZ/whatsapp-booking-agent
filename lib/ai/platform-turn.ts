@@ -28,7 +28,7 @@ import { beginTurn, isCurrentTurn } from "./turn-registry";
 import { buildFacts, type BusinessFacts } from "./facts";
 import {
   planContinuityMenu, resolveMenuNavigation, resolveMenuPayload, readMenuState,
-  buildInteractiveForNav, ctaBody, type MenuState, type MenuNav,
+  buildInteractiveForNav, buildMainMenu, buildInteractiveMainMenu, ctaBody, type MenuState, type MenuNav,
 } from "./continuity-menu";
 import type { WhatsAppInteractive } from "@/lib/whatsapp";
 
@@ -358,6 +358,10 @@ export async function runPlatformTurn(
     const emojiNone = ctx.aiSettings?.emoji_usage === "none";
     const degIntent = classifyDegradedIntent(messageText);
     const isProvider = reason !== "ai_disabled";
+    const facts = buildFacts(ctx);
+    // Is the customer already INSIDE the deterministic menu (a live cursor)? Distinguishes a fresh
+    // ENTRY into deterministic mode (anchor to the main menu) from mid-navigation (Axis C).
+    const hasCursor = !!readMenuState(priorContext, now);
     let text = ""; let link: PlatformLink = null; let suppress = false; let persistNotice = false;
     let menuKind = "-";
     let interactive: WhatsAppInteractive | undefined;
@@ -383,11 +387,23 @@ export async function runPlatformTurn(
       // do NOT switch to the full deterministic FAQ menu over a single 503 (no permanent downgrade).
       if (degradedNoticeAllowed(priorContext, now)) { text = continuityText(reason, "menu"); persistNotice = true; menuKind = "transient_soft"; }
       else { suppress = true; menuKind = "transient_quiet"; }
+    } else if (isProvider && !hasCursor) {
+      // AXIS C — OUTAGE / severe-failure ENTRY (no active cursor): the customer was talking to the AI
+      // and it became unavailable. Anchor to the MAIN MENU, VISIBLY — bypass the vague rate-limit so
+      // the FIRST outage turn is never silence (C1), and show the MAIN menu (book/manage/FAQ), not the
+      // FAQ submenu (C2). Stamp the rate-limit clock + set the cursor so the NEXT vague turn stays quiet
+      // (no spam). Explicit booking/manage already routed above; ai_disabled (not isProvider) keeps its
+      // direct-answer behavior. Subsequent turns have a cursor → normal navigation / rate-limiting.
+      text = buildMainMenu(facts, reason);
+      interactive = buildInteractiveMainMenu(facts, reason);
+      menuNode = { node: "main", at: now };
+      persistNotice = true;
+      menuKind = "outage_entry";
     } else {
-      // SUSTAINED outage / owner-disabled AI / internal error → the GENERAL deterministic menu.
+      // SUSTAINED outage (mid-navigation) / owner-disabled AI / internal error → the GENERAL menu.
       // A real business-info question is ANSWERED from facts/KB (or gets the info submenu) and is
       // NEVER rate-limited; only a vague/contentless repeat falls to the one-menu-per-window limit.
-      const plan = planContinuityMenu(reason, messageText, buildFacts(ctx));
+      const plan = planContinuityMenu(reason, messageText, facts);
       menuKind = plan.kind;
       if (plan.kind === "vague_menu") {
         if (degradedNoticeAllowed(priorContext, now)) { text = plan.text; interactive = plan.interactive; persistNotice = true; menuNode = { node: "main", at: now }; }
@@ -505,7 +521,19 @@ export async function runPlatformTurn(
     const reason: DegradedReason =
       decision.branch === "ai_disabled" ? "ai_disabled"
       : decision.branch === "api_overloaded" ? (isGeminiCoolingDown() ? "provider_outage" : "provider_transient")
-      : "ai_error"; // api_error | parse_error | not_configured
+      : "ai_error"; // api_error | parse_error | not_configured (incl. empty/blocked/RECITATION)
+    // ── AXIS B: a MODEL blocked/empty/RECITATION/parse/api hiccup in HEALTHY AI MODE is a per-turn
+    //    glitch, NOT a mode change — it must NOT open the deterministic menu (the live bug:
+    //    "כמה אנשים יש בכדור הארץ?" → RECITATION → ai_error → FAQ submenu). Answer with a soft
+    //    AI-mode fallback and stay in AI mode. Deterministic menu is reserved for genuine no-AI
+    //    states (owner disabled / no key / sustained outage) — exactly when `deterministicMenu` is
+    //    true (e.g. not_configured), where ai_error correctly routes to the menu below.
+    if (reason === "ai_error" && !deterministicMenu) {
+      const softText = decision.replyText || FALLBACK.error; // calm "try again", no menu, no link
+      await safeLog(businessId, customerId, decision);
+      console.log(`[platform-turn] ai_error in healthy AI mode → soft fallback (no menu) branch=${decision.branch}`);
+      return { replyText: softText, decision, linkAttached: null };
+    }
     return runContinuity(reason, decision);
   }
 
