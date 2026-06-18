@@ -45,6 +45,9 @@ import {
 } from "../../lib/ai/continuity-menu";
 import { getGeminiHealth, resetGeminiHealth } from "../../lib/ai/gemini";
 import { extractInboundMessage } from "../../lib/whatsapp";
+import {
+  buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate,
+} from "../../lib/booking/notifications";
 import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../../lib/ai/reply-polish";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
@@ -904,6 +907,37 @@ function main(): void {
     "A deterministic fence (defuseActionRefusal, section 6b) now neutralizes a false 'can't book/reschedule/cancel' WHEN a booking/manage link is attached. Remaining edges: LIST-refusals ('לראות') are intentionally excluded, and turns where no link is attached are out of scope. A live probe should still confirm real-world frequency.");
   gap("prose / owner-configured truth is unfenced",
     "Grounding covers prices/times/phones only. Invented capabilities/policies, junk KB, and junk address/city (M0A P1) pass through. Fix is data hygiene (Phase 1) + a future fact-quality gate, not a regex here.");
+
+  // ── 12. Post-action notifications (cancel / reschedule WhatsApp confirmations) ──
+  // Deterministic templates sent after a successful website action — no Gemini, summarizing the
+  // real appointment details + the right link, with dedupe so a refresh/double-submit can't spam.
+  section("12. Cancel/reschedule confirmations — deterministic templates + dedupe");
+  check("date formatter: YYYY-MM-DD → DD/MM/YYYY; malformed passes through",
+    formatApptDate("2026-06-18") === "18/06/2026" && formatApptDate("garbage") === "garbage");
+  check("cancellation message: confirms cancel + date/time + a NEW-BOOKING link (+ service when known)",
+    (() => {
+      const m = buildCancellationMessage({ serviceName: "שיעור יוגה", dateISO: "2026-06-18", time: "11:15", bookingLink: "https://x/book/flow" });
+      return m.includes("בוטל") && m.includes("18/06/2026") && m.includes("11:15")
+        && m.includes("https://x/book/flow") && m.includes("שיעור יוגה");
+    })());
+  check("cancellation omits the service line when service is unknown (no blank/hallucinated field)",
+    !buildCancellationMessage({ serviceName: null, dateISO: "2026-06-18", time: "11:15", bookingLink: "L" }).includes("שירות:"));
+  check("reschedule message: confirms update + OLD and NEW date/time + a MANAGE link",
+    (() => {
+      const m = buildRescheduleMessage({ serviceName: "פן", fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: "https://x/appointment/abc" });
+      return m.includes("עודכן") && m.includes("18/06/2026") && m.includes("11:15")
+        && m.includes("20/06/2026") && m.includes("09:30") && m.includes("https://x/appointment/abc");
+    })());
+  check("reschedule never claims the bot changed it (website did) and carries no in-chat scheduling ask",
+    (() => {
+      const m = buildRescheduleMessage({ serviceName: null, fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: "L" });
+      return !/קבעתי|שיניתי|ביטלתי|איזה (יום|שעה|שירות)/.test(m);
+    })());
+  check("DEDUPE predicate: a real move notifies; a same-slot resubmit does NOT (no duplicate spam)",
+    rescheduleChanged("2026-06-18", "11:15", "2026-06-20", "09:30") === true
+    && rescheduleChanged("2026-06-18", "11:15", "2026-06-18", "11:15") === false);
+  gap("notification SEND path (cancel/reschedule) is an integration path",
+    "The pure message builders + dedupe predicates are unit-asserted here. The actual send (sendOutbound after a successful conditional DB update; cancel deduped by the .select('id') rowcount, reschedule by rescheduleChanged) lives in lib/booking/platform.ts and needs a live DB + WhatsApp. It reuses the exact fail-open booking-confirmation pattern; a manual manage-page test is the full assertion.");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

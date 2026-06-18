@@ -21,7 +21,8 @@ import {
 } from "./availability";
 import { sendOutbound } from "./outbound";
 import { emitEvent } from "@/lib/events/emit";
-import { buildAppointmentLink } from "@/lib/config";
+import { buildAppointmentLink, buildBookingLink } from "@/lib/config";
+import { buildCancellationMessage, buildRescheduleMessage, rescheduleChanged } from "./notifications";
 
 /** Customers can't book a slot starting sooner than this from "now". */
 const MIN_LEAD_MINUTES = 15;
@@ -66,6 +67,7 @@ export interface AppointmentView {
   serviceId: string | null;
   serviceName: string | null;
   customerId: string | null;
+  customerPhone: string | null;
   business: PlatformBusiness;
   customerName: string | null;
   isFuture: boolean;
@@ -280,7 +282,7 @@ export async function createPlatformBooking(db: DB, input: CreateBookingInput): 
 export async function getAppointmentView(db: DB, appointmentId: string): Promise<AppointmentView | null> {
   const { data } = await db
     .from("appointments")
-    .select("id, status, start_time, end_time, business_id, customer_id, service_id, services(name), businesses(id, name, slug, timezone), customers(name)")
+    .select("id, status, start_time, end_time, business_id, customer_id, service_id, services(name), businesses(id, name, slug, timezone), customers(name, phone)")
     .eq("id", appointmentId)
     .maybeSingle();
   if (!data) return null;
@@ -301,6 +303,7 @@ export async function getAppointmentView(db: DB, appointmentId: string): Promise
     serviceId: (data.service_id as string | null) ?? null,
     serviceName: (data.services as unknown as { name: string } | null)?.name ?? null,
     customerId: (data.customer_id as string | null) ?? null,
+    customerPhone: (data.customers as unknown as { name: string | null; phone: string | null } | null)?.phone ?? null,
     business: { id: biz.id, name: biz.name, slug: biz.slug, timezone },
     customerName: (data.customers as unknown as { name: string | null } | null)?.name ?? null,
     isFuture: start.getTime() > Date.now(),
@@ -316,12 +319,17 @@ export async function cancelPlatformAppointment(db: DB, appointmentId: string): 
   if (!view) return { ok: false, reason: "not_found" };
   if (!CHANGEABLE.has(view.status) || !view.isFuture) return { ok: false, reason: "not_changeable" };
 
-  const { error } = await db
+  // CONDITIONAL update — only rows still pending/confirmed flip to cancelled. `.select("id")`
+  // returns the rows ACTUALLY transitioned: this is the idempotency key. A double-click / refresh
+  // / retry / concurrent request that didn't win the transition gets 0 rows → no duplicate notice.
+  const { data: updated, error } = await db
     .from("appointments")
     .update({ status: "cancelled" })
     .eq("id", appointmentId)
-    .in("status", ["pending", "confirmed"]);
+    .in("status", ["pending", "confirmed"])
+    .select("id");
   if (error) return { ok: false, reason: "db_error" };
+  const transitioned = (updated?.length ?? 0) > 0;
 
   // Freed-slot payload feeds the waitlist matcher (the runner detects matches).
   await emitEvent(db, view.business.id, "appointment_cancelled", {
@@ -332,6 +340,21 @@ export async function cancelPlatformAppointment(db: DB, appointmentId: string): 
       serviceId: view.serviceId, durationMinutes: view.durationMinutes,
     },
   });
+
+  // Deterministic WhatsApp confirmation (fail-open, like the booking confirmation). Sent ONLY when
+  // THIS call performed the cancellation and we have a phone — never on a duplicate/no-op.
+  if (transitioned && view.customerPhone && view.customerId) {
+    await sendOutbound(
+      db, view.business.id, view.customerId, view.customerPhone,
+      buildCancellationMessage({
+        serviceName: view.serviceName, dateISO: view.dateISO, time: view.time,
+        bookingLink: buildBookingLink(view.business.slug, view.customerPhone),
+      }),
+    );
+    console.log(`[platform] cancel notification sent appt=${maskId(appointmentId)}`);
+  } else {
+    console.log(`[platform] cancel notification skipped appt=${maskId(appointmentId)} reason=${!transitioned ? "no_transition_dedupe" : "no_phone"}`);
+  }
   return { ok: true };
 }
 
@@ -381,5 +404,28 @@ export async function reschedulePlatformAppointment(
       source: "platform", serviceId: view.serviceId, durationMinutes: view.durationMinutes,
     },
   });
+
+  // Deterministic WhatsApp confirmation (fail-open). Dedupe: send ONLY when the appointment actually
+  // MOVED (a refresh/double-submit to the SAME slot is a no-op → skip), and we have a phone. The OLD
+  // slot was captured in `view` BEFORE the update, so old → new is reliable.
+  const moved = rescheduleChanged(view.dateISO, view.time, dateISO, time);
+  if (moved && view.customerPhone && view.customerId) {
+    await sendOutbound(
+      db, view.business.id, view.customerId, view.customerPhone,
+      buildRescheduleMessage({
+        serviceName: view.serviceName,
+        fromDateISO: view.dateISO, fromTime: view.time, toDateISO: dateISO, toTime: time,
+        manageLink: buildAppointmentLink(appointmentId),
+      }),
+    );
+    console.log(`[platform] reschedule notification sent appt=${maskId(appointmentId)}`);
+  } else {
+    console.log(`[platform] reschedule notification skipped appt=${maskId(appointmentId)} reason=${!moved ? "no_change_dedupe" : "no_phone"}`);
+  }
   return { ok: true };
+}
+
+/** Masks an appointment UUID for logs (keeps the first 8 chars — enough to correlate, no full id). */
+function maskId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
 }

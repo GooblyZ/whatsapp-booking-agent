@@ -2041,6 +2041,27 @@ async function main() {
       active(true, true, false) === false ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 57: post-cancel / post-reschedule WhatsApp confirmations (FEATURE) ================");
+  // Additive notification polish: after a successful website cancel/reschedule the customer gets a
+  // deterministic WhatsApp summary (no Gemini), mirroring the booking confirmation. Pure builders +
+  // dedupe predicate (the live send path lives in platform.ts and reuses sendOutbound, fail-open).
+  {
+    const n = await import("../lib/booking/notifications");
+    const cancel = n.buildCancellationMessage({ serviceName: "שיעור יוגה", dateISO: "2026-06-18", time: "11:15", bookingLink: "https://x/book/flow" });
+    const resched = n.buildRescheduleMessage({ serviceName: "פן", fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: "https://x/appointment/abc" });
+    console.log("  [pure] cancellation summary: confirms cancel + date/time + new-booking link:",
+      cancel.includes("בוטל") && cancel.includes("18/06/2026") && cancel.includes("11:15") && cancel.includes("https://x/book/flow")
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] reschedule summary: old → new date/time + manage link, never claims the bot did it:",
+      resched.includes("עודכן") && resched.includes("18/06/2026") && resched.includes("20/06/2026") &&
+      resched.includes("https://x/appointment/abc") && !/קבעתי|שיניתי/.test(resched)
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] dedupe: a real move notifies; a same-slot resubmit does not (no duplicate spam):",
+      n.rescheduleChanged("2026-06-18", "11:15", "2026-06-20", "09:30") === true &&
+      n.rescheduleChanged("2026-06-18", "11:15", "2026-06-18", "11:15") === false
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
   console.log("\nDONE.");
 }
 
