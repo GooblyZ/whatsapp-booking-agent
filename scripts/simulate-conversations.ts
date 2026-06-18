@@ -2090,6 +2090,30 @@ async function main() {
         ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 59: operating-mode contract — deterministic mode is menu-anchored (BUG-025) ================");
+  // Live bug: with AI disabled, free-text leaked AI-mode hybrids — 'היי אתה פה?' → 'אני כאן' (low-signal),
+  // 'מה אפשר לשאול?' → FAQ submenu. Fix: full deterministic mode bypasses the AI guards and anchors all
+  // vague/unrecognized text to the MAIN menu; the FAQ submenu needs an explicit selection; repeated vague
+  // text gets a short reminder (never silent). Pure (no Gemini/Meta network).
+  {
+    const cm = await import("../lib/ai/continuity-menu");
+    const facts = {
+      businessName: "סטודיו פלואו", phone: "03-1234567",
+      location: { address: "הרצל 10", city: "תל אביב" }, timezone: "Asia/Jerusalem", bookingEnabled: true,
+      hours: [{ day: "ראשון", closed: false, opens: "09:00", closes: "18:00" }],
+      services: [{ name: "שיעור יוגה", durationMin: 60, price: 70, description: null }],
+      knowledge: [{ category: "parking", title: "חניה", content: "יש חניון ציבורי במרחק 2 דקות הליכה." }],
+    };
+    console.log("  [pure] FAQ submenu only via explicit selection (tap m:faq / 'שאלות נפוצות'); a recognized topic answers:",
+      cm.resolveMenuPayload(cm.MENU_PAYLOAD.faq, facts)?.kind === "faq" &&
+      cm.resolveMenuNavigation("faq", "שאלות נפוצות", facts, { activeMenu: true })?.kind === "faq" &&
+      cm.resolveMenuPayload("f:hours", facts)?.kind === "answer"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] repeated-vague reminder is a short menu anchor (book/manage/info), never silent, distinct from full menu:",
+      /תור/.test(cm.MENU_REMINDER) && /מידע/.test(cm.MENU_REMINDER) && cm.MENU_REMINDER !== cm.buildMainMenu(facts)
+        ? "PASS ✓" : "FAIL ✗");
+  }
+
   console.log("\nDONE.");
 }
 

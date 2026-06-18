@@ -16,7 +16,7 @@ import {
 } from "./conversation";
 import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured } from "./gemini";
 import {
-  runReceptionistTurn, FALLBACK, classifyInput, type ReceptionistDecision, type ReceptionistTurn,
+  runReceptionistTurn, FALLBACK, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
 import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
@@ -28,7 +28,8 @@ import { beginTurn, isCurrentTurn } from "./turn-registry";
 import { buildFacts, type BusinessFacts } from "./facts";
 import {
   planContinuityMenu, resolveMenuNavigation, resolveMenuPayload, readMenuState,
-  buildInteractiveForNav, buildMainMenu, buildInteractiveMainMenu, ctaBody, type MenuState, type MenuNav,
+  buildInteractiveForNav, buildMainMenu, buildInteractiveMainMenu, ctaBody, MENU_REMINDER,
+  type MenuState, type MenuNav,
 } from "./continuity-menu";
 import type { WhatsAppInteractive } from "@/lib/whatsapp";
 
@@ -274,7 +275,9 @@ export async function runPlatformTurn(
   //    text+emoji ("תודה 😊") is NOT emoji-only and flows normally. Detected
   //    cheaply and generally (no blacklist): has a pictographic char and no letters/
   //    digits. Gender on the boundary reply is fixed at the outbound chokepoint.
-  if (isEmojiOnly(messageText)) {
+  //    SKIPPED in full deterministic mode — there the turn is menu-anchored (the low-signal
+  //    "אני כאן" reply is an AI-mode hybrid); the deterministic handler below owns it instead.
+  if (isEmojiOnly(messageText) && !deterministicMenu) {
     const newCount = prevLowSignal + 1;
     const action = lowSignalActionFor(newCount);
     let replyText = LOW_SIGNAL_SHORT;       // tiers 1-2: one short clarification
@@ -305,8 +308,10 @@ export async function runPlatformTurn(
   //   • a normal greeting / meta ("היי", "מה קורה", "יש תשובה?") → NOT spam: a short
   //     friendly RESET reply (no Gemini) and the counter resets — never silently dropped
   //   • anything else (a real-looking message) → fall through to Gemini
+  //   • SKIPPED entirely in full deterministic mode (owner-disabled / outage / no-key): there
+  //     the low-signal/greeting-reset replies are AI-mode hybrids — every turn is menu-anchored.
   const activeServiceNames = ctx.services.filter((s) => s.active).map((s) => s.name);
-  const preGemini = preGeminiAction(prevLowSignal, prevGreeting, messageText, activeServiceNames);
+  const preGemini = deterministicMenu ? "proceed_to_gemini" : preGeminiAction(prevLowSignal, prevGreeting, messageText, activeServiceNames);
   if (preGemini !== "proceed_to_gemini") {
     if (preGemini === "skip_gemini_gibberish") {
       const newCount = prevLowSignal + 1;
@@ -400,19 +405,21 @@ export async function runPlatformTurn(
       persistNotice = true;
       menuKind = "outage_entry";
     } else {
-      // SUSTAINED outage (mid-navigation) / owner-disabled AI / internal error → the GENERAL menu.
-      // A real business-info question is ANSWERED from facts/KB (or gets the info submenu) and is
-      // NEVER rate-limited; only a vague/contentless repeat falls to the one-menu-per-window limit.
+      // FULL DETERMINISTIC MODE (owner-disabled AI / sustained outage mid-navigation / no-key) — every
+      // free-text turn is MENU-ANCHORED. A RECOGNIZED business-info topic (e.g. "חניה", "שעות") is
+      // answered directly from facts/KB; EVERYTHING ELSE anchors to the MAIN menu — the FAQ submenu is
+      // reached ONLY by an explicit FAQ selection (tap "מידע ושאלות" / type "שאלות נפוצות"), never from
+      // vague/unrecognized free text (the live "מה אפשר לשאול?" → FAQ-submenu bug). Repeated vague text
+      // is rate-limited to a SHORT reminder — never the full menu spam, and NEVER silent (which felt broken).
       const plan = planContinuityMenu(reason, messageText, facts);
       menuKind = plan.kind;
-      if (plan.kind === "vague_menu") {
-        if (degradedNoticeAllowed(priorContext, now)) { text = plan.text; interactive = plan.interactive; persistNotice = true; menuNode = { node: "main", at: now }; }
-        else suppress = true;                                     // genuinely vague repeat → quiet (anti-spam)
+      if (plan.kind === "answer") {
+        text = plan.text; interactive = plan.interactive; menuNode = { node: "faq", at: now };
+      } else if (degradedNoticeAllowed(priorContext, now)) {
+        text = buildMainMenu(facts, reason); interactive = buildInteractiveMainMenu(facts, reason);
+        persistNotice = true; menuNode = { node: "main", at: now }; menuKind = "main_menu";
       } else {
-        text = plan.text;                                         // answer / submenu / explicit menu → ALWAYS reply
-        interactive = plan.interactive;                           // clickable buttons/list version
-        // answer/submenu put the customer in the FAQ node; an explicit main menu → main node.
-        menuNode = { node: plan.kind === "main_menu_explicit" ? "main" : "faq", at: now };
+        text = MENU_REMINDER; menuNode = { node: "main", at: now }; menuKind = "menu_reminder"; // short anchor, never silent
       }
     }
     if (!suppress && emojiNone) text = stripEmojis(text);
@@ -442,8 +449,10 @@ export async function runPlatformTurn(
     return { replyText: text, decision, linkAttached: link, suppressReply: suppress, interactive: suppress ? undefined : interactive };
   };
 
-  // DEGRADED MODE (provider cooldown active) — serve deterministically via the shared core.
-  if (isGeminiCoolingDown() && classifyInput(messageText) === "ok") {
+  // CONFIRMED OUTAGE (provider cooldown active) — full deterministic mode: serve EVERY message via
+  // the menu-anchored core (no Gemini, even for noise/emoji — the AI-protection guards above are
+  // skipped in deterministic mode). The pre-call gate (deterministicMenu) is true whenever cooling.
+  if (isGeminiCoolingDown()) {
     console.warn(`[platform-turn] DEGRADED MODE — cooldown ${Math.ceil(geminiCooldownRemainingMs() / 1000)}s left`);
     return runContinuity("provider_outage", errorDecision("gemini_cooldown", true));
   }

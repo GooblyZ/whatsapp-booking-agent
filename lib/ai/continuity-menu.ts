@@ -223,6 +223,12 @@ export function ctaBody(kind: "book" | "manage"): string {
   return `${kind === "book" ? "לקביעת תור 📅" : "לניהול התור 📅"}\n${MENU_HINT}`;
 }
 
+// A SHORT menu-anchor nudge for a REPEATED vague message in deterministic mode — shown instead of
+// re-sending the full clickable menu (anti-spam) and instead of going silent (which feels broken).
+// Generic, business-agnostic; emoji stripped at the chokepoint when the owner set emoji=none.
+export const MENU_REMINDER =
+  "אני כאן 🙂 אפשר לבחור מהתפריט — לקבוע תור, לנהל תור קיים, או לקבל מידע על העסק.";
+
 /** The MAIN menu — book (if enabled), manage, and business-info (if any). Generic across verticals. */
 export function buildMainMenu(facts: BusinessFacts, reason?: DegradedReason): string {
   const lines = availableMainOptions(facts).map((o, i) => `${i + 1}. ${o.label}`);

@@ -41,7 +41,7 @@ import {
   buildMainMenu, buildInfoSubmenu, availableInfoTopics, planContinuityMenu,
   availableMainOptions, resolveMenuNavigation, readMenuState, buildCategoryAnswer, MENU_STATE_TTL_MS,
   resolveMenuPayload, buildInteractiveMainMenu, buildInteractiveFaqMenu, buildInteractiveAnswer, MENU_PAYLOAD,
-  mainMenuBody, ctaBody, MENU_HINT,
+  mainMenuBody, ctaBody, MENU_HINT, MENU_REMINDER,
 } from "../../lib/ai/continuity-menu";
 import { getGeminiHealth, resetGeminiHealth } from "../../lib/ai/gemini";
 import { extractInboundMessage } from "../../lib/whatsapp";
@@ -966,6 +966,30 @@ function main(): void {
     buildInteractiveFaqMenu(FACTS).kind === "list" && buildInteractiveMainMenu(FACTS, "provider_outage").kind === "buttons");
   gap("Axis B/C entry routing is integration-wired in runPlatformTurn/runContinuity",
     "The unit pieces are asserted here (the gate's healthy-mode value; the main-menu vs submenu builders + outage wording). The actual routing — ai_error→soft-fallback when the gate is inactive, and provider_outage 'outage_entry' anchoring to the main menu (bypassing the vague rate-limit, set cursor, then rate-limit follow-ups) — lives in runPlatformTurn/runContinuity and needs a live DB + provider state. A live RECITATION + a real 503-storm entry are the full assertions.");
+
+  // ── 14. Operating-mode contract — deterministic mode is menu-anchored, never hybrid ──
+  // In full deterministic mode (owner-disabled / outage / no-key) every free-text turn is menu-anchored:
+  // the AI-protection guards (emoji/quiet/greeting) are bypassed, vague/unrecognized text anchors to the
+  // MAIN menu (never the FAQ submenu — that needs an explicit selection), a recognized topic answers
+  // directly, and a repeated vague message gets a SHORT reminder (never silent).
+  section("14. Operating-mode contract — full deterministic mode is menu-anchored (no AI hybrid)");
+  check("the deterministic gate is the single source of truth (drives guard bypass + menu anchoring)",
+    isDeterministicMenuActive({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: false }) === true
+    && isDeterministicMenuActive({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false }) === false);
+  check("the repeated-vague reminder is a SHORT menu anchor (book/manage/info), never silent, generic",
+    MENU_REMINDER.length > 0 && /תור/.test(MENU_REMINDER) && /מידע/.test(MENU_REMINDER)
+    && !/מספרה|תספורת|זקן/.test(MENU_REMINDER)
+    && MENU_REMINDER !== buildMainMenu(FACTS) /* distinct from the full menu (anti-spam) */);
+  check("the FAQ submenu is a LIST reached only by explicit selection; the anchor is the main-menu BUTTONS",
+    buildInteractiveFaqMenu(FACTS).kind === "list"
+    && buildInteractiveMainMenu(FACTS).kind === "buttons"
+    && resolveMenuPayload(MENU_PAYLOAD.faq, FACTS)?.kind === "faq"   // tapping "מידע ושאלות" → submenu
+    && resolveMenuNavigation("faq", "שאלות נפוצות", FACTS, { activeMenu: true })?.kind === "faq");
+  check("a recognized topic still answers directly in deterministic mode ('שעות'→hours, 'חניה'→parking)",
+    resolveMenuPayload("f:hours", FACTS)?.kind === "answer"
+    && planContinuityMenu("ai_disabled", "מה השעות?", FACTS).kind === "answer");
+  gap("deterministic-mode guard-bypass + main-menu anchoring is integration-wired in runPlatformTurn",
+    "Asserted here: the gate value, the short reminder's shape, FAQ-submenu only via explicit selection, recognized-topic direct answer. The wiring — in deterministic mode skip the emoji/quiet/greeting guards, serve EVERY message (incl. noise) via runContinuity with no Gemini, anchor vague/unrecognized text to the MAIN menu (not the FAQ submenu), and rate-limit a repeated vague turn to MENU_REMINDER (never silent) — lives in runPlatformTurn/runContinuity and needs a live DB + AI-disabled/outage state. A manual AI-disabled session is the full assertion.");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
