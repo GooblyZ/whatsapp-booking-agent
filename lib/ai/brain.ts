@@ -18,6 +18,7 @@ import type { GeminiTurn, GeminiUsage } from "./gemini";
 import { geminiGenerateConversation } from "./gemini";
 import { buildFacts, formatFacts, buildFactIndex, type BusinessFacts, type Capabilities } from "./facts";
 import { buildReceptionistInstruction } from "./persona";
+import { buildPromptProfile } from "./prompt-profile";
 import { verifyGrounding, extractTimeTokens, extractPhoneDigits } from "./grounding";
 import { parseAiJsonResponse } from "./json-parse";
 import { buildContextReply, type BookingSession } from "./booking-session";
@@ -219,9 +220,14 @@ export async function runReceptionistTurn(
 
   const useNativeHistory = (input.historyTurns?.length ?? 0) > 0;
   const factsBlock = formatFacts(facts);
+  // AI Settings Phase 1B: build the normalized owner profile ONCE and pass it to the persona, so the
+  // prompt sources identity/style from the same PromptProfile the outbound fences use. Its hash +
+  // version are logged below for turn traceability ("this reply used this settings profile").
+  const profile = buildPromptProfile(ctx.aiSettings, ctx.business.id);
   const instruction = buildReceptionistInstruction(ctx, {
     factsBlock,
     caps,
+    profile,
     // With native history, the transcript block is redundant — the turns speak
     // for themselves (and far more naturally).
     conversationContext: useNativeHistory ? "" : input.conversationContext,
@@ -254,7 +260,9 @@ export async function runReceptionistTurn(
       ` custom=${sz(ctx.aiSettings?.custom_instructions ?? undefined)}` +
       ` transcript=${useNativeHistory ? 0 : sz(input.conversationContext)})` +
       ` + history_turns=${input.historyTurns?.length ?? 0} (${historyChars} chars)` +
-      ` + message=${Math.min(input.message.length, 1000)}`
+      ` + message=${Math.min(input.message.length, 1000)}` +
+      // Settings traceability (safe metadata only — no prompt, message, phone, or custom-instruction text):
+      ` | profileHash=${profile.promptProfileHash} settingsVersion=${profile.settingsVersion ?? "-"}`
     );
   }
 

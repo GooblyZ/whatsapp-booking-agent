@@ -16,6 +16,7 @@ import type { BusinessAIContext } from "@/types/database";
 import type { Capabilities } from "./facts";
 import { todayInTZ } from "@/lib/booking/availability";
 import { dayNameHe } from "./booking-session";
+import { buildPromptProfile, type PromptProfile } from "./prompt-profile";
 
 export interface PersonaInput {
   factsBlock: string;
@@ -32,6 +33,12 @@ export interface PersonaInput {
    * SYSTEM attaches booking/self-service links after the reply.
    */
   platformMode?: boolean;
+  /**
+   * AI Settings Phase 1B: the normalized owner PromptProfile (same source of truth the outbound
+   * fences use). Optional — when omitted the persona builds it from ctx.aiSettings, so script
+   * callers keep working. Identity/style values are read from here, never from raw aiSettings.
+   */
+  profile?: PromptProfile;
 }
 
 // DEPRECATED back-compat only: the old 4-way tone preset is retired from the UI.
@@ -51,20 +58,30 @@ const LEGACY_TONE_PROFILE: Record<string, string> = {
 /** Builds the full system instruction. */
 export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaInput): string {
   const ai = ctx.aiSettings;
-  const language = ai?.language?.trim() || "he";
-  const name = ai?.assistant_name?.trim() || "Assistant";
+  // AI Settings Phase 1B: identity/style come from the NORMALIZED PromptProfile (the same source of
+  // truth the outbound fences use), not from raw aiSettings fields — so the prompt and the fences can
+  // never disagree about name/gender/length/emoji/language. Built here only if the caller didn't pass
+  // one (script callers). The profile's defaults match this builder's previous defaults exactly
+  // (length=medium, emoji=low, language=he, gender=neutral) and the dashboard's assistant_name default
+  // ("עוזר"), so this is a sourcing change, not a behavior change.
+  const profile = p.profile ?? buildPromptProfile(ai, ctx.business.id);
+  const language = profile.language;
+  const name = profile.assistantName;
   // PERSONALITY — ONE natural-language description is the entire voice authority.
   // The owner describes the receptionist in their own words; this scaffold turns
-  // that into behavior. Back-compat fallbacks keep older configs working with no
-  // data migration: persona_voice (pre-009) and the retired tone preset (a config
-  // that only ever set a tone still gets an equivalent character).
+  // that into behavior. The profile's customInstructions is the primary source; the
+  // back-compat fallbacks keep older configs working with no data migration:
+  // persona_voice (pre-009) and the retired tone preset (a config that only ever set
+  // a tone still gets an equivalent character).
   const personality =
-    ai?.custom_instructions?.trim() ||
+    profile.customInstructions ||
     ai?.persona_voice?.trim() ||
     (ai?.tone ? LEGACY_TONE_PROFILE[ai.tone] : undefined);
   // Assistant SELF-reference gender (Hebrew is gendered); default neutral. This is
   // the assistant's own identity — phrasing toward the customer stays neutral/mirrored.
-  const gender = ai?.assistant_gender;
+  const gender = profile.assistantGender;
+  // things_to_avoid stays the RAW owner text here (rendered verbatim in HARD RULES); the parsed
+  // profile.thingsToAvoid array is the outbound forbidden-phrase fence's concern, not the prompt's.
   const avoid = ai?.things_to_avoid?.trim();
   const stuck = p.stuckTurns ?? 0;
 
@@ -111,8 +128,8 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     ``,
     `=== HOW YOU WRITE (format set by the owner — these limits ALWAYS hold, even when your character would run longer or chattier) ===`,
     `Language: ${language}.`,
-    `Length: ${lengthHint(ai?.response_length)}`,
-    `Emoji: ${emojiHint(ai?.emoji_usage)}`,
+    `Length: ${lengthHint(profile.responseLength)}`,
+    `Emoji: ${emojiHint(profile.emojiUsage)}`,
     `Your character shapes WHAT you say and how you come across — not how long the message is. Stay within the length and emoji limits no matter what; check the reply before sending.`,
     avoid
       ? [
