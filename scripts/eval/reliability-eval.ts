@@ -33,7 +33,7 @@ import {
   degradedNoticeAllowed, readLastDegradedAt, DEGRADED_NOTICE_MIN_GAP_MS,
   classifyDegradedIntent, continuityText,
   readPendingFailedNeed, PENDING_FAILED_NEED_TTL_MS,
-  isDeterministicMenuActive,
+  isDeterministicMenuActive, operatingModeReason,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -990,6 +990,26 @@ function main(): void {
     && planContinuityMenu("ai_disabled", "מה השעות?", FACTS).kind === "answer");
   gap("deterministic-mode guard-bypass + main-menu anchoring is integration-wired in runPlatformTurn",
     "Asserted here: the gate value, the short reminder's shape, FAQ-submenu only via explicit selection, recognized-topic direct answer. The wiring — in deterministic mode skip the emoji/quiet/greeting guards, serve EVERY message (incl. noise) via runContinuity with no Gemini, anchor vague/unrecognized text to the MAIN menu (not the FAQ submenu), and rate-limit a repeated vague turn to MENU_REMINDER (never silent) — lives in runPlatformTurn/runContinuity and needs a live DB + AI-disabled/outage state. A manual AI-disabled session is the full assertion.");
+
+  // ── 15. Operating-mode RESOLUTION (observability) — owner-disabled ≠ healthy AI ──
+  // The diagnostic mission: with ai_enabled=true in the DB the runtime correctly runs AI; the mode
+  // log must make that unambiguous (modeReason) and stay consistent with the menu gate, so "owner AI
+  // disabled" can never be confused with "healthy AI". The reason is derived from the SAME inputs.
+  section("15. Operating-mode resolution log (modeReason) — consistent with the menu gate");
+  check("modeReason: owner-disabled / no-key / outage / healthy from the same inputs",
+    operatingModeReason({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: false }) === "owner_ai_disabled"
+    && operatingModeReason({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: false }) === "no_api_key"
+    && operatingModeReason({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: true }) === "provider_outage"
+    && operatingModeReason({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false }) === "healthy_ai");
+  check("modeReason NEVER disagrees with isDeterministicMenuActive (healthy_ai ⇔ menu inactive)",
+    [true, false].every((a) => [true, false].every((g) => [true, false].every((c) => {
+      const inputs = { aiEnabled: a, geminiConfigured: g, providerCoolingDown: c };
+      const det = isDeterministicMenuActive(inputs);
+      const reason = operatingModeReason(inputs);
+      return det === (reason !== "healthy_ai");
+    }))));
+  check("owner-disabled takes precedence over provider health (owner intent wins)",
+    operatingModeReason({ aiEnabled: false, geminiConfigured: false, providerCoolingDown: true }) === "owner_ai_disabled");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

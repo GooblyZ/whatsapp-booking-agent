@@ -65,6 +65,19 @@ export function isDeterministicMenuActive(opts: {
   return false;                              // AI enabled + provider healthy → AI mode (menu inactive)
 }
 
+/** The single human-readable OPERATING-MODE reason for this turn — for the mode-resolution log so
+ *  "owner AI disabled" can never be confused with "healthy AI" in production logs. Derived from the
+ *  SAME inputs as isDeterministicMenuActive (same precedence), so the two never disagree. */
+export type OperatingModeReason = "owner_ai_disabled" | "no_api_key" | "provider_outage" | "healthy_ai";
+export function operatingModeReason(opts: {
+  aiEnabled: boolean; geminiConfigured: boolean; providerCoolingDown: boolean;
+}): OperatingModeReason {
+  if (!opts.aiEnabled) return "owner_ai_disabled";
+  if (!opts.geminiConfigured) return "no_api_key";
+  if (opts.providerCoolingDown) return "provider_outage";
+  return "healthy_ai";
+}
+
 // WhatsApp renders *…* as bold and auto-links a bare URL on its own line. A bold
 // label + clean URL reads as an intentional, premium CTA (no markdown links in
 // WhatsApp). Emojis are intentionally omitted here so the CTA looks the same
@@ -242,11 +255,23 @@ export async function runPlatformTurn(
   //    model / normal platform routing, and the cursor is cleared by the healthy persist below.
   //    Decided from THIS turn's facts (ctx.aiSettings.ai_enabled + live provider health), so toggling
   //    AI back on or a provider recovery flips the gate on the very next turn — no stale state trusted.
-  const deterministicMenu = isDeterministicMenuActive({
+  const modeInputs = {
     aiEnabled: ctx.aiSettings?.ai_enabled !== false,
     geminiConfigured: isGeminiConfigured(),
     providerCoolingDown: isGeminiCoolingDown(),
-  });
+  };
+  const deterministicMenu = isDeterministicMenuActive(modeInputs);
+  // ── OPERATING-MODE RESOLUTION (observability). Emitted BEFORE any branch that can suppress, call
+  //    Gemini, or route to AI — so "owner AI disabled" can never be mistaken for "healthy AI" in logs.
+  //    `aiEnabled` reflects ai_settings.ai_enabled for THIS business (a MISSING row defaults to
+  //    enabled). No secrets: a business UUID + booleans only. If this says aiEnabled=true while the
+  //    owner believes AI is off, the toggle was not persisted as ai_enabled=false in the DB.
+  console.log(
+    `[platform-turn] mode-resolution business=${businessId}` +
+    ` modeReason=${operatingModeReason(modeInputs)} deterministicMenu=${deterministicMenu}` +
+    ` aiEnabled=${modeInputs.aiEnabled} geminiConfigured=${modeInputs.geminiConfigured}` +
+    ` providerCoolingDown=${modeInputs.providerCoolingDown} aiSettingsRow=${ctx.aiSettings ? "present" : "missing(default_enabled)"}`
+  );
   if (deterministicMenu) {
     const facts = buildFacts(ctx);
     const menuState = readMenuState(priorContext, now);
