@@ -122,11 +122,22 @@ const NEUTRAL_RULES: Rule[] = Object.entries(NEUTRAL_REPLACE).map(([form, to]) =
 // survives). Whether it's appropriate to address an unknown customer that way is a separate
 // customer-address-policy concern (future AI Settings work), not this fence.
 const NEUTRAL_IDENTITY = "זה הצ׳אט"; // non-personal, service-style: "this is the chat of <business>"
-// "וירטואלי" with optional definite-ה and the single/double-vav spelling (matches "הווירטואלי").
-const VIRTUAL = "(?:\\s+ה?ו?וירטואלי(?:ת)?)?";
+// SELF-IDENTITY CLASS (first-person). The model introduces itself with several gendered ROLE nouns,
+// optionally followed by an identity QUALIFIER — a whole family, not one sentence:
+//   "אני העוזרת הווירטואלית של X", "אני עוזרת הקבלה של X", "אני נציג השירות של X",
+//   "אני המזכירה הדיגיטלית של X", "אני העוזר האישי של X".
+const ROLE = "(?:עוזר(?:ת)?|נציג(?:ה|ת)?|מזכיר(?:ה)?)"; // assistant / representative / secretary (gendered)
+// An identity qualifier bound to the role: an adjective (optional definite-ה + the double-vav spelling
+// of "הווירטואלי") OR a construct noun ("הקבלה"/"השירות"). The leading \s+ is part of each branch.
+const ROLE_QUAL =
+  "(?:\\s+ה?ו?(?:וירטואלי(?:ת)?|דיגיטלי(?:ת)?|אישי(?:ת)?|אוטומטי(?:ת)?)|\\s+ה?(?:קבלה|שירות))";
 const NEUTRAL_IDENTITY_RULES: Rule[] = [
-  // 1) First-person identity: "אני [ה]עוזר/ת [הווירטואלי/ת] …" → "זה הצ׳אט …" (the "של X" tail is preserved).
-  { re: new RegExp(`${NB}${ANI}\\s+ה?עוזר(?:ת)?${VIRTUAL}${NA}`, "g"), to: NEUTRAL_IDENTITY },
+  // 1) First-person self-IDENTITY as a CLASS → "זה הצ׳אט …" (the "של X" tail is preserved). Fires ONLY
+  //    when "אני <role>" is unmistakably the identity NOUN: the role is DEFINITE ("אני ה<role> …"), OR
+  //    carries an identity qualifier ("אני עוזרת הקבלה"), OR is followed by "של <business>". This
+  //    deliberately never touches the VERB readings "אני עוזר/ת לך" (help) or "אני מזכיר/ה לך" (remind)
+  //    — they have no ה, no qualifier and no "של", so none of the three branches match.
+  { re: new RegExp(`${NB}${ANI}\\s+(?:ה${ROLE}${ROLE_QUAL}?|${ROLE}(?:${ROLE_QUAL}|(?=\\s+של)))${NA}`, "g"), to: NEUTRAL_IDENTITY },
   // 2) First-person gender DECLARATION (answer to "בן או בת?"): "אני בן/בת" → service wording. Guarded
   //    so "אני בן/בת זוג" and ages ("אני בן 30") are NEVER caught. ONLY the first-person self-statement
   //    is rewritten — "בן"/"בת" anywhere else (including customer-address) is left untouched.
@@ -139,13 +150,31 @@ const NEUTRAL_IDENTITY_RULES: Rule[] = [
   { re: new RegExp(`${NB}כ(?:אל\\s+)?מישה[יו]${NA}`, "g"), to: "כחלק" },
 ];
 
-/** Rewrites POSITIVE first-person gendered self-references AND gendered identity/person phrasing to
- *  impersonal, service-style forms (neutral voice). Anchored to the assistant's own self-reference;
- *  customer-address slang is NOT touched. No-op when there's nothing to rewrite (good replies untouched). */
+// First-person gendered ACTION verbs that take a ל-OBJECT — "אני עוזר/ת לך" (help), "אני מזכיר/ה לך"
+// (remind) — rewritten to neutral, impersonal action wording ("אפשר לעזור לך" / "אפשר להזכיר לך").
+// GRAMMATICALITY GUARD: rewrite ONLY when the object is unmistakably a ל-PREPOSITION phrase that keeps
+// "אפשר לעזור ל…" clean — a closed-class dative pronoun ("לך"/"לכם"/"לו"/"להם"…) OR a double-ל word
+// (ל-prep + a ל-initial word: "ללקוח"/"ללקוחות"/"ללא"). A bare ל-INITIAL noun used as object
+// ("אני עוזרת לקוחות") is single-ל and is deliberately NOT matched — rewriting it would yield the broken
+// "אפשר לעזור לקוחות"; such ambiguous noun-role phrases are left unchanged. The ל-object lookahead also
+// separates the VERB ("עוזר לך") from the identity NOUN ("עוזרת הקבלה"/"עוזר של X") and from third-party
+// mentions. Narrow by design — only these two action verbs, first-person, before a clean ל-object.
+const LAMED_DATIVE = "ל(?:הם|הן|כם|כן|נו|ך|ו|ה|י)"; // ל + pronoun suffix (to me/you/him/her/us/them)
+const LAMED_OBJ = `(?:${LAMED_DATIVE}(?![${H}])|לל)`; // a whole-word dative pronoun OR a double-ל word
+const NEUTRAL_ACTION_RULES: Rule[] = [
+  { re: new RegExp(`${NB}${ANI}\\s+עוזר(?:ת)?(?=\\s+${LAMED_OBJ})`, "g"), to: "אפשר לעזור" },
+  { re: new RegExp(`${NB}${ANI}\\s+מזכיר(?:ה)?(?=\\s+${LAMED_OBJ})`, "g"), to: "אפשר להזכיר" },
+];
+
+/** Rewrites POSITIVE first-person gendered self-references (participles + the help/remind action verbs)
+ *  AND gendered identity/person phrasing to impersonal, service-style forms (neutral voice). Anchored to
+ *  the assistant's own self-reference; customer-address slang is NOT touched. No-op when there's nothing
+ *  to rewrite (good replies untouched). */
 export function enforceNeutralVoice(text: string): string {
   if (!text) return text;
   let out = text;
-  for (const r of NEUTRAL_RULES) out = out.replace(r.re, r.to);           // first-person verbs
+  for (const r of NEUTRAL_RULES) out = out.replace(r.re, r.to);           // first-person participle verbs (שמח/יכול…)
+  for (const r of NEUTRAL_ACTION_RULES) out = out.replace(r.re, r.to);    // first-person action verbs (עוזר/מזכיר ל…)
   for (const r of NEUTRAL_IDENTITY_RULES) out = out.replace(r.re, r.to);  // identity / person nouns
   return out.replace(/ {2,}/g, " ").trim();
 }

@@ -1239,6 +1239,49 @@ function main(): void {
       const out = enforceNeutralVoice("אני העוזרת הווירטואלית של RB Hair Studio, אפשר לקבוע תור או לשאול שאלות.");
       return !/עוזר/.test(out) && /הצ.?אט/.test(out) && out.includes("RB Hair Studio");
     })());
+  check("neutral self-identity CLASS → 'זה הצ׳אט של X' (assistant/rep/secretary nouns, qualified or definite)",
+    (() => {
+      const X = "סטודיו יוגה אור";
+      const variants = [
+        `אני עוזרת הקבלה של ${X}`, `אני עוזר הקבלה של ${X}`,            // construct qualifier, indefinite (the live bug)
+        `אני העוזרת הווירטואלית של ${X}`, `אני העוזר הווירטואלי של ${X}`,
+        `אני נציגת השירות של ${X}`, `אני נציג השירות של ${X}`,
+        `אני המזכירה הדיגיטלית של ${X}`, `אני המזכיר הדיגיטלי של ${X}`,
+        `אני העוזרת האישית של ${X}`, `אני העוזר האישי של ${X}`,
+      ];
+      return variants.every((v) => {
+        const out = enforceNeutralVoice(v);
+        return /^זה הצ.?אט של /.test(out) && out.includes(X) && !/עוזר|נציג|מזכיר/.test(out);
+      });
+    })());
+  check("neutral first-person ACTION verbs → clean impersonal wording (dative-pronoun & double-ל objects)",
+    enforceNeutralVoice("אני עוזר לך") === "אפשר לעזור לך"
+    && enforceNeutralVoice("אני עוזרת לכם") === "אפשר לעזור לכם"
+    && enforceNeutralVoice("אני עוזר לכן") === "אפשר לעזור לכן"
+    && enforceNeutralVoice("אני עוזר ללקוח") === "אפשר לעזור ללקוח"
+    && enforceNeutralVoice("אני עוזרת ללקוחות") === "אפשר לעזור ללקוחות"
+    && enforceNeutralVoice("אני מזכיר לך") === "אפשר להזכיר לך"
+    && enforceNeutralVoice("אני מזכירה לכם") === "אפשר להזכיר לכם"
+    && enforceNeutralVoice("אני עוזר לך לקבוע תור") === "אפשר לעזור לך לקבוע תור"); // tail preserved
+  check("neutral ACTION verb NEVER produces broken Hebrew ('אני עוזרת לקוחות' must NOT become 'אפשר לעזור לקוחות')",
+    (() => {
+      const out = enforceNeutralVoice("אני עוזרת לקוחות"); // ל-initial NOUN object, not a ל-preposition
+      return out !== "אפשר לעזור לקוחות" && out === "אני עוזרת לקוחות";
+    })());
+  check("neutral self-identity fence leaves THIRD-PARTY role mentions alone (no 'אני' ⇒ not self-identity)",
+    (() => {
+      const s = "נציג השירות יחזור אליך, והעוזרת תיצור קשר";
+      return enforceNeutralVoice(s) === s; // no first-person anchor → untouched
+    })());
+  check("neutral PRESERVES business/customer/relationship terms (slang, service names, 'בן/בת זוג', ages)",
+    (() => {
+      const safe = [
+        "אין בעיה אחי", "סבבה גבר", "בטח אחותי",                       // customer-address slang (owner persona)
+        "תספורת גבר", "סטודיו גבר", "שירות לגברים",                    // business / service text
+        "תור לבן זוג", "תור לבת זוג", "הוא בן 20",                     // relationship terms + age
+      ];
+      return safe.every((s) => enforceNeutralVoice(s) === s);
+    })());
   check("neutral: deterministic main-menu copy no longer says 'אני העוזר/העוזרת' (with and without a name)",
     (() => {
       const named = enforceNeutralVoice(mainMenuBody(FACTS));
