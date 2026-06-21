@@ -34,6 +34,7 @@ import {
   classifyDegradedIntent, continuityText,
   readPendingFailedNeed, PENDING_FAILED_NEED_TTL_MS,
   isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
+  resolveOperatingState, isDeterministicState,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -1031,6 +1032,37 @@ function main(): void {
       return o.link === "manage" && !/תור פעיל/.test(o.text)
         && o.interactive.kind === "cta_url" && o.interactive.url === "https://x/appointment/abc";
     })());
+
+  // ── 17. Operating-state resolver (Phase 2) — single source of truth, no drift ──
+  // One pure resolver names the turn's lane; isDeterministicMenuActive / operatingModeReason / the
+  // mode log all DERIVE from it. The resolver must NEVER disagree with the (back-compat) menu gate.
+  section("17. Operating-state resolver — single source of truth for AI vs deterministic lane");
+  // A. The five states from the inputs (precedence: owner > config > outage > blip > healthy).
+  check("resolveOperatingState: owner-disabled / no-key / outage / degraded / healthy",
+    resolveOperatingState({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: false }) === "owner_ai_disabled"
+    && resolveOperatingState({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: false }) === "no_key"
+    && resolveOperatingState({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: true }) === "provider_outage"
+    && resolveOperatingState({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false, providerHealth: "transient" }) === "degraded_ai"
+    && resolveOperatingState({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false, providerHealth: "healthy" }) === "healthy_ai");
+  check("owner-disabled wins precedence even when no-key AND cooling are also true",
+    resolveOperatingState({ aiEnabled: false, geminiConfigured: false, providerCoolingDown: true, providerHealth: "outage" }) === "owner_ai_disabled");
+  check("degraded_ai is an AI-LANE state (Gemini still attempted) — NOT deterministic",
+    isDeterministicState("degraded_ai") === false && isDeterministicState("healthy_ai") === false
+    && isDeterministicState("owner_ai_disabled") && isDeterministicState("no_key") && isDeterministicState("provider_outage"));
+  // B. THE invariant — the resolver+lane can NEVER disagree with the back-compat menu gate, for any
+  //    input combination (this is what makes the consolidation safe / behavior-preserving).
+  check("isDeterministicState(resolveOperatingState(x)) === isDeterministicMenuActive(x) for ALL inputs",
+    [true, false].every((a) => [true, false].every((g) => [true, false].every((c) =>
+      (["healthy", "transient", "outage"] as const).every((h) => {
+        const x = { aiEnabled: a, geminiConfigured: g, providerCoolingDown: c };
+        return isDeterministicState(resolveOperatingState({ ...x, providerHealth: h })) === isDeterministicMenuActive(x);
+      })))));
+  // C. operatingModeReason stays consistent with the resolved state (back-compat strings preserved).
+  check("operatingModeReason aligns with the resolved state (no_key→no_api_key; lane matches)",
+    operatingModeReason({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: false }) === "owner_ai_disabled"
+    && operatingModeReason({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: false }) === "no_api_key"
+    && operatingModeReason({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: true }) === "provider_outage"
+    && operatingModeReason({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false }) === "healthy_ai");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

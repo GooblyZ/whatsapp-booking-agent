@@ -14,7 +14,7 @@ import { getBusinessAIContext } from "./context";
 import {
   getConversationContext, renderUpcomingAppointments, renderCustomerState, didLastReplyFailToSend,
 } from "./conversation";
-import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured } from "./gemini";
+import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured, getGeminiHealth, type GeminiHealthState } from "./gemini";
 import {
   runReceptionistTurn, FALLBACK, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
@@ -47,35 +47,59 @@ export interface PlatformTurnOutcome {
   interactive?: WhatsAppInteractive;
 }
 
-// ── OPERATING-MODE GATE — is the deterministic clickable menu authoritative this turn? ──────
-// Two modes: AI mode (Gemini owns the conversation) and deterministic menu mode. The menu is
-// authoritative ONLY when AI genuinely cannot operate:
-//   • the owner DISABLED AI, or
-//   • no API key is configured (AI can't run), or
-//   • the provider is in a SUSTAINED outage (cooldown active).
-// A single transient 503 is NOT here (it's handled as soft AI recovery downstream, not menu mode).
-// Pure + decided from CURRENT-turn signals, so re-enabling AI or a provider recovery flips it on the
-// next turn — a stale menu cursor / old button payload is therefore never trusted in AI mode.
+// ── OPERATING STATE — the SINGLE source of truth for AI-vs-deterministic routing (Phase 2) ──────
+// One pure resolver names the turn's operating state; the menu gate, the mode-resolution log, and the
+// legacy helpers all DERIVE from it, so the precedence rules live in exactly one place and can't drift.
+//
+//   AI LANE (Gemini may run):                 healthy_ai, degraded_ai
+//   DETERMINISTIC LANE (no Gemini, menu):     provider_outage, owner_ai_disabled, no_key
+//
+// The menu is authoritative ONLY in the deterministic lane — when AI genuinely cannot operate (owner
+// DISABLED it, no API key, or a SUSTAINED outage/cooldown). `degraded_ai` (one recent overload strike,
+// not cooling) stays in the AI LANE: this turn still ATTEMPTS Gemini; the soft "resend?" only fires if
+// THIS call also fails. So degraded_ai is an observability/Phase-3 hook and does NOT change routing
+// today. Decided from CURRENT-turn signals, so re-enabling AI / a provider recovery flips the lane on
+// the next turn — a stale menu cursor / old button payload is therefore never trusted in the AI lane.
+export type OperatingState =
+  | "healthy_ai" | "degraded_ai" | "provider_outage" | "owner_ai_disabled" | "no_key";
+
+export interface OperatingStateInputs {
+  aiEnabled: boolean;
+  geminiConfigured: boolean;
+  providerCoolingDown: boolean;
+  /** getGeminiHealth().state — ONLY distinguishes degraded_ai from healthy_ai; irrelevant to the lane. */
+  providerHealth?: GeminiHealthState;
+}
+/** THE resolver. Precedence: owner intent > config > sustained outage > recent blip > healthy. */
+export function resolveOperatingState(i: OperatingStateInputs): OperatingState {
+  if (!i.aiEnabled) return "owner_ai_disabled";        // owner intent wins over provider health
+  if (!i.geminiConfigured) return "no_key";            // no API key → AI cannot operate
+  if (i.providerCoolingDown) return "provider_outage"; // sustained outage (cooldown active)
+  if (i.providerHealth === "transient") return "degraded_ai"; // recent blip — still AI lane
+  return "healthy_ai";
+}
+/** True for the DETERMINISTIC lane (no Gemini, menu-anchored). The AI lane (healthy_ai/degraded_ai) is
+ *  false. This is THE deterministic decision; every downstream guard reads the boolean derived from it. */
+export function isDeterministicState(state: OperatingState): boolean {
+  return state === "owner_ai_disabled" || state === "no_key" || state === "provider_outage";
+}
+
+/** Back-compat menu gate — now DERIVED from the resolver (no duplicate precedence). Byte-identical to
+ *  the previous implementation for every input (degraded_ai/healthy_ai both → false = AI mode). */
 export function isDeterministicMenuActive(opts: {
   aiEnabled: boolean; geminiConfigured: boolean; providerCoolingDown: boolean;
 }): boolean {
-  if (!opts.aiEnabled) return true;          // owner disabled AI
-  if (!opts.geminiConfigured) return true;   // no API key → AI cannot operate
-  if (opts.providerCoolingDown) return true; // sustained provider outage
-  return false;                              // AI enabled + provider healthy → AI mode (menu inactive)
+  return isDeterministicState(resolveOperatingState(opts));
 }
 
-/** The single human-readable OPERATING-MODE reason for this turn — for the mode-resolution log so
- *  "owner AI disabled" can never be confused with "healthy AI" in production logs. Derived from the
- *  SAME inputs as isDeterministicMenuActive (same precedence), so the two never disagree. */
+/** Back-compat human-readable log reason — derived from the resolver, keeping the EXACT existing strings
+ *  (incl. "no_api_key") so log consumers / evals are unaffected. */
 export type OperatingModeReason = "owner_ai_disabled" | "no_api_key" | "provider_outage" | "healthy_ai";
 export function operatingModeReason(opts: {
   aiEnabled: boolean; geminiConfigured: boolean; providerCoolingDown: boolean;
 }): OperatingModeReason {
-  if (!opts.aiEnabled) return "owner_ai_disabled";
-  if (!opts.geminiConfigured) return "no_api_key";
-  if (opts.providerCoolingDown) return "provider_outage";
-  return "healthy_ai";
+  const s = resolveOperatingState(opts); // providerHealth omitted → never "degraded_ai"
+  return s === "no_key" ? "no_api_key" : s === "degraded_ai" ? "healthy_ai" : s;
 }
 
 // WhatsApp renders *…* as bold and auto-links a bare URL on its own line. A bold
@@ -255,22 +279,28 @@ export async function runPlatformTurn(
   //    model / normal platform routing, and the cursor is cleared by the healthy persist below.
   //    Decided from THIS turn's facts (ctx.aiSettings.ai_enabled + live provider health), so toggling
   //    AI back on or a provider recovery flips the gate on the very next turn — no stale state trusted.
+  // ── OPERATING STATE — resolved ONCE here, near the top of the turn (Phase 2). Everything below
+  //    (the menu interceptor, the emoji/quiet guards, the cooldown block, the post-Gemini dispatch)
+  //    reads `deterministicMenu`, which is DERIVED from this single named state — no second copy of
+  //    the precedence rules. `providerCoolingDown` keeps using isGeminiCoolingDown() so the gate is
+  //    byte-identical to before; providerHealth only adds the degraded_ai observability distinction.
   const modeInputs = {
     aiEnabled: ctx.aiSettings?.ai_enabled !== false,
     geminiConfigured: isGeminiConfigured(),
     providerCoolingDown: isGeminiCoolingDown(),
   };
-  const deterministicMenu = isDeterministicMenuActive(modeInputs);
-  // ── OPERATING-MODE RESOLUTION (observability). Emitted BEFORE any branch that can suppress, call
-  //    Gemini, or route to AI — so "owner AI disabled" can never be mistaken for "healthy AI" in logs.
-  //    `aiEnabled` reflects ai_settings.ai_enabled for THIS business (a MISSING row defaults to
-  //    enabled). No secrets: a business UUID + booleans only. If this says aiEnabled=true while the
-  //    owner believes AI is off, the toggle was not persisted as ai_enabled=false in the DB.
+  const providerHealth = getGeminiHealth().state;
+  const operatingState = resolveOperatingState({ ...modeInputs, providerHealth });
+  const deterministicMenu = isDeterministicState(operatingState); // THE deterministic decision
+  // Mode-resolution log — emitted BEFORE any branch that can suppress, call Gemini, or route to AI, so
+  // "owner AI disabled" can never be mistaken for "healthy AI". No secrets: a business UUID + booleans.
+  // If aiEnabled=true while the owner believes AI is off, the toggle wasn't persisted as ai_enabled=false.
   console.log(
     `[platform-turn] mode-resolution business=${businessId}` +
-    ` modeReason=${operatingModeReason(modeInputs)} deterministicMenu=${deterministicMenu}` +
+    ` operatingState=${operatingState} modeReason=${operatingModeReason(modeInputs)} deterministicMenu=${deterministicMenu}` +
     ` aiEnabled=${modeInputs.aiEnabled} geminiConfigured=${modeInputs.geminiConfigured}` +
-    ` providerCoolingDown=${modeInputs.providerCoolingDown} aiSettingsRow=${ctx.aiSettings ? "present" : "missing(default_enabled)"}`
+    ` providerCoolingDown=${modeInputs.providerCoolingDown} providerHealth=${providerHealth}` +
+    ` aiSettingsRow=${ctx.aiSettings ? "present" : "missing(default_enabled)"}`
   );
   if (deterministicMenu) {
     const facts = buildFacts(ctx);
