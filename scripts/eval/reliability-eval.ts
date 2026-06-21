@@ -1139,6 +1139,65 @@ function main(): void {
   gap("good-faith floor is AI-LANE suppression only — deterministic mode & Gemini routing unaffected",
     "isGoodFaithLowSignal gates ONLY the two quiet-mode suppression points (pre-Gemini gibberish-skip, post-Gemini quiet_mode), both AI-lane. Deterministic mode forces proceed_to_gemini and skips the low-signal block, so owner-disabled/outage menus are untouched; the resolver/lane decision (§17) does not reference it. The end-to-end 'confused user never silent' assertion needs the runPlatformTurn integration harness (Phase 5).");
 
+  // ── 20. Pipeline decision harness (Phase 5A) — scenario-level, real functions ───
+  // A THIN harness: composes the REAL exported decision functions in the order runPlatformTurn
+  // applies them, asserting the lane + contract for each scenario. NOT full end-to-end I/O — the
+  // turn's context-load / event-log / Gemini call all use supabaseServer()/network internally and
+  // are not injectable, so faking them needs DI seams (Phase 5B). This closes the DECISION layer of
+  // the gaps with zero product change; the I/O wiring remains a documented gap below.
+  section("20. Pipeline decision harness (scenario-level composition of real pipeline functions)");
+  const lane = (i: { aiEnabled: boolean; geminiConfigured: boolean; providerCoolingDown: boolean; providerHealth?: "healthy" | "transient" | "outage" }) => {
+    const state = resolveOperatingState(i);
+    return { state, deterministic: isDeterministicState(state) };
+  };
+  // 1. Owner-disabled + "היי" → deterministic lane (no Gemini/guards), anchors to a VISIBLE main menu.
+  check("S1 owner-disabled + 'היי' → deterministic lane, main menu, not silent (no Gemini/low-signal)",
+    (() => {
+      const l = lane({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: false });
+      return l.state === "owner_ai_disabled" && l.deterministic === true
+        && classifyDegradedIntent("היי") === "menu"
+        && planContinuityMenu("ai_disabled", "היי", FACTS).kind === "vague_menu"
+        && buildMainMenu(FACTS, "ai_disabled").length > 0;
+    })());
+  // 2. Provider outage (cooldown) → deterministic lane (no Gemini).
+  check("S2 provider outage → deterministic lane (cooldown serves the menu, no Gemini)",
+    (() => { const l = lane({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: true, providerHealth: "outage" }); return l.state === "provider_outage" && l.deterministic === true; })());
+  // 3. Healthy AI → AI lane (Gemini may be called).
+  check("S3 healthy AI → AI lane (not deterministic; Gemini allowed)",
+    (() => { const l = lane({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false, providerHealth: "healthy" }); return l.state === "healthy_ai" && l.deterministic === false; })());
+  // 4. 1–2 strikes → degraded_ai, AI lane, soft fallback (NOT the deterministic menu).
+  check("S4 1–2 strikes → degraded_ai (AI lane), soft 'resend?' distinct from the outage menu",
+    (() => {
+      const l = lane({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false, providerHealth: providerHealthFromCounters(2, 0) });
+      return l.state === "degraded_ai" && l.deterministic === false
+        && /לשלוח שוב/.test(continuityText("provider_transient", "menu"))
+        && continuityText("provider_transient", "menu") !== continuityText("provider_outage", "menu");
+    })());
+  // 5. Good-faith low signal → never silenced even on a would-be-silent quiet turn.
+  check("S5 good-faith low signal ('מה?','לא הבנתי','??') → reminder, never silent",
+    (() => {
+      const silentTurn = quietModePlan(4).suppressReply === true;
+      return silentTurn && ["מה?", "לא הבנתי", "??"].every((m) =>
+        isGoodFaithLowSignal(m) && (quietModePlan(4).suppressReply && !isGoodFaithLowSignal(m)) === false);
+    })());
+  // 6. Machine-noise low signal → Gemini avoided (recognized noise) + still suppressible. Uses a
+  //    HEBREW keysmash that looksLikeNoise flags (latin "asdfgh" is caught by brain.classifyInput,
+  //    a different pre-Gemini path); emoji-only is caught by isEmojiOnly.
+  check("S6 machine noise (Hebrew keysmash/emoji) → recognized noise (Gemini avoidable) + still suppressible",
+    looksLikeNoise("חבצב") === true && isEmojiOnly("🙂🙂") === true
+    && isGoodFaithLowSignal("חבצב") === false
+    && (quietModePlan(4).suppressReply && !isGoodFaithLowSignal("חבצב")) === true);
+  // 7. Stale payload in healthy AI → the menu interceptor is GATED OFF (deterministic=false), so the
+  //    payload is never resolved as navigation. (The "ignore stale" branch itself is the I/O gap.)
+  check("S7 stale payload in healthy AI → interceptor gated off (deterministic=false); payloads only resolve in deterministic mode",
+    lane({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false, providerHealth: "healthy" }).deterministic === false
+    && resolveMenuPayload("m:book", FACTS)?.kind === "book"); // payloads DO resolve — but only when the gate is on
+  // 8. Deterministic repeated vague → main menu then a short reminder, never silent.
+  check("S8 deterministic vague text → main menu; repeats get a short reminder (never silent)",
+    planContinuityMenu("ai_disabled", "מה נשמע", FACTS).kind === "vague_menu" && MENU_REMINDER.length > 0);
+  gap("full end-to-end runPlatformTurn I/O harness needs DI seams (Phase 5B)",
+    "These assert the DECISION layer with the real functions in pipeline order. Driving runPlatformTurn itself offline is blocked because getBusinessAIContext (context.ts), logAIEvent (events.ts), and the brain's Gemini call all use supabaseServer()/network internally and ignore the passed db — and a plain tsx eval can't mock ES module bindings. RECOMMENDED next smallest step: add ONE optional, default-preserving `loadContext` (and optional event-sink) param to runPlatformTurn, which unlocks real owner-disabled + provider-outage end-to-end tests (those never call Gemini). That is a tiny DI change but still a product-code change, so it's deferred to Phase 5B for explicit approval.");
+
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
   console.log("(GAP lines are intentional known limitations, not failures — they scope the next reliability work.)");
