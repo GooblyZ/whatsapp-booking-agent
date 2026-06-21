@@ -34,7 +34,7 @@ import {
   classifyDegradedIntent, continuityText,
   readPendingFailedNeed, PENDING_FAILED_NEED_TTL_MS,
   isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
-  resolveOperatingState, isDeterministicState,
+  resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -1114,6 +1114,30 @@ function main(): void {
     resolveOperatingState({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: true, providerHealth: "outage" }) === "owner_ai_disabled");
   check("no API key OVERRIDES provider health (no_key deterministic safety)",
     resolveOperatingState({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: true, providerHealth: "outage" }) === "no_key");
+
+  // ── 19. Good-faith low-signal never walked into silence (Phase 4A) ─────────────
+  // Anti-spam stays for machine noise, but a confused-but-HUMAN message must get a short reminder,
+  // never the eerie silence of a broken-looking bot. Suppression-only — routing/booking/menu untouched.
+  section("19. Good-faith low-signal — quiet mode reminds instead of silencing a confused human");
+  check("good-faith confusion recognized: 'מה?', 'לא הבנתי', '??', '???', '?!'",
+    isGoodFaithLowSignal("מה?") && isGoodFaithLowSignal("לא הבנתי")
+    && isGoodFaithLowSignal("??") && isGoodFaithLowSignal("???") && isGoodFaithLowSignal("?!"));
+  check("machine noise is NOT good-faith (keysmash / consonant cluster / emoji-only)",
+    isGoodFaithLowSignal("asdfgh") === false && isGoodFaithLowSignal("חבצב") === false
+    && isGoodFaithLowSignal("🙂🙂") === false && isGoodFaithLowSignal("🔥") === false);
+  check("a would-be-SILENT quiet turn → REMINDER for good-faith, stays SILENT for machine noise",
+    (() => {
+      const plan = quietModePlan(4); // count 4 → suppressReply === true (a silent turn today)
+      const goodFaithSuppressed = plan.suppressReply && !isGoodFaithLowSignal("??");
+      const noiseSuppressed = plan.suppressReply && !isGoodFaithLowSignal("asdfgh");
+      return plan.suppressReply === true && goodFaithSuppressed === false && noiseSuppressed === true;
+    })());
+  check("booking/manage intent is never treated as good-faith-low-signal (suppression can't touch it)",
+    isGoodFaithLowSignal("אני רוצה לקבוע תור") === false && isGoodFaithLowSignal("לבטל תור") === false);
+  check("a genuine multi-word question is not 'low-signal' here (it routes productive, not quiet)",
+    isGoodFaithLowSignal("מה אפשר לעשות?") === false && isGenuineQuestion("מה אפשר לעשות?") === true);
+  gap("good-faith floor is AI-LANE suppression only — deterministic mode & Gemini routing unaffected",
+    "isGoodFaithLowSignal gates ONLY the two quiet-mode suppression points (pre-Gemini gibberish-skip, post-Gemini quiet_mode), both AI-lane. Deterministic mode forces proceed_to_gemini and skips the low-signal block, so owner-disabled/outage menus are untouched; the resolver/lane decision (§17) does not reference it. The end-to-end 'confused user never silent' assertion needs the runPlatformTurn integration harness (Phase 5).");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

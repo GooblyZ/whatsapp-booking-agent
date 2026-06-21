@@ -373,6 +373,9 @@ export async function runPlatformTurn(
     if (preGemini === "skip_gemini_gibberish") {
       const newCount = prevLowSignal + 1;
       const plan = quietModePlan(newCount);
+      // Good-faith confusion that LOOKS like local noise (e.g. "??") is never walked into silence —
+      // it gets the short reminder instead. Genuine keysmash/noise can still go quiet (Phase 4A).
+      const suppress = plan.suppressReply && !isGoodFaithLowSignal(latestFragment(messageText));
       await persist(newCount, 0); // gibberish breaks any greeting run
       const decision = errorDecision("low_signal_quiet", true);
       await safeLog(businessId, customerId, decision);
@@ -381,11 +384,11 @@ export async function runPlatformTurn(
         ` gemini_skipped_reason=quiet_mode_gibberish low_signal=true low_signal_kind=gibberish` +
         ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
         ` greeting_count_before=${prevGreeting} greeting_count_after=0` +
-        ` low_signal_action=quiet_mode cooldown_short_circuit=true reply_suppressed=${plan.suppressReply} link=-`
+        ` low_signal_action=quiet_mode cooldown_short_circuit=true reply_suppressed=${suppress} link=-`
       );
       return {
-        replyText: plan.suppressReply ? "" : LOW_SIGNAL_QUIET_REMINDER,
-        decision, linkAttached: null, suppressReply: plan.suppressReply,
+        replyText: suppress ? "" : LOW_SIGNAL_QUIET_REMINDER,
+        decision, linkAttached: null, suppressReply: suppress,
       };
     }
     if (preGemini === "cheap_reset_reply") {
@@ -918,10 +921,12 @@ export async function runPlatformTurn(
     else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
     else if (lowSignalAct === "quiet_mode") {
       // Reached via Gemini (the message wasn't obvious local nonsense). Go sparse:
-      // mostly suppress, a rare reminder — never the same line every turn.
+      // mostly suppress, a rare reminder — never the same line every turn. EXCEPT: a GOOD-FAITH
+      // confused message ("מה?", "לא הבנתי", "??") is NEVER walked into silence (Phase 4A) — it gets
+      // the short reminder instead, even on a would-be-suppressed turn. Machine noise still goes quiet.
       linkAttached = null;
       const plan = quietModePlan(newLowSignal);
-      if (plan.suppressReply) suppressReply = true;
+      if (plan.suppressReply && !isGoodFaithLowSignal(latest)) suppressReply = true;
       else replyText = LOW_SIGNAL_QUIET_REMINDER;
     }
   }
@@ -1410,6 +1415,19 @@ export function quietModePlan(count: number): { isQuiet: boolean; suppressReply:
   const quietIndex = count - 3; // 1, 2, 3, …
   const sendReminder = quietIndex % QUIET_REMINDER_EVERY === 0;
   return { isQuiet: true, suppressReply: !sendReminder };
+}
+
+// ── GOOD-FAITH low-signal (Phase 4A — never walk a confused human into silence) ──────────────────
+// A confused-but-HUMAN message — a bare "what?", a string of question marks, "I didn't understand" —
+// as opposed to MACHINE NOISE (keysmash, emoji-only, consonant clusters). Consulted ONLY at the
+// quiet-mode SUPPRESSION points (AI-lane): when quiet mode would otherwise go SILENT, a good-faith
+// message instead gets a short visible reminder. Machine noise can still go quiet (anti-spam intact).
+// Affects suppression ONLY — never routing, booking/manage, links, or deterministic mode.
+const GOODFAITH_PUNCT_RE = /^[?？!！]+$/; // "?", "??", "???", "?!" — a person asking "huh?"
+export function isGoodFaithLowSignal(message: string): boolean {
+  const t = (message ?? "").trim();
+  if (!t || t.length > 30) return false;
+  return GOODFAITH_PUNCT_RE.test(t) || META_ONLY_RE.test(t); // META_ONLY_RE: "מה?", "לא הבנתי", "מה זה", …
 }
 
 /** Does this turn push toward QUIET MODE? Only truly low-content turns do —
