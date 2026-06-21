@@ -56,12 +56,13 @@ import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
 import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
-import type { AISettings } from "../../types/database";
+import type { AISettings, BusinessAIContext } from "../../types/database";
+import { buildReceptionistInstruction } from "../../lib/ai/persona";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
 import type { ReceptionistTurn, ReceptionistDecision } from "../../lib/ai/brain";
-import type { FactIndex, BusinessFacts } from "../../lib/ai/facts";
+import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
 
 // ── tiny harness ────────────────────────────────────────────────────────────────
 let pass = 0;
@@ -1295,6 +1296,28 @@ function main(): void {
         const menu = enforceNeutralVoice(mainMenuBody({ ...FACTS, businessName: name })); // deterministic main-menu greeting
         return generic(identity, name) && generic(menu, name);
       });
+    })());
+  // B4. The assembled PERSONA PROMPT (platform-fixed template Gemini receives) must not hardcode any
+  //     vertical. Built for a NON-salon business with NEUTRAL inputs + an EMPTY factsBlock, so a
+  //     hair/salon term can only appear if the TEMPLATE itself carries it (dynamic business facts /
+  //     services are injected separately and are out of scope — they may legitimately be vertical).
+  check("persona prompt is business-agnostic: no hardcoded vertical terms in the platform-fixed template",
+    (() => {
+      const ctx = {
+        business: { id: "biz", name: "סטודיו יוגה אור", slug: "biz", phone: null, timezone: "Asia/Jerusalem", created_at: "", updated_at: "" },
+        aiSettings: {
+          id: "a", business_id: "biz", assistant_name: "עוזר", assistant_gender: "neutral",
+          response_length: "medium", emoji_usage: "low", language: "he", custom_instructions: null,
+          things_to_avoid: null, ai_enabled: true, faq_enabled: true, intent_detection_enabled: true,
+          created_at: "", updated_at: "",
+        },
+      } as unknown as BusinessAIContext;
+      const caps: Capabilities = { canAnswer: true, canStartBooking: true, canCancel: true, canReschedule: true };
+      const prompt = buildReceptionistInstruction(ctx, { factsBlock: "", caps, platformMode: true });
+      const VERTICAL = /מספרה|שיער|תספורת|סלון|טיפולים מפנקים|hair|salon|barber|stylist/i;
+      return !VERTICAL.test(prompt)                       // template carries no hair/salon vocabulary
+        && prompt.includes("name 2-3 ACTUAL services")    // the "name real services, don't be vague" rule is preserved
+        && prompt.includes("יש לנו כמה שירותים");          // the neutralized, vertical-free anti-example
     })());
   // C. Length cap (conservative, URL-safe).
   check("length cap: trims long prose at sentence boundary; NEVER trims when a URL is present",
