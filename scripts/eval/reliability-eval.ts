@@ -33,7 +33,7 @@ import {
   degradedNoticeAllowed, readLastDegradedAt, DEGRADED_NOTICE_MIN_GAP_MS,
   classifyDegradedIntent, continuityText,
   readPendingFailedNeed, PENDING_FAILED_NEED_TTL_MS,
-  isDeterministicMenuActive, operatingModeReason,
+  isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -41,7 +41,7 @@ import {
   buildMainMenu, buildInfoSubmenu, availableInfoTopics, planContinuityMenu,
   availableMainOptions, resolveMenuNavigation, readMenuState, buildCategoryAnswer, MENU_STATE_TTL_MS,
   resolveMenuPayload, buildInteractiveMainMenu, buildInteractiveFaqMenu, buildInteractiveAnswer, MENU_PAYLOAD,
-  mainMenuBody, ctaBody, MENU_HINT, MENU_REMINDER,
+  mainMenuBody, ctaBody, MENU_HINT, MENU_REMINDER, NO_APPOINTMENT_PROMPT,
 } from "../../lib/ai/continuity-menu";
 import { getGeminiHealth, resetGeminiHealth } from "../../lib/ai/gemini";
 import { extractInboundMessage } from "../../lib/whatsapp";
@@ -1010,6 +1010,27 @@ function main(): void {
     }))));
   check("owner-disabled takes precedence over provider health (owner intent wins)",
     operatingModeReason({ aiEnabled: false, geminiConfigured: false, providerCoolingDown: true }) === "owner_ai_disabled");
+
+  // ── 16. Deterministic MANAGE with NO active appointment → explain + offer to book ──
+  // In deterministic (AI-disabled) mode, tapping/saying "ניהול תור" when the customer has 0 upcoming
+  // must NOT silently send a bare booking link — it should say there's no active appointment and
+  // offer to book a new one. With an appointment, it attaches the right manage link.
+  section("16. Deterministic manage with no appointment → 'no active appointment' + book-new offer");
+  check("0 upcoming (manageLinkFor→booking): says NO active appointment + offers to book (cta_url)",
+    (() => {
+      const o = buildManageOutcome({ url: "https://x/book/test", label: "", kind: "booking" }, "ai_disabled");
+      return o.link === "booking"
+        && /תור פעיל/.test(o.text) && o.text.includes("https://x/book/test")
+        && o.interactive.kind === "cta_url" && /תור פעיל/.test(o.interactive.body)
+        && o.interactive.url === "https://x/book/test"
+        && o.text.includes(NO_APPOINTMENT_PROMPT);
+    })());
+  check("has an appointment (manageLinkFor→manage): attaches the manage link, NOT the no-appointment line",
+    (() => {
+      const o = buildManageOutcome({ url: "https://x/appointment/abc", label: "", kind: "manage" }, "ai_disabled");
+      return o.link === "manage" && !/תור פעיל/.test(o.text)
+        && o.interactive.kind === "cta_url" && o.interactive.url === "https://x/appointment/abc";
+    })());
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

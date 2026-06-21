@@ -29,7 +29,7 @@ import { buildFacts, type BusinessFacts } from "./facts";
 import {
   planContinuityMenu, resolveMenuNavigation, resolveMenuPayload, readMenuState,
   buildInteractiveForNav, buildMainMenu, buildInteractiveMainMenu, ctaBody, MENU_REMINDER,
-  type MenuState, type MenuNav,
+  NO_APPOINTMENT_PROMPT, noAppointmentCtaBody, type MenuState, type MenuNav,
 } from "./continuity-menu";
 import type { WhatsAppInteractive } from "@/lib/whatsapp";
 
@@ -407,9 +407,8 @@ export async function runPlatformTurn(
     } else if (degIntent === "manage") {
       const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
       const m = manageLinkFor(upcoming, ctx.business.slug, customerPhone, customerId);
-      text = continuityText(reason, m.kind === "booking" ? "booking" : "manage", m.url);
-      link = m.kind; logPlatformLink(m.kind, m.url);
-      interactive = { kind: "cta_url", body: ctaBody(m.kind === "booking" ? "book" : "manage"), buttonText: "לחץ כאן", url: m.url };
+      const mo = buildManageOutcome(m, reason); // 0 upcoming → "no active appointment" + offer to book new
+      text = mo.text; interactive = mo.interactive; link = mo.link; logPlatformLink(m.kind, m.url);
       menuNode = { node: "main", at: now };
     } else if (reason === "provider_transient") {
       // ONE brief blip — keep the AI experience: a soft "resend?" (rate-limited like the notice),
@@ -1024,9 +1023,8 @@ async function runMenuNavigation(nav: MenuNav, deps: MenuNavDeps): Promise<Platf
   } else if (nav.kind === "manage") {
     const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
     const m = manageLinkFor(upcoming, slug, customerPhone, customerId);
-    text = continuityText("ai_disabled", m.kind === "booking" ? "booking" : "manage", m.url);
-    link = m.kind; logPlatformLink(m.kind, m.url);
-    interactive = { kind: "cta_url", body: ctaBody(m.kind === "booking" ? "book" : "manage"), buttonText: "לחץ כאן", url: m.url };
+    const mo = buildManageOutcome(m, "ai_disabled"); // 0 upcoming → "no active appointment" + offer to book new
+    text = mo.text; interactive = mo.interactive; link = mo.link; logPlatformLink(m.kind, m.url);
   } else {
     text = nav.reply;
     interactive = buildInteractiveForNav(nav, facts) ?? undefined; // clickable buttons/list (settings enforced at chokepoint)
@@ -1637,6 +1635,29 @@ function manageLinkFor(
   if (upcoming.length === 0) return { url: buildBookingLink(slug, customerPhone), label: BOOK_LINE, kind: "booking" };
   if (upcoming.length === 1) return { url: buildAppointmentLink(upcoming[0].id), label: MANAGE_LINE, kind: "manage" };
   return { url: buildMyAppointmentsLink(customerId), label: MY_APPTS_LINE, kind: "manage" };
+}
+
+/**
+ * The deterministic MANAGE reply. When `manageLinkFor` resolved to a BOOKING link the customer has
+ * NO active appointment to manage — so we say so plainly and offer to book a new one (never a bare
+ * "great, to book!" that ignores the manage request). Otherwise we attach the right manage link.
+ * Exported for unit testing; used by both the menu-tap path and the free-text continuity path.
+ */
+export function buildManageOutcome(
+  m: ManageLink, reason: DegradedReason
+): { text: string; interactive: WhatsAppInteractive; link: PlatformLink } {
+  if (m.kind === "booking") {
+    return {
+      text: `${NO_APPOINTMENT_PROMPT}\nלקביעת תור:\n${m.url}`,
+      interactive: { kind: "cta_url", body: noAppointmentCtaBody(), buttonText: "לחץ כאן", url: m.url },
+      link: "booking",
+    };
+  }
+  return {
+    text: continuityText(reason, "manage", m.url),
+    interactive: { kind: "cta_url", body: ctaBody("manage"), buttonText: "לחץ כאן", url: m.url },
+    link: m.kind,
+  };
 }
 
 /**

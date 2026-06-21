@@ -223,6 +223,14 @@ export function ctaBody(kind: "book" | "manage"): string {
   return `${kind === "book" ? "לקביעת תור 📅" : "לניהול התור 📅"}\n${MENU_HINT}`;
 }
 
+// Shown when the customer asks to MANAGE an appointment but has NO active one — we don't silently
+// send a bare booking link; we explain there's no appointment and offer to book a new one (the
+// action card's button carries the booking link, the text fallback carries the URL).
+export const NO_APPOINTMENT_PROMPT = "אין לי תור פעיל על המספר הזה כרגע 🙂 רוצה לקבוע תור חדש?";
+export function noAppointmentCtaBody(): string {
+  return `${NO_APPOINTMENT_PROMPT}\n${MENU_HINT}`;
+}
+
 // A SHORT menu-anchor nudge for a REPEATED vague message in deterministic mode — shown instead of
 // re-sending the full clickable menu (anti-spam) and instead of going silent (which feels broken).
 // Generic, business-agnostic; emoji stripped at the chokepoint when the owner set emoji=none.
