@@ -57,8 +57,10 @@ function rulesFor(target: "male" | "female"): Rule[] {
   const m = target === "male";
   // העוזרת ↔ העוזר (keep optional ה)
   rules.push({ re: new RegExp(`${NB}(ה?)${m ? "עוזרת" : "עוזר"}${NA}`, "g"), to: `$1${m ? "עוזר" : "עוזרת"}` });
-  // וירטואלית ↔ וירטואלי (keep optional ה)
-  rules.push({ re: new RegExp(`${NB}(ה?)${m ? "וירטואלית" : "וירטואלי"}${NA}`, "g"), to: `$1${m ? "וירטואלי" : "וירטואלית"}` });
+  // וירטואלית ↔ וירטואלי (keep optional definite-ה AND an optional connective/spelling vav, so the
+  // double-vav spelling "הווירטואלי" — used in the menu copy "העוזר הווירטואלי" — is also gendered;
+  // otherwise the female fence left a mixed "העוזרת הווירטואלי").
+  rules.push({ re: new RegExp(`${NB}(ה?ו?)${m ? "וירטואלית" : "וירטואלי"}${NA}`, "g"), to: `$1${m ? "וירטואלי" : "וירטואלית"}` });
   return rules;
 }
 
@@ -76,6 +78,54 @@ export function enforceAssistantGender(text: string, gender: AISettingsGender | 
   let out = text;
   for (const r of rules) out = out.replace(r.re, r.to);
   return out;
+}
+
+// ── NEUTRAL voice (Phase 1A) ─────────────────────────────────────────────────────
+// Hebrew has no genderless first-person present participle, so "be neutral" fails at the model
+// level (report §8). Strategy = AVOIDANCE: rewrite a POSITIVE first-person gendered participle
+// to an impersonal/plural-future equivalent that carries no gender. NEGATED forms ("אני לא יכול")
+// are deliberately NOT matched — replacing the verb there would invert the meaning — so they are
+// left to the prompt (a rare, safe leftover). Customer-directed phrasing is never touched.
+const NEUTRAL_REPLACE: Record<string, string> = {
+  "יכול": "אפשר", "יכולה": "אפשר",
+  "שמח": "נשמח", "שמחה": "נשמח",
+  "ממליץ": "מומלץ", "ממליצה": "מומלץ",
+  "מציע": "מוצע", "מציעה": "מוצע",
+  "יודע": "ידוע לי", "יודעת": "ידוע לי",
+  "מבין": "מובן", "מבינה": "מובן",
+  "בטוח": "בוודאי", "בטוחה": "בוודאי",
+  "מצטער": "סליחה", "מצטערת": "סליחה",
+  "מתנצל": "סליחה", "מתנצלת": "סליחה",
+  "מסכים": "מקובל", "מסכימה": "מקובל",
+};
+// Positive-only adverbs (NO negation) between "אני" and the participle, so a negated form never matches.
+const POS_ADV = "(?:כבר|עדיין|באמת|ממש|מאוד|כל כך|לגמרי|פשוט|כאן|תכף|אכן|בהחלט|אישית)";
+const POS_GAP = `(?:\\s+${POS_ADV}){0,2}`;
+const NEUTRAL_RULES: Rule[] = Object.entries(NEUTRAL_REPLACE).map(([form, to]) => ({
+  re: new RegExp(`${NB}${ANI}${POS_GAP}\\s+${form}${NA}`, "g"),
+  to, // replaces the «אני [adv] <form>» span; the tail (e.g. " לעזור") is preserved
+}));
+
+/** Rewrites POSITIVE first-person gendered self-references to impersonal forms (neutral voice).
+ *  No-op when there's nothing to rewrite (good replies untouched). */
+export function enforceNeutralVoice(text: string): string {
+  if (!text) return text;
+  let out = text;
+  for (const r of NEUTRAL_RULES) out = out.replace(r.re, r.to);
+  return out.replace(/ {2,}/g, " ").trim();
+}
+
+/** Counts ANY first-person gendered participle ("אני …") — the neutral-mode scorer (target 0). */
+export function countGenderedFirstPerson(text: string): number {
+  if (!text) return 0;
+  let count = 0;
+  for (const [m, f] of PAIRS) {
+    if (m === f) continue;
+    for (const form of [m, f]) {
+      count += text.match(new RegExp(`${NB}${ANI}${GAP}\\s+${form}${NA}`, "g"))?.length ?? 0;
+    }
+  }
+  return count;
 }
 
 /**

@@ -1,29 +1,66 @@
 import { sendWhatsAppTextMessage, sendWhatsAppInteractiveMessage, type WhatsAppInteractive } from "@/lib/whatsapp";
-import { stripEmojis } from "@/lib/ai/reply-polish";
-import { enforceAssistantGender } from "@/lib/ai/gender";
+import { enforceAssistantGender, enforceNeutralVoice } from "@/lib/ai/gender";
+import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "@/lib/ai/style-fences";
+import { buildPromptProfile, type PromptProfile } from "@/lib/ai/prompt-profile";
 import { recordWhatsAppSendResult } from "@/lib/integration-health";
 import { type DB, saveOutboundMessage } from "./helpers";
+import type { AISettings } from "@/types/database";
+
+// The owner-settings columns the chokepoint needs to build the PromptProfile. One read, fail-open.
+const PROFILE_COLUMNS =
+  "assistant_name, assistant_gender, response_length, emoji_usage, custom_instructions, things_to_avoid, language, updated_at";
+
+/** Reads ai_settings and builds the normalized owner PromptProfile (a missing row → safe defaults). */
+async function loadProfile(db: DB, businessId: string): Promise<PromptProfile> {
+  const { data } = await db.from("ai_settings").select(PROFILE_COLUMNS).eq("business_id", businessId).maybeSingle();
+  return buildPromptProfile(data as Partial<AISettings> | null, businessId);
+}
+
+/** Assistant SELF-gender enforcement: male/female rewrite, or neutral-voice avoidance. */
+function enforceVoice(text: string, profile: PromptProfile): string {
+  if (profile.assistantGender === "male" || profile.assistantGender === "female") {
+    return enforceAssistantGender(text, profile.assistantGender);
+  }
+  return enforceNeutralVoice(text); // neutral
+}
+
+/** FULL presentation fences for free PROSE (gender → forbidden → length → emoji cap). Link-bearing
+ *  text is preserved by the length/forbidden fences themselves (they no-op when a URL is present). */
+function applyTextFences(text: string, profile: PromptProfile): string {
+  let out = enforceVoice(text, profile);
+  out = enforceForbiddenPhrases(out, profile.thingsToAvoid);
+  out = enforceLength(out, profile.responseLength);
+  out = enforceEmojiCap(out, profile.emojiCap);
+  return out;
+}
+
+/** Safe profile observability — enums + hash + version ONLY. No text, no phone, no secrets. */
+function logProfile(businessId: string, profile: PromptProfile, where: string): void {
+  console.log(
+    `[outbound] ${where} business=${businessId} profileHash=${profile.promptProfileHash}` +
+    ` settingsVersion=${profile.settingsVersion ?? "-"} gender=${profile.assistantGender}` +
+    ` emoji=${profile.emojiUsage}(cap${profile.emojiCap}) length=${profile.responseLength}`
+  );
+}
 
 /**
- * THE single outbound chokepoint, shared by the chat router (flow.ts) and the
- * booking platform. Owner AI settings apply to EVERY customer-facing message —
- * model-written, guard, deterministic strings, and platform notifications alike:
- *   - assistant_gender → the assistant's own Hebrew forms are forced to the
- *     configured gender (the FINAL authority — beats persona text, name, history,
- *     and model drift; never touches references to the customer).
- *   - emoji_usage=none → all emojis stripped.
- * Fail-open: if settings can't be read, the text is sent unmodified.
+ * THE single outbound chokepoint, shared by the chat router (flow.ts) and the booking platform.
+ * Owner AI PRESENTATION settings apply to EVERY customer-facing message — model-written, guard,
+ * deterministic strings, and platform notifications alike (the report's Model-D enforcement layer):
+ *   - assistant_gender → male/female rewrite, or NEUTRAL-voice avoidance (FINAL authority over the
+ *     assistant's own Hebrew forms; never touches references to the customer).
+ *   - emoji_usage → capped to 0 / 1 / 2 (none / low / medium).
+ *   - response_length → conservative length cap (URL-safe; never breaks a link/CTA).
+ *   - things_to_avoid → owner forbidden phrases removed (never strips links/required platform text).
+ * These are PRESENTATION fences only — they never change routing, booking/manage, grounding,
+ * reliability, or deterministic-mode behavior. Fail-open: if settings can't be read, text is sent
+ * unmodified.
  */
 export async function applyOutboundSettings(db: DB, businessId: string, text: string): Promise<string> {
   try {
-    const { data } = await db
-      .from("ai_settings")
-      .select("emoji_usage, assistant_gender")
-      .eq("business_id", businessId)
-      .maybeSingle();
-    let out = enforceAssistantGender(text, data?.assistant_gender as ("neutral" | "female" | "male") | undefined);
-    if (data?.emoji_usage === "none") out = stripEmojis(out);
-    return out;
+    const profile = await loadProfile(db, businessId);
+    logProfile(businessId, profile, "text");
+    return applyTextFences(text, profile);
   } catch {
     // settings unavailable → send as-is
     return text;
@@ -64,14 +101,12 @@ export async function sendOutbound(
   }
 }
 
-/** Applies emoji enforcement to an interactive message's body + visible labels. Gender is
- *  enforced on the BODY (the prose); button/row titles are short generic nouns (no gendered
- *  self-reference), so only emoji-stripping is applied to them. */
-function applyInteractiveSettings(
-  i: WhatsAppInteractive, gender: "neutral" | "female" | "male" | undefined, emojiNone: boolean
-): WhatsAppInteractive {
-  const body = emojiNone ? stripEmojis(enforceAssistantGender(i.body, gender)) : enforceAssistantGender(i.body, gender);
-  const label = (s: string): string => (emojiNone ? stripEmojis(s) : s);
+/** Applies PRESENTATION fences to an interactive message. Body gets gender (incl. neutral) + emoji
+ *  cap; short button/row titles are platform menu/CTA copy → emoji cap only (no gender drift there,
+ *  and the length/forbidden fences are deliberately NOT applied so required menu labels stay intact). */
+function applyInteractiveSettings(i: WhatsAppInteractive, profile: PromptProfile): WhatsAppInteractive {
+  const body = enforceEmojiCap(enforceVoice(i.body, profile), profile.emojiCap);
+  const label = (s: string): string => enforceEmojiCap(s, profile.emojiCap);
   if (i.kind === "buttons") return { kind: "buttons", body, buttons: i.buttons.map((b) => ({ ...b, title: label(b.title) })) };
   if (i.kind === "list") return { kind: "list", body, button: label(i.button), rows: i.rows.map((r) => ({ ...r, title: label(r.title), ...(r.description ? { description: label(r.description) } : {}) })) };
   return { kind: "cta_url", body, buttonText: label(i.buttonText), url: i.url };
@@ -87,15 +122,12 @@ export async function sendOutboundInteractive(
   db: DB, businessId: string, customerId: string, toPhone: string,
   interactive: WhatsAppInteractive, fallbackText: string
 ): Promise<void> {
-  let gender: "neutral" | "female" | "male" | undefined;
-  let emojiNone = false;
-  try {
-    const { data } = await db.from("ai_settings").select("emoji_usage, assistant_gender").eq("business_id", businessId).maybeSingle();
-    gender = data?.assistant_gender as ("neutral" | "female" | "male") | undefined;
-    emojiNone = data?.emoji_usage === "none";
-  } catch { /* settings unavailable → send as-is */ }
+  let profile: PromptProfile | null = null;
+  try { profile = await loadProfile(db, businessId); }
+  catch { /* settings unavailable → send as-is */ }
 
-  const enforced = applyInteractiveSettings(interactive, gender, emojiNone);
+  const enforced = profile ? applyInteractiveSettings(interactive, profile) : interactive;
+  if (profile) logProfile(businessId, profile, `interactive(${enforced.kind})`);
   console.log(`[outbound] interactive(${enforced.kind}) → "${enforced.body.slice(0, 60)}${enforced.body.length > 60 ? "…" : ""}"`);
   const result = await sendWhatsAppInteractiveMessage(toPhone, enforced);
 

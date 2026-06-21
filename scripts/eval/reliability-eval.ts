@@ -53,6 +53,10 @@ import {
   buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate,
 } from "../../lib/booking/notifications";
 import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../../lib/ai/reply-polish";
+import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
+import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
+import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
+import type { AISettings } from "../../types/database";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
@@ -1197,6 +1201,71 @@ function main(): void {
     planContinuityMenu("ai_disabled", "מה נשמע", FACTS).kind === "vague_menu" && MENU_REMINDER.length > 0);
   gap("full end-to-end runPlatformTurn I/O harness needs DI seams (Phase 5B)",
     "These assert the DECISION layer with the real functions in pipeline order. Driving runPlatformTurn itself offline is blocked because getBusinessAIContext (context.ts), logAIEvent (events.ts), and the brain's Gemini call all use supabaseServer()/network internally and ignore the passed db — and a plain tsx eval can't mock ES module bindings. RECOMMENDED next smallest step: add ONE optional, default-preserving `loadContext` (and optional event-sink) param to runPlatformTurn, which unlocks real owner-disabled + provider-outage end-to-end tests (those never call Gemini). That is a tiny DI change but still a product-code change, so it's deferred to Phase 5B for explicit approval.");
+
+  // ── 21. AI Settings Phase 1A — PromptProfile + presentation fences ─────────────
+  // Owner presentation settings, deterministically enforced at the outbound chokepoint (Model D),
+  // so they hold on BOTH Gemini-authored and canned/platform replies — without touching routing,
+  // booking/manage, grounding, reliability, or deterministic-mode behavior.
+  section("21. AI Settings Phase 1A — PromptProfile, emoji/length/forbidden/gender fences + hash");
+  // A. Emoji caps (none=0, low=1, medium=2) — applies to model AND canned text.
+  check("emoji cap: none→0, low→1, medium→2 emojis kept",
+    enforceEmojiCap("שלום 🙂😊🔥", emojiCapFor("none")) === "שלום"
+    && enforceEmojiCap("שלום 🙂😊🔥", emojiCapFor("low")) === "שלום 🙂"
+    && enforceEmojiCap("שלום 🙂😊🔥", emojiCapFor("medium")) === "שלום 🙂😊");
+  check("emoji cap keeps non-emoji text intact + handles a modifier/ZWJ emoji as one unit",
+    enforceEmojiCap("רק טקסט", 1) === "רק טקסט"
+    && enforceEmojiCap("👍🏽 תודה 🙂", 1) === "👍🏽 תודה");
+  // B. Gender enforcement (male/female rewrite; neutral avoidance) — self-reference only.
+  check("female output has no MALE self-reference; male output has no FEMALE self-reference",
+    countWrongGenderForms(enforceAssistantGender("אני שמח לעזור", "female"), "female") === 0
+    && enforceAssistantGender("אני שמח לעזור", "female").includes("שמחה")
+    && countWrongGenderForms(enforceAssistantGender("אני שמחה לעזור", "male"), "male") === 0
+    && enforceAssistantGender("אני שמחה לעזור", "male").includes("שמח"));
+  check("neutral output avoids first-person gendered forms ('אני שמח/יכול/ממליץ' → impersonal)",
+    countGenderedFirstPerson(enforceNeutralVoice("אני שמח לעזור")) === 0
+    && countGenderedFirstPerson(enforceNeutralVoice("אני יכולה לבדוק את זה")) === 0
+    && countGenderedFirstPerson(enforceNeutralVoice("אני ממליץ על הטיפול")) === 0
+    && /נשמח לעזור/.test(enforceNeutralVoice("אני שמח לעזור")));
+  check("neutral leaves already-neutral copy untouched (no over-reach)",
+    enforceNeutralVoice("נשמח לעזור 🙂 אפשר לקבוע דרך הקישור") === "נשמח לעזור 🙂 אפשר לקבוע דרך הקישור");
+  check("mixed copy 'העוזרת הווירטואלי' is made CONSISTENT by the gender fence (no mixed gender)",
+    enforceAssistantGender("העוזרת הווירטואלי", "male") === "העוזר הווירטואלי"
+    && enforceAssistantGender("העוזרת הווירטואלי", "female") === "העוזרת הווירטואלית");
+  // C. Length cap (conservative, URL-safe).
+  check("length cap: trims long prose at sentence boundary; NEVER trims when a URL is present",
+    (() => {
+      const longText = "זהו משפט הסבר ארוך מספיק עם כמה מילים. ".repeat(8).trim(); // ~300 chars, 8 sentences
+      const short = enforceLength(longText, "short");
+      const withUrl = "לקביעת תור: https://x/book/test — אפשר גם לשאול שאלות נוספות על העסק כאן בצ'אט בכל זמן שנוח לכם מאוד.";
+      return short.length < longText.length && short.length <= 240
+        && enforceLength(withUrl, "short") === withUrl       // URL present → untouched (CTA safe)
+        && enforceLength("משפט קצר.", "short") === "משפט קצר."; // within budget → untouched
+    })());
+  check("length 'long' is generous — a normal multi-sentence reply is untouched",
+    (() => { const t = "משפט ראשון. משפט שני. משפט שלישי."; return enforceLength(t, "long") === t; })());
+  // D. Forbidden phrases (narrow, never removes links/safety).
+  check("forbidden phrase removed when safe; result tidied",
+    /^שלום עולם$/.test(enforceForbiddenPhrases("שלום מילהאסורה עולם", ["מילהאסורה"]).trim()));
+  check("forbidden NEVER strips a booking/manage link or platform-required text (URL present → no-op)",
+    enforceForbiddenPhrases("לקביעת תור https://x/book/test", ["תור"]) === "לקביעת תור https://x/book/test");
+  check("forbidden falls back to a safe line if removal would mangle/empty the message",
+    (() => { const r = enforceForbiddenPhrases("מילהאסורה", ["מילהאסורה"]); return r.length > 5 && !/מילהאסורה/.test(r); })());
+  check("things_to_avoid parses lines/semicolons into phrases (commas kept)",
+    parseThingsToAvoid("ביטוי אחד\nביטוי שני; ביטוי שלישי").length === 3
+    && parseThingsToAvoid("שלום, עולם")[0] === "שלום, עולם");
+  // E. Profile hash — changes on owner edit, stable across runtime/customer input.
+  const mkSettings = (o: Partial<AISettings>): Partial<AISettings> => ({ assistant_name: "עוזר", assistant_gender: "neutral", response_length: "medium", emoji_usage: "low", language: "he", ...o });
+  check("profile hash CHANGES when an owner setting changes",
+    buildPromptProfile(mkSettings({}), "biz").promptProfileHash !== buildPromptProfile(mkSettings({ assistant_name: "מיקה" }), "biz").promptProfileHash
+    && buildPromptProfile(mkSettings({}), "biz").promptProfileHash !== buildPromptProfile(mkSettings({ emoji_usage: "none" }), "biz").promptProfileHash);
+  check("profile hash STABLE across rebuilds with the same settings (no customer/runtime input in it)",
+    buildPromptProfile(mkSettings({}), "biz").promptProfileHash === buildPromptProfile(mkSettings({}), "biz").promptProfileHash);
+  check("profile normalizes a missing row to safe defaults (he / עוזר / medium / low=cap1 / neutral)",
+    (() => {
+      const p = buildPromptProfile(null, "biz");
+      return p.language === "he" && p.assistantName === "עוזר" && p.responseLength === "medium"
+        && p.emojiUsage === "low" && p.emojiCap === 1 && p.assistantGender === "neutral" && p.promptProfileHash.length > 0;
+    })());
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
