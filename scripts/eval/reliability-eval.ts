@@ -1231,6 +1231,71 @@ function main(): void {
   check("mixed copy 'העוזרת הווירטואלי' is made CONSISTENT by the gender fence (no mixed gender)",
     enforceAssistantGender("העוזרת הווירטואלי", "male") === "העוזר הווירטואלי"
     && enforceAssistantGender("העוזרת הווירטואלי", "female") === "העוזרת הווירטואלית");
+  // B2. Neutral mode — IDENTITY / person references (not just first-person verbs). The assistant must
+  //     not present itself as a man or a woman; identity becomes non-personal, service-style wording.
+  check("neutral: a 'מי את/ה?' identity reply drops 'עוזר/עוזרת' → service wording ('זה הצ׳אט …')",
+    (() => {
+      const out = enforceNeutralVoice("אני העוזרת הווירטואלית של RB Hair Studio, אפשר לקבוע תור או לשאול שאלות.");
+      return !/עוזר/.test(out) && /הצ.?אט/.test(out) && out.includes("RB Hair Studio");
+    })());
+  check("neutral: deterministic main-menu copy no longer says 'אני העוזר/העוזרת' (with and without a name)",
+    (() => {
+      const named = enforceNeutralVoice(mainMenuBody(FACTS));
+      const anon = enforceNeutralVoice(mainMenuBody({ ...FACTS, businessName: "" }));
+      return !/אני ה?עוזר/.test(named) && !/עוזר/.test(named) && /הצ.?אט/.test(named)
+        && !/אני ה?עוזר/.test(anon) && !/עוזר/.test(anon);
+    })());
+  check("neutral: self-as-'מישהו/מישהי' becomes genderless ('כאל מישהי מהצוות' → 'כחלק מהצוות')",
+    (() => {
+      const out = enforceNeutralVoice("אפשר להתייחס אליי כאל מישהי מהצוות.");
+      return !/מישה[יו]/.test(out) && out.includes("כחלק");
+    })());
+  check("neutral fixes first-person 'אני שמח'/'אני שמחה' → impersonal ('נשמח'), no gendered self-reference",
+    countGenderedFirstPerson(enforceNeutralVoice("אני שמח לעזור")) === 0
+    && countGenderedFirstPerson(enforceNeutralVoice("אני שמחה לעזור")) === 0
+    && /נשמח לעזור/.test(enforceNeutralVoice("אני שמח לעזור"))
+    && /נשמח לעזור/.test(enforceNeutralVoice("אני שמחה לעזור")));
+  // The neutral SELF-gender fence must NOT touch customer-address slang — the owner may configure
+  // "אחי"/"גבר"/"אחותי" as intentional persona style; that's a separate customer-address-policy concern.
+  check("neutral PRESERVES customer-address style words ('גבר'/'אחי'/'אחותי') — owner persona, not self-gender",
+    (() => {
+      const s = "אין בעיה אחי, סבבה גבר, בטח אחותי 🙂";
+      return enforceNeutralVoice(s) === s; // left untouched on purpose
+    })());
+  check("neutral leaves business/service usages of 'גבר' intact ('תספורת גבר', 'סטודיו גבר', 'שירות לגברים')",
+    ["תספורת גבר", "סטודיו גבר", "שירות לגברים"].every((c) => enforceNeutralVoice(c) === c));
+  check("neutral: gender DECLARATION ('אני בת') de-gendered, but 'בן/בת זוג' and ages are never touched",
+    (() => {
+      const decl = enforceNeutralVoice("אני בת 🙂");
+      const safe = "התור שלך לבן זוג נקבע, והוא בן 30";
+      return /הצ.?אט/.test(decl) && !/אני ב[תן]/.test(decl) && enforceNeutralVoice(safe) === safe;
+    })());
+  check("neutral rules do NOT leak into male/female: identity copy stays gendered, never 'הצ׳אט'",
+    (() => {
+      const male = enforceAssistantGender("אני העוזרת הווירטואלית של RB", "male");
+      const female = enforceAssistantGender("אני העוזר הווירטואלי של RB", "female");
+      return male === "אני העוזר הווירטואלי של RB" && female === "אני העוזרת הווירטואלית של RB"
+        && !/הצ.?אט/.test(male) && !/הצ.?אט/.test(female);
+    })());
+  // B3. BUSINESS-AGNOSTIC: the neutral wording must carry the DYNAMIC business name and generic
+  //     appointment-business language ONLY — never hair/salon/treatment or any RB-specific term.
+  //     Same fence, three very different verticals (yoga studio / physio clinic / business consultant).
+  check("neutral identity for a non-salon business → generic 'זה הצ׳אט של <name>' (no hair/treatment wording)",
+    (() => {
+      const out = enforceNeutralVoice("היי, אני העוזר הווירטואלי של סטודיו יוגה אור 🙂 איך אפשר לעזור?");
+      return /זה הצ.?אט של סטודיו יוגה אור/.test(out) && !/מספרה|שיער|תספורת|סלון|טיפול/.test(out);
+    })());
+  check("neutral wording is business-agnostic across verticals: keeps the dynamic name, adds no industry words",
+    (() => {
+      const INDUSTRY = /מספרה|שיער|תספורת|סלון|טיפול|hair|salon|barber|stylist/i;
+      const generic = (s: string, name: string): boolean =>
+        s.includes(name) && /הצ.?אט/.test(s) && !/עוזר/.test(s) && !INDUSTRY.test(s);
+      return ["סטודיו יוגה אור", "קליניקת פיזיותרפיה", "יועץ עסקי"].every((name) => {
+        const identity = enforceNeutralVoice(`אני העוזרת הווירטואלית של ${name}, אפשר לקבוע תור או לקבל מידע על העסק.`);
+        const menu = enforceNeutralVoice(mainMenuBody({ ...FACTS, businessName: name })); // deterministic main-menu greeting
+        return generic(identity, name) && generic(menu, name);
+      });
+    })());
   // C. Length cap (conservative, URL-safe).
   check("length cap: trims long prose at sentence boundary; NEVER trims when a URL is present",
     (() => {

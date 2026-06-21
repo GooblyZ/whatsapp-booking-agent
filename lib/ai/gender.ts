@@ -106,12 +106,47 @@ const NEUTRAL_RULES: Rule[] = Object.entries(NEUTRAL_REPLACE).map(([form, to]) =
   to, // replaces the «אני [adv] <form>» span; the tail (e.g. " לעזור") is preserved
 }));
 
-/** Rewrites POSITIVE first-person gendered self-references to impersonal forms (neutral voice).
- *  No-op when there's nothing to rewrite (good replies untouched). */
+// ── NEUTRAL identity / person references ─────────────────────────────────────────
+// The verb rules above only de-gender first-person PARTICIPLES ("אני שמח/יכול"). Manual testing
+// showed the model ALSO genders its own IDENTITY — "אני העוזרת הווירטואלית של X", "אפשר להתייחס
+// אליי כאל מישהי מהצוות", or, answering "בן או בת?", "אני בת". In NEUTRAL mode the assistant must
+// not present ITSELF as a man or a woman, so its OWN self-reference is rewritten to non-personal,
+// SERVICE-style wording ("זה הצ׳אט של X"). Every pattern is anchored to the assistant's SELF-
+// reference (first-person "אני" or the virtual-assistant noun) and Hebrew-boundary protected, so
+// customer references and unrelated lookalikes are never touched: "אחות"/"אחיות" (nurse), the
+// honorific "גברת"/plural "גברים", "בן/בת זוג", and ages ("בן 30") all survive.
+//
+// SCOPE — this fence governs the assistant's SELF-gender ONLY. Customer-ADDRESS slang the owner may
+// intentionally configure as persona style ("אחי", "גבר", "אחותי") is NOT a self-gender violation and
+// is deliberately left untouched (so business/service text like "תספורת גבר", "שירות לגברים" also
+// survives). Whether it's appropriate to address an unknown customer that way is a separate
+// customer-address-policy concern (future AI Settings work), not this fence.
+const NEUTRAL_IDENTITY = "זה הצ׳אט"; // non-personal, service-style: "this is the chat of <business>"
+// "וירטואלי" with optional definite-ה and the single/double-vav spelling (matches "הווירטואלי").
+const VIRTUAL = "(?:\\s+ה?ו?וירטואלי(?:ת)?)?";
+const NEUTRAL_IDENTITY_RULES: Rule[] = [
+  // 1) First-person identity: "אני [ה]עוזר/ת [הווירטואלי/ת] …" → "זה הצ׳אט …" (the "של X" tail is preserved).
+  { re: new RegExp(`${NB}${ANI}\\s+ה?עוזר(?:ת)?${VIRTUAL}${NA}`, "g"), to: NEUTRAL_IDENTITY },
+  // 2) First-person gender DECLARATION (answer to "בן או בת?"): "אני בן/בת" → service wording. Guarded
+  //    so "אני בן/בת זוג" and ages ("אני בן 30") are NEVER caught. ONLY the first-person self-statement
+  //    is rewritten — "בן"/"בת" anywhere else (including customer-address) is left untouched.
+  { re: new RegExp(`${NB}${ANI}\\s+(?:בן|בת)${NA}(?!\\s+זוג)(?!\\s*\\d)`, "g"), to: NEUTRAL_IDENTITY },
+  // 3) Bare virtual-assistant noun (no "אני") — e.g. leaked/standalone identity copy → "הצ׳אט".
+  { re: new RegExp(`${NB}ה?עוזר(?:ת)?\\s+ה?ו?וירטואלי(?:ת)?${NA}`, "g"), to: "הצ׳אט" },
+  // 4) Degraded-state self-noun "העוזר/ת החכם/ה …" → neutral "הצ׳אט החכם …".
+  { re: new RegExp(`${NB}ה?עוזר(?:ת)?\\s+החכ(?:ם|מה)${NA}`, "g"), to: "הצ׳אט החכם" },
+  // 5) Self-as-"someone": "כ[אל] מישהו/מישהי …" → "כחלק …" (a genderless "as part of the team").
+  { re: new RegExp(`${NB}כ(?:אל\\s+)?מישה[יו]${NA}`, "g"), to: "כחלק" },
+];
+
+/** Rewrites POSITIVE first-person gendered self-references AND gendered identity/person phrasing to
+ *  impersonal, service-style forms (neutral voice). Anchored to the assistant's own self-reference;
+ *  customer-address slang is NOT touched. No-op when there's nothing to rewrite (good replies untouched). */
 export function enforceNeutralVoice(text: string): string {
   if (!text) return text;
   let out = text;
-  for (const r of NEUTRAL_RULES) out = out.replace(r.re, r.to);
+  for (const r of NEUTRAL_RULES) out = out.replace(r.re, r.to);           // first-person verbs
+  for (const r of NEUTRAL_IDENTITY_RULES) out = out.replace(r.re, r.to);  // identity / person nouns
   return out.replace(/ {2,}/g, " ").trim();
 }
 
