@@ -28,11 +28,16 @@ export type GeminiErrorCode = "not_configured" | "api_error" | "network" | "empt
 //
 // Gemini 503 "high demand" is an UPSTREAM condition shared by every business
 // served by this process — so the cooldown is process-global, NOT per business
-// or per conversation. After OVERLOAD_STRIKES consecutive overload failures,
-// callers that check isGeminiCoolingDown() (the conversation engine) stop
-// calling Gemini for a short window and serve turns deterministically. Any
-// successful response clears the state immediately.
-const OVERLOAD_STRIKES = 2;
+// or per conversation. POLICY (Phase 3A — AI-first): a single transient blip must
+// NOT drop the product into the deterministic menu. Strikes (one per fully-failed
+// inbound) map to operating state via getGeminiHealth():
+//   0 strikes            → healthy   (healthy_ai)
+//   1–2 strikes          → transient (degraded_ai — STILL AI-lane: soft fallback, Gemini retried)
+//   OVERLOAD_STRIKES (3) consecutive within STRIKE_WINDOW_MS (~90s) → cooldown → outage (deterministic)
+// The window means stale strikes spaced far apart don't accumulate toward outage; any success
+// clears everything. Cooldown DURATION is unchanged (GEMINI_COOLDOWN_SECONDS, default 60s).
+export const OVERLOAD_STRIKES = 3;
+export const STRIKE_WINDOW_MS = 90_000;
 const RETRY_DELAY_MS = 1_200;
 
 function cooldownMs(): number {
@@ -41,7 +46,26 @@ function cooldownMs(): number {
 }
 
 let overloadStrikes = 0;
+let lastStrikeAt = 0;
 let cooldownUntil = 0;
+
+// ── Pure policy helpers (exported for deterministic eval; no module state) ───────
+/** The next strike count given the prior count + when the last strike happened. A strike older than
+ *  the rolling window doesn't count toward outage — the window restarts at 1. */
+export function nextStrikeCount(currentStrikes: number, lastStrikeAtMs: number, nowMs: number): number {
+  if (lastStrikeAtMs > 0 && nowMs - lastStrikeAtMs > STRIKE_WINDOW_MS) return 1; // window expired → fresh
+  return currentStrikes + 1;
+}
+/** True once the strike count reaches the outage threshold (→ enter cooldown / deterministic menu). */
+export function strikesTripOutage(strikes: number): boolean {
+  return strikes >= OVERLOAD_STRIKES;
+}
+/** Maps raw counters to the operating health state (the same logic getGeminiHealth uses). */
+export function providerHealthFromCounters(strikes: number, cooldownRemainingMs: number): GeminiHealthState {
+  if (cooldownRemainingMs > 0) return "outage";
+  if (strikes > 0) return "transient";
+  return "healthy";
+}
 
 /** True while the engine should skip Gemini and serve deterministically. */
 export function isGeminiCoolingDown(): boolean {
@@ -69,41 +93,40 @@ export interface GeminiHealth {
 }
 export function getGeminiHealth(): GeminiHealth {
   const cooldownRemainingMs = geminiCooldownRemainingMs();
-  const state: GeminiHealthState =
-    cooldownRemainingMs > 0 ? "outage" : overloadStrikes > 0 ? "transient" : "healthy";
-  return { state, strikes: overloadStrikes, cooldownRemainingMs };
+  return { state: providerHealthFromCounters(overloadStrikes, cooldownRemainingMs), strikes: overloadStrikes, cooldownRemainingMs };
 }
 
-/** Test/ops hook: clears overload strikes and any active cooldown. */
+/** Test/ops hook: clears overload strikes, the rolling-window anchor, and any active cooldown. */
 export function resetGeminiHealth(): void {
   overloadStrikes = 0;
+  lastStrikeAt = 0;
   cooldownUntil = 0;
 }
 
 function noteOverload(model: string): void {
-  overloadStrikes++;
-  if (overloadStrikes >= OVERLOAD_STRIKES) {
-    cooldownUntil = Date.now() + cooldownMs();
-    // healthy/transient → OUTAGE: a sustained provider problem. The engine now serves
+  const now = Date.now();
+  overloadStrikes = nextStrikeCount(overloadStrikes, lastStrikeAt, now); // rolling-window aware
+  lastStrikeAt = now;
+  if (strikesTripOutage(overloadStrikes)) {
+    cooldownUntil = now + cooldownMs();
+    // OUTAGE: OVERLOAD_STRIKES consecutive failures within the window → sustained problem. Serve
     // deterministic menu mode until a recovery probe succeeds (see RECOVERY PROBE below).
     console.warn(
-      `[gemini] OUTAGE — model=${model} overloaded (strike ${overloadStrikes});` +
-      ` cooldown ${Math.round(cooldownMs() / 1000)}s — engine serves deterministically until recovery`
+      `[gemini] OUTAGE — model=${model} overloaded (strike ${overloadStrikes}/${OVERLOAD_STRIKES}` +
+      ` within ${Math.round(STRIKE_WINDOW_MS / 1000)}s); cooldown ${Math.round(cooldownMs() / 1000)}s — deterministic until recovery`
     );
   } else {
-    // healthy → FLAKY/transient: ONE blip. Stay AI-first (soft recovery / resend), do NOT
-    // drop into deterministic menu mode over a single 503.
+    // FLAKY/degraded_ai: 1–2 blips → STAY AI-first (soft recovery / resend), no deterministic menu.
     console.warn(
       `[gemini] FLAKY — model=${model} transient overload (strike ${overloadStrikes}/${OVERLOAD_STRIKES});` +
-      ` staying AI-first (soft recovery)`
+      ` staying AI-first (degraded_ai, soft recovery)`
     );
   }
 }
 
 function noteSuccess(): void {
   // A live call SUCCEEDED. If we were degraded (transient or full outage), this is the
-  // RECOVERY transition → clear the breaker and resume normal AI-first behavior. Logged so
-  // the healthy → degraded → recovered lifecycle is reconstructable from logs.
+  // RECOVERY transition → clear the breaker (incl. the rolling-window anchor) and resume AI-first.
   if (cooldownUntil > 0 || overloadStrikes > 0) {
     console.log(
       `[gemini] RECOVERED — provider healthy again (was ${cooldownUntil > 0 ? "outage" : "transient"});` +
@@ -111,6 +134,7 @@ function noteSuccess(): void {
     );
   }
   overloadStrikes = 0;
+  lastStrikeAt = 0;
   cooldownUntil = 0;
 }
 

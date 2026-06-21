@@ -289,17 +289,19 @@ export async function runPlatformTurn(
     geminiConfigured: isGeminiConfigured(),
     providerCoolingDown: isGeminiCoolingDown(),
   };
-  const providerHealth = getGeminiHealth().state;
-  const operatingState = resolveOperatingState({ ...modeInputs, providerHealth });
+  const gh = getGeminiHealth();
+  const operatingState = resolveOperatingState({ ...modeInputs, providerHealth: gh.state });
   const deterministicMenu = isDeterministicState(operatingState); // THE deterministic decision
   // Mode-resolution log — emitted BEFORE any branch that can suppress, call Gemini, or route to AI, so
-  // "owner AI disabled" can never be mistaken for "healthy AI". No secrets: a business UUID + booleans.
-  // If aiEnabled=true while the owner believes AI is off, the toggle wasn't persisted as ai_enabled=false.
+  // "owner AI disabled" can never be mistaken for "healthy AI". No secrets: a business UUID + booleans +
+  // provider-health counters (strikes/cooldown). If aiEnabled=true while the owner believes AI is off,
+  // the toggle wasn't persisted as ai_enabled=false.
   console.log(
     `[platform-turn] mode-resolution business=${businessId}` +
     ` operatingState=${operatingState} modeReason=${operatingModeReason(modeInputs)} deterministicMenu=${deterministicMenu}` +
     ` aiEnabled=${modeInputs.aiEnabled} geminiConfigured=${modeInputs.geminiConfigured}` +
-    ` providerCoolingDown=${modeInputs.providerCoolingDown} providerHealth=${providerHealth}` +
+    ` providerCoolingDown=${modeInputs.providerCoolingDown} providerHealth=${gh.state}` +
+    ` strikes=${gh.strikes} cooldownMs=${gh.cooldownRemainingMs}` +
     ` aiSettingsRow=${ctx.aiSettings ? "present" : "missing(default_enabled)"}`
   );
   if (deterministicMenu) {

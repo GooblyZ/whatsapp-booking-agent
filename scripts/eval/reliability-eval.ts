@@ -44,7 +44,10 @@ import {
   resolveMenuPayload, buildInteractiveMainMenu, buildInteractiveFaqMenu, buildInteractiveAnswer, MENU_PAYLOAD,
   mainMenuBody, ctaBody, MENU_HINT, MENU_REMINDER, NO_APPOINTMENT_PROMPT,
 } from "../../lib/ai/continuity-menu";
-import { getGeminiHealth, resetGeminiHealth } from "../../lib/ai/gemini";
+import {
+  getGeminiHealth, resetGeminiHealth,
+  nextStrikeCount, strikesTripOutage, providerHealthFromCounters, OVERLOAD_STRIKES, STRIKE_WINDOW_MS,
+} from "../../lib/ai/gemini";
 import { extractInboundMessage } from "../../lib/whatsapp";
 import {
   buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate,
@@ -1063,6 +1066,54 @@ function main(): void {
     && operatingModeReason({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: false }) === "no_api_key"
     && operatingModeReason({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: true }) === "provider_outage"
     && operatingModeReason({ aiEnabled: true, geminiConfigured: true, providerCoolingDown: false }) === "healthy_ai");
+
+  // ── 18. Provider-health policy (Phase 3A) — 3 strikes / ~90s window → outage ───
+  // AI-first: a transient blip must NOT drop into deterministic menu. 0 → healthy, 1–2 → degraded_ai
+  // (AI lane, soft fallback), 3 consecutive within ~90s → provider_outage (deterministic). Cooldown
+  // duration unchanged. Owner-disabled / no-key still override provider health.
+  section("18. Provider-health policy (Phase 3A): 3 consecutive failures in ~90s → outage");
+  check("threshold = 3 strikes; rolling window ≈ 90s",
+    OVERLOAD_STRIKES === 3 && STRIKE_WINDOW_MS === 90_000);
+  check("strike counting within the window (1→2→3); a stale strike past the window restarts at 1",
+    (() => {
+      const T = 1_700_000_000_000;
+      return nextStrikeCount(0, 0, T) === 1
+        && nextStrikeCount(1, T, T + 1_000) === 2
+        && nextStrikeCount(2, T, T + 1_000) === 3
+        && nextStrikeCount(2, T, T + STRIKE_WINDOW_MS + 1) === 1; // window expired → fresh
+    })());
+  check("only the 3rd strike trips outage (1,2 stay degraded)",
+    strikesTripOutage(1) === false && strikesTripOutage(2) === false && strikesTripOutage(3) === true);
+  check("counters → health: 0=healthy, 1–2=transient, cooldown→outage",
+    providerHealthFromCounters(0, 0) === "healthy"
+    && providerHealthFromCounters(1, 0) === "transient"
+    && providerHealthFromCounters(2, 0) === "transient"
+    && providerHealthFromCounters(3, 60_000) === "outage");
+  // Full mapping into operating state (the AI-first outcome).
+  const aiOk = { aiEnabled: true, geminiConfigured: true };
+  check("0 failures → healthy_ai (AI lane)",
+    resolveOperatingState({ ...aiOk, providerCoolingDown: false, providerHealth: providerHealthFromCounters(0, 0) }) === "healthy_ai");
+  check("1 failure → degraded_ai, NOT deterministic (still AI-first)",
+    (() => {
+      const s = resolveOperatingState({ ...aiOk, providerCoolingDown: false, providerHealth: providerHealthFromCounters(1, 0) });
+      return s === "degraded_ai" && isDeterministicState(s) === false;
+    })());
+  check("2 failures → degraded_ai, NOT deterministic (still AI-first)",
+    (() => {
+      const s = resolveOperatingState({ ...aiOk, providerCoolingDown: false, providerHealth: providerHealthFromCounters(2, 0) });
+      return s === "degraded_ai" && isDeterministicState(s) === false;
+    })());
+  check("3 failures (cooldown set) → provider_outage, deterministic",
+    (() => {
+      const s = resolveOperatingState({ ...aiOk, providerCoolingDown: true, providerHealth: providerHealthFromCounters(3, 60_000) });
+      return s === "provider_outage" && isDeterministicState(s) === true;
+    })());
+  check("success resets provider health back to healthy (strikes 0, no cooldown)",
+    (() => { resetGeminiHealth(); const h = getGeminiHealth(); return h.state === "healthy" && h.strikes === 0 && h.cooldownRemainingMs === 0; })());
+  check("owner-disabled OVERRIDES provider outage (still deterministic owner_ai_disabled, never Gemini)",
+    resolveOperatingState({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: true, providerHealth: "outage" }) === "owner_ai_disabled");
+  check("no API key OVERRIDES provider health (no_key deterministic safety)",
+    resolveOperatingState({ aiEnabled: true, geminiConfigured: false, providerCoolingDown: true, providerHealth: "outage" }) === "no_key");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
