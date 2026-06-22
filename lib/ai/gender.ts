@@ -126,11 +126,17 @@ const NEUTRAL_IDENTITY = "זה הצ׳אט"; // non-personal, service-style: "thi
 // optionally followed by an identity QUALIFIER — a whole family, not one sentence:
 //   "אני העוזרת הווירטואלית של X", "אני עוזרת הקבלה של X", "אני נציג השירות של X",
 //   "אני המזכירה הדיגיטלית של X", "אני העוזר האישי של X".
-const ROLE = "(?:עוזר(?:ת)?|נציג(?:ה|ת)?|מזכיר(?:ה)?)"; // assistant / representative / secretary (gendered)
+const ROLE = "(?:עוזר(?:ת)?|נציג(?:ה|ת)?|מזכיר(?:ה|ת)?)"; // assistant / representative / secretary (incl. construct forms)
 // An identity qualifier bound to the role: an adjective (optional definite-ה + the double-vav spelling
 // of "הווירטואלי") OR a construct noun ("הקבלה"/"השירות"). The leading \s+ is part of each branch.
 const ROLE_QUAL =
   "(?:\\s+ה?ו?(?:וירטואלי(?:ת)?|דיגיטלי(?:ת)?|אישי(?:ת)?|אוטומטי(?:ת)?)|\\s+ה?(?:קבלה|שירות))";
+// A bounded ALLOWLIST of GENERIC business/establishment nouns — how a business refers to ITSELF, never
+// industry/service vocab (so it stays business-agnostic). Rule 1b ONLY rewrites "אני <role> ה<entity>"
+// against this fixed list, which makes it grammar-safe by construction: a verb + adverb/quantifier
+// ("אני עוזר המון/הכי/הבוקר/הרבה יותר") can never match it, so no broken "זה הצ׳אט של המון" is possible.
+// Extend this list to teach the fence a new business form — never widen it to an open-ended ה-word.
+const ENTITY = "(?:עסק|סטודיו|מרפאה|מכון|מרכז|קליניקה|חברה|צוות|משרד|שירות|קבלה)";
 const NEUTRAL_IDENTITY_RULES: Rule[] = [
   // 1) First-person self-IDENTITY as a CLASS → "זה הצ׳אט …" (the "של X" tail is preserved). Fires ONLY
   //    when "אני <role>" is unmistakably the identity NOUN: the role is DEFINITE ("אני ה<role> …"), OR
@@ -138,6 +144,13 @@ const NEUTRAL_IDENTITY_RULES: Rule[] = [
   //    deliberately never touches the VERB readings "אני עוזר/ת לך" (help) or "אני מזכיר/ה לך" (remind)
   //    — they have no ה, no qualifier and no "של", so none of the three branches match.
   { re: new RegExp(`${NB}${ANI}\\s+(?:ה${ROLE}${ROLE_QUAL}?|${ROLE}(?:${ROLE_QUAL}|(?=\\s+של)))${NA}`, "g"), to: NEUTRAL_IDENTITY },
+  // 1b) SMIKHUT construct identity: "אני <role> ה<generic-business-noun>" → "זה הצ׳אט של <noun>" (the
+  //    noun is PRESERVED, so it stays clean Hebrew): "אני עוזרת הסטודיו" → "זה הצ׳אט של הסטודיו",
+  //    "אני נציגת הקליניקה" → "זה הצ׳אט של הקליניקה", "אני מזכירת המרכז" → "זה הצ׳אט של המרכז". CONSERVATIVE:
+  //    only the fixed ENTITY allowlist matches, so verb+adverb phrases ("אני עוזר המון/הכי/הבוקר") are never
+  //    rewritten. The word boundary (NA) keeps "העסק" from firing inside "העסקה" (a deal). The assistant
+  //    verbs take ל ("עוזר/מזכיר ל…", handled by NEUTRAL_ACTION_RULES), so this never collides with them.
+  { re: new RegExp(`${NB}${ANI}\\s+${ROLE}\\s+(ה${ENTITY})${NA}`, "g"), to: `${NEUTRAL_IDENTITY} של $1` },
   // 2) First-person gender DECLARATION (answer to "בן או בת?"): "אני בן/בת" → service wording. Guarded
   //    so "אני בן/בת זוג" and ages ("אני בן 30") are NEVER caught. ONLY the first-person self-statement
   //    is rewritten — "בן"/"בת" anywhere else (including customer-address) is left untouched.

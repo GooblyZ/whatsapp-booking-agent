@@ -1255,6 +1255,23 @@ async function main(): Promise<void> {
         return /^זה הצ.?אט של /.test(out) && out.includes(X) && !/עוזר|נציג|מזכיר/.test(out);
       });
     })());
+  check("neutral self-identity CONSTRUCT (role + business/entity noun) → 'זה הצ׳אט של <noun>' (QA bug 'אני עוזרת הסטודיו')",
+    (() => {
+      const cases: [string, string][] = [
+        ["אני עוזרת הסטודיו", "הסטודיו"], ["אני עוזר הסטודיו", "הסטודיו"],   // the exact QA bug + masculine pair
+        ["אני עוזרת העסק", "העסק"], ["אני עוזר העסק", "העסק"],
+        ["אני עוזרת המרפאה", "המרפאה"], ["אני עוזר המכון", "המכון"],
+        ["אני נציגת הקליניקה", "הקליניקה"], ["אני מזכירת המרכז", "המרכז"],
+      ];
+      // each → exactly "זה הצ׳אט של <noun>" (no leftover 'עוזר/ת', noun preserved, clean Hebrew)
+      return cases.every(([inp, noun]) => new RegExp(`^זה הצ.?אט של ${noun}$`).test(enforceNeutralVoice(inp)));
+    })());
+  check("neutral construct fence is CONSERVATIVE — verb/adverb phrases NEVER become 'זה הצ׳אט של …'",
+    (() => {
+      // ה-word that is NOT a generic business noun (allowlist) → left unchanged, never rewritten.
+      const phrases = ["אני עוזר המון", "אני עוזר הכי מהר", "אני עוזרת הבוקר", "אני עוזר הרבה יותר", "אני עוזר היום", "אני עוזרת היטב"];
+      return phrases.every((p) => enforceNeutralVoice(p) === p && !/זה הצ.?אט של/.test(enforceNeutralVoice(p)));
+    })());
   check("neutral first-person ACTION verbs → clean impersonal wording (dative-pronoun & double-ל objects)",
     enforceNeutralVoice("אני עוזר לך") === "אפשר לעזור לך"
     && enforceNeutralVoice("אני עוזרת לכם") === "אפשר לעזור לכם"
