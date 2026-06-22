@@ -946,6 +946,25 @@ async function main(): Promise<void> {
   check("DEDUPE predicate: a real move notifies; a same-slot resubmit does NOT (no duplicate spam)",
     rescheduleChanged("2026-06-18", "11:15", "2026-06-20", "09:30") === true
     && rescheduleChanged("2026-06-18", "11:15", "2026-06-18", "11:15") === false);
+  check("notification TEMPLATES are business-agnostic, say 'successfully', and never mention AI/bot/industry",
+    (() => {
+      // template wording only (service omitted) — dynamic service names are owner data, out of scope here
+      const cancel = buildCancellationMessage({ serviceName: null, dateISO: "2026-06-18", time: "11:15", bookingLink: "https://x/book/biz" });
+      const resched = buildRescheduleMessage({ serviceName: null, fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: "https://x/appointment/abc" });
+      const BANNED = /gemini|chatbot|רובוט|העוזר|מספרה|שיער|תספורת|סלון|קליניקה|hair|salon|clinic|beauty/i;
+      return cancel.includes("בהצלחה") && resched.includes("בהצלחה")        // confirms success
+        && !BANNED.test(cancel) && !BANNED.test(resched);                   // no AI/bot/vertical wording
+    })());
+  check("notification messages embed the link IN-BODY and survive fences: length cap never trims the CTA",
+    (() => {
+      const cancel = buildCancellationMessage({ serviceName: "שירות בסיסי", dateISO: "2026-06-18", time: "11:15", bookingLink: "https://x/book/biz" });
+      const resched = buildRescheduleMessage({ serviceName: null, fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: "https://x/appointment/abc" });
+      // The link lives INSIDE the message body (unlike AI-chat CTAs, which are separate interactive cards),
+      // so the URL-aware length fence must no-op even at the most aggressive "short" cap. Gender/emoji
+      // fences don't apply (no first-person self-reference, no emojis), so the full pipeline is a no-op.
+      return enforceLength(cancel, "short") === cancel && cancel.includes("https://x/book/biz")
+        && enforceLength(resched, "short") === resched && resched.includes("https://x/appointment/abc");
+    })());
   gap("notification SEND path (cancel/reschedule) is an integration path",
     "The pure message builders + dedupe predicates are unit-asserted here. The actual send (sendOutbound after a successful conditional DB update; cancel deduped by the .select('id') rowcount, reschedule by rescheduleChanged) lives in lib/booking/platform.ts and needs a live DB + WhatsApp. It reuses the exact fail-open booking-confirmation pattern; a manual manage-page test is the full assertion.");
 
