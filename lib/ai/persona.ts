@@ -115,7 +115,8 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     // VOICE — three NON-OVERLAPPING layers, in strict precedence so two controls
     // can never silently fight: (1) character = who you are (one natural-language
     // description, the sole voice authority); (2) format = how you write, always
-    // holds; (3) hard rules = never-cross, override everything.
+    // holds; (3) owner AVOIDANCE guidance = style hints on wording/topics to avoid —
+    // shapes phrasing only, NEVER overrides the platform/booking/safety rules below.
     `=== WHO YOU ARE (defined by the business owner — this is your character) ===`,
     personality
       ? [
@@ -134,8 +135,9 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     avoid
       ? [
           ``,
-          `=== HARD RULES (never cross these, in any phrasing or situation — they override your character, the format, and everything below) ===`,
-          `"${avoid}"`,
+          `=== OWNER STYLE GUIDANCE (wording/topics to AVOID — this is about HOW you phrase things) ===`,
+          `Lean away from this wording or these topics: "${avoid}"`,
+          `This shapes your phrasing only. It NEVER overrides the appointment/booking rules, the business facts, honesty, reliability, or any system/safety rule — if it ever conflicts with them, follow the system.`,
         ].join("\n")
       : ``,
     ``,

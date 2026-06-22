@@ -8,7 +8,7 @@
 //   מי הוא          (identity)      — name + gender
 //   האישיות         (personality)   — ONE natural-language description (the voice)
 //   סגנון כתיבה     (writing style) — length / emoji / language (format, not personality)
-//   כללים נוקשים    (hard rules)    — limits that override personality
+//   הנחיות נוספות   (style guidance) — soft wording/topics to avoid (never overrides the system)
 //
 // No tone presets, no business-type field, no prompt jargon. The personality is a
 // single field the owner writes in their own words; the optional ✨ button asks the
@@ -180,18 +180,20 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
         </label>
       </fieldset>
 
-      {/* HARD RULES — override personality. */}
+      {/* STYLE GUIDANCE — soft wording/topics to avoid; applied through the assistant, never a system override. */}
       <fieldset style={fieldset}>
-        <legend style={legend}>כללים נוקשים</legend>
+        <legend style={legend}>הנחיות סגנון נוספות</legend>
         <label style={fieldWrap}>
-          <span style={fieldLabel}>דברים שאסור לעשות</span>
+          <span style={fieldLabel}>דברים שכדאי לעוזר להימנע מהם בניסוח</span>
           <textarea
             name="things_to_avoid" defaultValue={initial?.things_to_avoid ?? ""}
             rows={3} maxLength={1000}
             placeholder="לדוגמה: אל תדבר על רווחי העסק; אל תבטיח תורים; אל תיתן הנחות."
             style={{ ...inputStyle, resize: "vertical" }}
           />
-          <span style={hint}>גבולות מוחלטים שהבוט לעולם לא יחצה — גוברים על האישיות ועל הכול.</span>
+          <span style={hint}>
+            הנחיות כתיבה לעוזר — משפיעות על אופן הניסוח. זו אינה רשימת מילים אסורות, והיא אינה גוברת על כללי קביעת התור, האמת או הבטיחות של המערכת.
+          </span>
         </label>
       </fieldset>
     </div>

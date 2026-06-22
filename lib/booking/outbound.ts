@@ -1,6 +1,6 @@
 import { sendWhatsAppTextMessage, sendWhatsAppInteractiveMessage, type WhatsAppInteractive } from "@/lib/whatsapp";
 import { enforceAssistantGender, enforceNeutralVoice } from "@/lib/ai/gender";
-import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "@/lib/ai/style-fences";
+import { enforceEmojiCap, enforceLength } from "@/lib/ai/style-fences";
 import { buildPromptProfile, type PromptProfile } from "@/lib/ai/prompt-profile";
 import { recordWhatsAppSendResult } from "@/lib/integration-health";
 import { type DB, saveOutboundMessage } from "./helpers";
@@ -24,11 +24,15 @@ function enforceVoice(text: string, profile: PromptProfile): string {
   return enforceNeutralVoice(text); // neutral
 }
 
-/** FULL presentation fences for free PROSE (gender → forbidden → length → emoji cap). Link-bearing
- *  text is preserved by the length/forbidden fences themselves (they no-op when a URL is present). */
+/** Presentation fences for free PROSE (gender/neutral voice → length → emoji cap). Link-bearing text is
+ *  preserved by the length fence (it no-ops when a URL is present).
+ *  NOTE (AI Settings Phase 2A): things_to_avoid is owner STYLE guidance, applied via the PERSONA prompt
+ *  only — it is intentionally NOT enforced as a hard deterministic filter here. Treating instruction-
+ *  phrased guidance ("אל תשתמש במילה מבצע") as literal removal silently no-ops, and a bare common word
+ *  ("תור") would get stripped from real replies. A future hard `forbidden_terms` field would re-use
+ *  enforceForbiddenPhrases at this point; it stays exported for that. */
 function applyTextFences(text: string, profile: PromptProfile): string {
   let out = enforceVoice(text, profile);
-  out = enforceForbiddenPhrases(out, profile.thingsToAvoid);
   out = enforceLength(out, profile.responseLength);
   out = enforceEmojiCap(out, profile.emojiCap);
   return out;
@@ -51,7 +55,7 @@ function logProfile(businessId: string, profile: PromptProfile, where: string): 
  *     assistant's own Hebrew forms; never touches references to the customer).
  *   - emoji_usage → capped to 0 / 1 / 2 (none / low / medium).
  *   - response_length → conservative length cap (URL-safe; never breaks a link/CTA).
- *   - things_to_avoid → owner forbidden phrases removed (never strips links/required platform text).
+ *   - things_to_avoid → owner STYLE guidance, applied via the persona prompt ONLY — not a hard fence here.
  * These are PRESENTATION fences only — they never change routing, booking/manage, grounding,
  * reliability, or deterministic-mode behavior. Fail-open: if settings can't be read, text is sent
  * unmodified.

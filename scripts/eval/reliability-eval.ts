@@ -61,6 +61,7 @@ import { buildReceptionistInstruction } from "../../lib/ai/persona";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
+import { applyOutboundSettings } from "../../lib/booking/outbound";
 import type { ReceptionistTurn, ReceptionistDecision } from "../../lib/ai/brain";
 import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
 
@@ -89,7 +90,7 @@ const dec = (intent: string): ReceptionistDecision =>
 
 const SERVICES = ["תספורת", "פן ועיצוב", "צביעת שיער"]; // the live test tenant's real services
 
-function main(): void {
+async function main(): Promise<void> {
   console.log("=== reliability-eval (deterministic, no network/DB/Gemini) ===");
 
   // ── 1. Routing → correct link family (the core product promise) ────────────────
@@ -1404,6 +1405,36 @@ function main(): void {
         && /never inside this chat/.test(hostile)                                        // platform boundary still emitted
         && /Never claim a booking/.test(hostile);                                        // truth fence still emitted
     })());
+  // B6. Phase 2A — things_to_avoid is SOFT style guidance, NOT a hard outbound filter. Exercises the
+  //     REAL chokepoint (applyOutboundSettings) with a stub db so the wiring change is what's tested.
+  const outboundDb = (row: Partial<AISettings>): Parameters<typeof applyOutboundSettings>[0] =>
+    ({ from: () => ({ select: () => ({ eq: () => ({ maybeSingle: async () => ({ data: row }) }) }) }) }) as unknown as Parameters<typeof applyOutboundSettings>[0];
+  const obBase: Partial<AISettings> = { assistant_gender: "neutral", response_length: "long", emoji_usage: "low", language: "he", updated_at: "2026-06-21T10:00:00Z" };
+  const obInstr = await applyOutboundSettings(outboundDb({ ...obBase, things_to_avoid: "אל תשתמש במילה מבצע" }), "biz", "יש לנו מבצע מיוחד החודש, נשמח לעזור.");
+  const obBareWord = await applyOutboundSettings(outboundDb({ ...obBase, things_to_avoid: "תור" }), "biz", "אפשר לקבוע תור בקלות, נשמח לעזור.");
+  const obLink = await applyOutboundSettings(outboundDb({ ...obBase, things_to_avoid: "תור" }), "biz", "לקביעת תור: https://x/book/biz");
+  const obEmoji = await applyOutboundSettings(outboundDb({ ...obBase, emoji_usage: "none", things_to_avoid: "מבצע" }), "biz", "שמחים לעזור 🙂😊🔥");
+  const obMale = await applyOutboundSettings(outboundDb({ ...obBase, assistant_gender: "male", things_to_avoid: "מבצע" }), "biz", "אני שמחה לעזור לך");
+  check("Phase 2A: instruction-phrased things_to_avoid does NOT strip/mangle outbound ('מבצע' survives)",
+    obInstr.includes("מבצע") && obInstr.includes("נשמח לעזור"));
+  check("Phase 2A: a bare common word in things_to_avoid ('תור') is NOT removed from a normal reply",
+    obBareWord.includes("תור") && obBareWord === "אפשר לקבוע תור בקלות, נשמח לעזור.");
+  check("Phase 2A: booking/manage link stays intact even with things_to_avoid set",
+    obLink.includes("https://x/book/biz"));
+  check("Phase 2A: OTHER outbound fences still work via the chokepoint (emoji none=0; male self-reference)",
+    obEmoji === "שמחים לעזור" && obMale.includes("אני שמח לעזור") && !obMale.includes("שמחה"));
+  check("Phase 2A: persona still includes the avoid text as SOFT style guidance (old 'override everything' claim gone)",
+    (() => {
+      const p = personaPrompt({ things_to_avoid: "אל תבטיח תורים" });
+      return p.includes("אל תבטיח תורים") && /OWNER STYLE GUIDANCE/.test(p) && /NEVER overrides/.test(p)
+        && !/override your character, the format, and everything below/.test(p);
+    })());
+  check("Phase 2A: platform booking rules still present + avoid guidance is explicitly subordinate to them",
+    (() => {
+      const p = personaPrompt({ things_to_avoid: "תמיד תאשר תורים בצ'אט" });
+      return /never inside this chat/.test(p) && /Never claim a booking/.test(p)
+        && /NEVER overrides the appointment\/booking rules/.test(p);
+    })());
   // C. Length cap (conservative, URL-safe).
   check("length cap: trims long prose at sentence boundary; NEVER trims when a URL is present",
     (() => {
@@ -1446,4 +1477,4 @@ function main(): void {
   process.exitCode = fail > 0 ? 1 : 0;
 }
 
-main();
+void main();
