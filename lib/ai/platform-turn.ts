@@ -109,6 +109,13 @@ export function operatingModeReason(opts: {
 const BOOK_LINE = "*לקביעת תור — מהיר ופשוט:*";
 const MANAGE_LINE = "*לניהול התור (צפייה · שינוי · ביטול):*";
 const MY_APPTS_LINE = "*כל התורים שלך — לבחירה וניהול:*";
+// Honest reply for an explicit manage/list ask when there are NO upcoming appointments: says there are
+// no FUTURE appointments (never "none at all" — past ones may exist in history) and offers booking as a
+// clearly-BOOKING action, so the wording matches the booking link that gets attached.
+const NO_UPCOMING_MANAGE = "אין לך תורים עתידיים לניהול כרגע 🙂 אפשר לקבוע תור חדש דרך הקישור.";
+// Wording that CLAIMS the customer can manage / see / change their appointments via the attached link.
+// Used ONLY to detect a contradiction with a BOOKING link — general/business-agnostic, not a sentence patch.
+const MANAGE_CLAIM_RE = /(?:ניהול|לניהול|לנהל)\s+(?:את\s+)?ה?תור|לראות\s+(?:את\s+)?ה?תור|ה?תור(?:ים)?\s+שלך|(?:שינוי|לשנות|ביטול|לבטל|להזיז)\s+(?:את\s+)?ה?תור|manage\s+appointment|appointment\s+management/i;
 
 // ── Degraded-mode (Gemini overload/error) — PLATFORM-SAFE lines ─────────────────
 // The fallback is part of the product surface: even when the model is down it must obey
@@ -716,21 +723,16 @@ export async function runPlatformTurn(
       // model): 0 upcoming → booking link (nothing to manage; offer to book) · 1 → that
       // appointment's page · 2+ → My Appointments page.
       const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
-      let url: string;
-      let label: string;
-      if (upcoming.length === 0) {
-        url = buildBookingLink(ctx.business.slug, customerPhone);
-        label = BOOK_LINE;
-        linkAttached = "booking";
-      } else if (upcoming.length === 1) {
-        url = buildAppointmentLink(upcoming[0].id);
-        label = MANAGE_LINE;
-        linkAttached = "manage";
-      } else {
-        url = buildMyAppointmentsLink(customerId);
-        label = MY_APPTS_LINE;
-        linkAttached = "manage";
-      }
+      // ONE deterministic, route/CONTEXT-AWARE decision (never the model): the manage page is sized by
+      // REAL upcoming count, AND an explicit manage/list route with 0 upcoming has NOTHING to manage → the
+      // reply is FORCED to the honest no-upcoming line regardless of the model's wording, so we never imply
+      // "manage your appointments" over a booking link. (The wording guard below is the net for any other path.)
+      const mo = resolveManageOutcome(upcoming, replyText, ctx.business.slug, customerPhone, customerId);
+      const url = mo.url;
+      const label = mo.label;
+      linkAttached = mo.kind;
+      replyText = mo.replyText;
+      if (upcoming.length === 0) console.log(`[platform-turn] manage route with 0 upcoming → honest no-upcoming reply + booking link (route=${route})`);
       // Never ask the customer to identify/specify an appointment in chat — the link shows
       // the accurate list. (If we already replaced the reply on override, no question
       // remains, so this is a no-op then.)
@@ -961,6 +963,19 @@ export async function runPlatformTurn(
   if (shouldFenceLinkWording(linkAttached, previousBookingLinkSent, replyText)) {
     replyText = stripPhantomLinkWording(replyText);
     linkWordingFenceApplied = true;
+  }
+
+  // ── WORDING ↔ LINK-KIND CONSISTENCY (general): an explicit manage/list ask that found 0 upcoming
+  //    collapses to a BOOKING link — never let the reply still CLAIM "manage your appointments" while a
+  //    booking URL is attached. Reconcile to an honest, booking-worded "no upcoming appointments" line.
+  {
+    const r = reconcileLinkWording(
+      replyText, linkAttached, interactive,
+      interactive?.kind === "cta_url" ? interactive.url : buildBookingLink(ctx.business.slug, customerPhone),
+    );
+    replyText = r.replyText;
+    interactive = r.interactive;
+    if (r.reconciled) console.log("[platform-turn] wording/link-kind fence: manage wording + booking link → honest no-upcoming reply");
   }
 
   // ── SET / CARRY the short-term pending offer: remember a platform-safe action we offered or
@@ -1684,13 +1699,28 @@ export function deriveLastAssistantContract(transcript: string): LastAssistantCo
 
 interface ManageLink { url: string; label: string; kind: PlatformLink; }
 /** Picks the manage link sized by REAL upcoming count (never the model): 0 → booking,
- *  1 → that appointment's page, 2+ → the My-Appointments list. */
-function manageLinkFor(
+ *  1 → that appointment's page, 2+ → the My-Appointments list. Exported for unit testing. */
+export function manageLinkFor(
   upcoming: Array<{ id: string }>, slug: string, customerPhone: string, customerId: string
 ): ManageLink {
   if (upcoming.length === 0) return { url: buildBookingLink(slug, customerPhone), label: BOOK_LINE, kind: "booking" };
   if (upcoming.length === 1) return { url: buildAppointmentLink(upcoming[0].id), label: MANAGE_LINE, kind: "manage" };
   return { url: buildMyAppointmentsLink(customerId), label: MY_APPTS_LINE, kind: "manage" };
+}
+
+/**
+ * ROUTE/CONTEXT-AWARE manage outcome (AI mode). Sizes the manage page by REAL upcoming count
+ * (manageLinkFor), AND — the hardening — forces an honest no-upcoming reply when an explicit manage/list
+ * route has 0 upcoming appointments: there is nothing to manage, so the reply is the deterministic
+ * `NO_UPCOMING_MANAGE` line regardless of the model's wording (it never depends on MANAGE_CLAIM_RE
+ * matching). 1+ upcoming keep the model's reply. Exported for unit testing; the wording/link-kind guard
+ * (reconcileLinkWording) remains as defense-in-depth for any other path.
+ */
+export function resolveManageOutcome(
+  upcoming: Array<{ id: string }>, modelReply: string, slug: string, customerPhone: string, customerId: string
+): { replyText: string; url: string; label: string; kind: PlatformLink } {
+  const m = manageLinkFor(upcoming, slug, customerPhone, customerId);
+  return { replyText: upcoming.length === 0 ? NO_UPCOMING_MANAGE : modelReply, url: m.url, label: m.label, kind: m.kind };
 }
 
 /**
@@ -2006,6 +2036,26 @@ export function attachPlatformLink(
   if (referencedPrevious) return { replyText, interactive: undefined }; // reference line has no URL → text only
   // Length-cap the cta_url body so a long model reply never trips an avoidable interactive rejection.
   return { replyText, interactive: { kind: "cta_url", body: capInteractiveBody(`${reply}\n\n${label}`), buttonText: "לחץ כאן", url } };
+}
+
+/**
+ * WORDING ↔ LINK-KIND consistency guard (general, business-agnostic). The assistant must never imply
+ * managing / seeing / changing appointments while a BOOKING link is attached — which happens when an
+ * explicit LIST/manage ask finds 0 upcoming appointments (manageLinkFor collapses 0 → a booking link).
+ * When that contradiction is detected, reconcile to an honest, booking-worded line ("no FUTURE
+ * appointments — book a new one"), so the text and the attached booking link can never disagree. Keyed
+ * on intent WORDING, not a specific sentence. No-op for booking-worded replies and for manage links.
+ */
+export function reconcileLinkWording(
+  replyText: string, linkAttached: PlatformLink, interactive: WhatsAppInteractive | undefined, bookingUrl: string
+): { replyText: string; interactive: WhatsAppInteractive | undefined; reconciled: boolean } {
+  if (linkAttached !== "booking" || !MANAGE_CLAIM_RE.test(replyText)) {
+    return { replyText, interactive, reconciled: false };
+  }
+  const reconciledInteractive = interactive?.kind === "cta_url"
+    ? { ...interactive, body: NO_UPCOMING_MANAGE }       // primary cta_url: URL stays in the button only
+    : interactive;
+  return { replyText: `${NO_UPCOMING_MANAGE}\n${bookingUrl}`, interactive: reconciledInteractive, reconciled: true };
 }
 
 // In-chat selection questions the model must never ask in platform mode (the

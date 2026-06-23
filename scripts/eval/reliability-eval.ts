@@ -35,7 +35,7 @@ import {
   readPendingFailedNeed, PENDING_FAILED_NEED_TTL_MS,
   isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
   resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
-  attachPlatformLink, stripModelUrls,
+  attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -1061,6 +1061,52 @@ async function main(): Promise<void> {
       return o.link === "manage" && !/תור פעיל/.test(o.text)
         && o.interactive.kind === "cta_url" && o.interactive.url === "https://x/appointment/abc";
     })());
+
+  // ── 16d. Manage/LIST link-kind consistency: the link family follows REAL upcoming count (never the
+  //    model), and the assistant must NEVER imply "manage your appointments" while a booking link is
+  //    attached (the 0-upcoming collapse). General wording↔link-kind reconciliation, not a phrase patch.
+  section("16d. Manage/LIST link-kind consistency + wording reconciliation (no 'manage' over a booking link)");
+  const mlPhone = "972500000000";
+  check("manageLinkFor: 1 upcoming → single-appointment MANAGE link (text+link agree)",
+    (() => { const m = manageLinkFor([{ id: "appt-1" }], "biz", mlPhone, "cust-1"); return m.kind === "manage" && m.url === buildAppointmentLink("appt-1"); })());
+  check("manageLinkFor: 2+ upcoming → My-Appointments LIST link (kind=manage)",
+    (() => { const m = manageLinkFor([{ id: "a" }, { id: "b" }], "biz", mlPhone, "cust-1"); return m.kind === "manage" && m.url === buildMyAppointmentsLink("cust-1"); })());
+  check("manageLinkFor: 0 upcoming → booking link (nothing to manage; wording reconciled separately)",
+    (() => { const m = manageLinkFor([], "biz", mlPhone, "cust-1"); return m.kind === "booking" && m.url === buildBookingLink("biz", mlPhone); })());
+  check("booking route maps to booking link; LIST/RESCHEDULE/CANCEL routes map to manage (unchanged)",
+    linkKindForRoute("BOOK") === "booking" && linkKindForRoute("LIST") === "manage"
+    && linkKindForRoute("RESCHEDULE") === "manage" && linkKindForRoute("CANCEL") === "manage");
+  // PRIMARY (route/context-aware): an explicit manage/list route + 0 upcoming FORCES the honest reply,
+  // independent of the model's wording — proving it does NOT rely solely on MANAGE_CLAIM_RE.
+  check("manage route + 0 upcoming forces honest 'אין לך תורים עתידיים' EVEN with NON-manage model wording (route-context)",
+    (() => {
+      const o = resolveManageOutcome([], "סבבה, בוא נראה מה אפשר לעשות.", "biz", mlPhone, "cust-1"); // no manage/regex phrase
+      return o.kind === "booking" && o.url === buildBookingLink("biz", mlPhone)
+        && /^אין לך תורים עתידיים/.test(o.replyText) && !/בכלל/.test(o.replyText)
+        && o.replyText !== "סבבה, בוא נראה מה אפשר לעשות.";   // the model reply was discarded by context
+    })());
+  check("manage route + 1 upcoming KEEPS the model reply + single-appointment manage link",
+    (() => { const o = resolveManageOutcome([{ id: "appt-1" }], "הנה התור שלך.", "biz", mlPhone, "cust-1"); return o.kind === "manage" && o.url === buildAppointmentLink("appt-1") && o.replyText === "הנה התור שלך."; })());
+  check("manage route + 2+ upcoming KEEPS the model reply + My-Appointments link",
+    (() => { const o = resolveManageOutcome([{ id: "a" }, { id: "b" }], "הנה התורים שלך.", "biz", mlPhone, "cust-1"); return o.kind === "manage" && o.url === buildMyAppointmentsLink("cust-1") && o.replyText === "הנה התורים שלך."; })());
+  const mlBookUrl = buildBookingLink("biz", mlPhone);
+  check("manage WORDING + booking link → reconciled to honest 'אין לך תורים עתידיים' (not 'בכלל'); booking link kept, body URL-free",
+    (() => {
+      const before = { kind: "cta_url" as const, body: "בטח, הנה הקישור לניהול התורים שלך.\n\n*לקביעת תור — מהיר ופשוט:*", buttonText: "לחץ כאן", url: mlBookUrl };
+      const r = reconcileLinkWording("בטח, הנה הקישור לניהול התורים שלך.", "booking", before, mlBookUrl);
+      return r.reconciled
+        && /^אין לך תורים עתידיים לניהול כרגע/.test(r.replyText) && !/בכלל/.test(r.replyText)   // future-only wording
+        && /לקבוע תור חדש/.test(r.replyText) && !/לניהול התורים|התורים שלך/.test(r.replyText)    // now booking-worded, no manage claim
+        && r.replyText.includes(mlBookUrl)                                                       // fallback keeps the URL
+        && r.interactive?.kind === "cta_url" && r.interactive.url === mlBookUrl && !r.interactive.body.includes(mlBookUrl); // primary: URL in button only
+    })());
+  check("reconciliation is GENERAL: list/see/cancel/reschedule claims + booking link all reconcile (not a sentence patch)",
+    ["הנה הקישור לניהול התורים שלך", "אפשר לראות את התורים שלך בקישור", "כדי לבטל את התור — בקישור", "לשנות את התור דרך הקישור"]
+      .every((c) => reconcileLinkWording(c, "booking", undefined, mlBookUrl).reconciled === true));
+  check("reconciliation NO-OP: a booking-worded reply + booking link is left untouched",
+    (() => { const r = reconcileLinkWording("בטח! לקביעת תור בוחרים שירות, יום ושעה בקישור.", "booking", undefined, mlBookUrl); return r.reconciled === false && r.replyText === "בטח! לקביעת תור בוחרים שירות, יום ושעה בקישור."; })());
+  check("reconciliation NO-OP: manage wording WITH a manage link (1+ upcoming) is already honest → untouched",
+    reconcileLinkWording("בקישור רואים את התור שלך — לשנות מועד או לבטל.", "manage", undefined, buildAppointmentLink("appt-1")).reconciled === false);
 
   // ── 16b. AI-mode link PRESENTATION PARITY: booking/manage links go out as cta_url buttons (URL in
   //    the button, NOT the body), with the text-with-URL kept as the fallback — matching deterministic.
