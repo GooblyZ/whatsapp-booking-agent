@@ -117,7 +117,8 @@ Copy `.env.example` to `.env.local` and fill in all values.
 | `META_API_VERSION` | Meta Graph API version (default: `v20.0`). Optional. |
 | `BOOKING_MODE` | `conversational` (default — pre-pivot chat booking) or `platform` — AI detects intent and routes to the web booking page (see `TRANSITION_PLAN.md`). |
 | `PUBLIC_BASE_URL` | Public origin for customer-facing links (`/book/[slug]`, `/appointment/[id]`) — the ngrok/deployed URL. Falls back to `http://localhost:3000` with a warning. |
-| `JOBS_SECRET` | Bearer secret for `POST /api/jobs/process` (event runner). Unset = runner disabled. |
+| `JOBS_SECRET` | Bearer secret for `POST /api/jobs/process` (event runner, manual/external trigger). Unset = POST disabled. |
+| `CRON_SECRET` | Bearer secret for the Vercel Cron `GET /api/jobs/process` invocation (daily 03:00 UTC, see `vercel.json` — daily is the Hobby-plan-safe schedule; switch to hourly `0 * * * *` only on Pro). Set in the Vercel project env; sent automatically on cron requests. Unset = GET cron disabled. A manual `POST` backfill still works any time. |
 
 ---
 

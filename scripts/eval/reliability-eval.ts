@@ -54,6 +54,7 @@ import {
   buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate, confirmationCta,
 } from "../../lib/booking/notifications";
 import { isAutoCompletable, completePastAppointments, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
+import { authorizeJobRequest } from "../../lib/jobs/auth";
 import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../../lib/ai/reply-polish";
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
@@ -1667,6 +1668,28 @@ async function main(): Promise<void> {
   const acFail = await completePastAppointments(acDb({ data: null, error: { message: "relation \"appointments\" missing" } }), acNow);
   check("completePastAppointments is FAIL-SOFT: a DB error → 0 completed, never throws",
     acFail === 0);
+
+  // ── 23. Jobs runner auth — Vercel Cron (GET/CRON_SECRET) + manual (POST/JOBS_SECRET), fail-closed ──
+  // One processor, two triggers. Pure authorize predicate decides ok / unauthorized / disabled. The
+  // route handlers (POST/GET) and vercel.json hourly cron wire it up; never logs a secret.
+  section("23. Jobs runner authorization — cron GET + manual POST, fail-closed");
+  check("POST manual: JOBS_SECRET configured + matching Bearer → ok",
+    authorizeJobRequest("Bearer js-123", ["js-123"]) === "ok");
+  check("POST manual: JOBS_SECRET configured + wrong/missing token → unauthorized",
+    authorizeJobRequest("Bearer nope", ["js-123"]) === "unauthorized"
+    && authorizeJobRequest(null, ["js-123"]) === "unauthorized");
+  check("POST manual: JOBS_SECRET NOT set → disabled (fail-closed, runner off)",
+    authorizeJobRequest("Bearer anything", [undefined]) === "disabled");
+  check("GET cron: CRON_SECRET configured + matching Bearer → ok (Vercel Cron path)",
+    authorizeJobRequest("Bearer cron-xyz", ["cron-xyz", undefined]) === "ok");
+  check("GET cron: also accepts JOBS_SECRET for a manual GET trigger",
+    authorizeJobRequest("Bearer js-123", [undefined, "js-123"]) === "ok");
+  check("GET cron: configured secret(s) but wrong/missing token → unauthorized (not public)",
+    authorizeJobRequest("Bearer wrong", ["cron-xyz", "js-123"]) === "unauthorized"
+    && authorizeJobRequest(null, ["cron-xyz", "js-123"]) === "unauthorized");
+  check("GET cron: NEITHER CRON_SECRET nor JOBS_SECRET set → disabled (fail-closed, never public)",
+    authorizeJobRequest("Bearer anything", [undefined, undefined]) === "disabled"
+    && authorizeJobRequest("Bearer anything", ["", ""]) === "disabled"); // empty strings ignored
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
