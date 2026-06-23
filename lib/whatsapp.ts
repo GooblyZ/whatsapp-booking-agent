@@ -39,6 +39,17 @@ export type WhatsAppInteractive =
   | { kind: "list"; body: string; button: string; rows: { id: string; title: string; description?: string }[] }
   | { kind: "cta_url"; body: string; buttonText: string; url: string };
 
+/** WhatsApp interactive body text hard limit (cta_url / button / list bodies). */
+export const INTERACTIVE_BODY_MAX = 1024;
+/** Caps an interactive body to WhatsApp's limit at a word boundary (… elision), so a long reply never
+ *  causes an AVOIDABLE interactive-send rejection (which would otherwise fall back to a raw-URL text). */
+export function capInteractiveBody(text: string, max = INTERACTIVE_BODY_MAX): string {
+  if (!text || text.length <= max) return text;
+  const slice = text.slice(0, max - 1);
+  const atWord = slice.replace(/\s+\S*$/, "").trimEnd();
+  return `${atWord.length >= Math.floor(max / 2) ? atWord : slice.trimEnd()}…`;
+}
+
 /** Translates the business-agnostic interactive shape into the Meta `interactive` payload. */
 function buildInteractivePayload(i: WhatsAppInteractive): Record<string, unknown> {
   if (i.kind === "buttons") {

@@ -19,10 +19,10 @@ import {
   formatTimeInTZ,
   todayInTZ,
 } from "./availability";
-import { sendOutbound } from "./outbound";
+import { sendOutboundInteractive } from "./outbound";
 import { emitEvent } from "@/lib/events/emit";
 import { buildAppointmentLink, buildBookingLink } from "@/lib/config";
-import { buildCancellationMessage, buildRescheduleMessage, rescheduleChanged } from "./notifications";
+import { buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, confirmationCta } from "./notifications";
 
 /** Customers can't book a slot starting sooner than this from "now". */
 const MIN_LEAD_MINUTES = 15;
@@ -265,14 +265,16 @@ export async function createPlatformBooking(db: DB, input: CreateBookingInput): 
     payload: { source: "platform", dateISO: input.dateISO, time: input.time, serviceId: input.serviceId },
   });
   const [y, mo, d] = input.dateISO.split("-");
-  await sendOutbound(
-    db, input.businessId, customerId, input.phone,
+  const apptUrl = buildAppointmentLink(appointmentId);
+  const bookingText =
     `התור נקבע בהצלחה!\n\n` +
     `שירות: ${service.name as string}\n` +
     `תאריך: ${d}/${mo}/${y}\n` +
     `שעה: ${input.time}\n\n` +
-    `לצפייה, שינוי או ביטול: ${buildAppointmentLink(appointmentId)}`
-  );
+    `לצפייה, שינוי או ביטול: ${apptUrl}`;
+  // Clean cta_url button (URL in the button, not the body); the full text-with-URL is the fallback.
+  const bookingCta = confirmationCta(bookingText, apptUrl);
+  await sendOutboundInteractive(db, input.businessId, customerId, input.phone, bookingCta.interactive, bookingCta.fallbackText);
 
   return { ok: true, appointmentId };
 }
@@ -344,13 +346,12 @@ export async function cancelPlatformAppointment(db: DB, appointmentId: string): 
   // Deterministic WhatsApp confirmation (fail-open, like the booking confirmation). Sent ONLY when
   // THIS call performed the cancellation and we have a phone — never on a duplicate/no-op.
   if (transitioned && view.customerPhone && view.customerId) {
-    await sendOutbound(
-      db, view.business.id, view.customerId, view.customerPhone,
-      buildCancellationMessage({
-        serviceName: view.serviceName, dateISO: view.dateISO, time: view.time,
-        bookingLink: buildBookingLink(view.business.slug, view.customerPhone),
-      }),
-    );
+    const bookingLink = buildBookingLink(view.business.slug, view.customerPhone);
+    const cancelText = buildCancellationMessage({
+      serviceName: view.serviceName, dateISO: view.dateISO, time: view.time, bookingLink,
+    });
+    const cta = confirmationCta(cancelText, bookingLink); // cta_url button + text-with-URL fallback
+    await sendOutboundInteractive(db, view.business.id, view.customerId, view.customerPhone, cta.interactive, cta.fallbackText);
     console.log(`[platform] cancel notification sent appt=${maskId(appointmentId)}`);
   } else {
     console.log(`[platform] cancel notification skipped appt=${maskId(appointmentId)} reason=${!transitioned ? "no_transition_dedupe" : "no_phone"}`);
@@ -410,14 +411,13 @@ export async function reschedulePlatformAppointment(
   // slot was captured in `view` BEFORE the update, so old → new is reliable.
   const moved = rescheduleChanged(view.dateISO, view.time, dateISO, time);
   if (moved && view.customerPhone && view.customerId) {
-    await sendOutbound(
-      db, view.business.id, view.customerId, view.customerPhone,
-      buildRescheduleMessage({
-        serviceName: view.serviceName,
-        fromDateISO: view.dateISO, fromTime: view.time, toDateISO: dateISO, toTime: time,
-        manageLink: buildAppointmentLink(appointmentId),
-      }),
-    );
+    const manageLink = buildAppointmentLink(appointmentId);
+    const rescheduleText = buildRescheduleMessage({
+      serviceName: view.serviceName,
+      fromDateISO: view.dateISO, fromTime: view.time, toDateISO: dateISO, toTime: time, manageLink,
+    });
+    const cta = confirmationCta(rescheduleText, manageLink); // cta_url button + text-with-URL fallback
+    await sendOutboundInteractive(db, view.business.id, view.customerId, view.customerPhone, cta.interactive, cta.fallbackText);
     console.log(`[platform] reschedule notification sent appt=${maskId(appointmentId)}`);
   } else {
     console.log(`[platform] reschedule notification skipped appt=${maskId(appointmentId)} reason=${!moved ? "no_change_dedupe" : "no_phone"}`);

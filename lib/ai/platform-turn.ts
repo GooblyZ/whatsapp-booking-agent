@@ -31,7 +31,7 @@ import {
   buildInteractiveForNav, buildMainMenu, buildInteractiveMainMenu, ctaBody, MENU_REMINDER,
   NO_APPOINTMENT_PROMPT, noAppointmentCtaBody, type MenuState, type MenuNav,
 } from "./continuity-menu";
-import type { WhatsAppInteractive } from "@/lib/whatsapp";
+import { capInteractiveBody, type WhatsAppInteractive } from "@/lib/whatsapp";
 
 export type PlatformLink = "booking" | "manage" | null;
 
@@ -668,6 +668,10 @@ export async function runPlatformTurn(
   //    another link" loop. The link attaches only on a genuine action intent.
   const u = decision.turn?.understanding;
   let linkAttached: PlatformLink = null;
+  // Presentation parity with deterministic mode: when a platform link is attached we also build a
+  // clean cta_url interactive (URL in the button, not the body). Gated on linkAttached at the return,
+  // so a guard that later revokes the link (low-signal / recovery) also drops the button.
+  let interactive: WhatsAppInteractive | undefined;
   let platformRoute = "-";
   let platformRouteReason = "-";
 
@@ -754,7 +758,7 @@ export async function runPlatformTurn(
           replyText = refused.text;
         }
       }
-      replyText = appendPlatformLink(replyText, label, url, lastAssistant, messageText);
+      ({ replyText, interactive } = attachPlatformLink(replyText, label, url, lastAssistant, messageText));
       logPlatformLink(linkAttached, url);
     } else if (linkKind === "booking") {
       // A booking reply must never ask the customer to pick service/day/time in chat —
@@ -777,7 +781,7 @@ export async function runPlatformTurn(
         replyText = refused.text;
       }
       const url = buildBookingLink(ctx.business.slug, customerPhone);
-      replyText = appendPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText);
+      ({ replyText, interactive } = attachPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText));
       linkAttached = "booking";
       logPlatformLink(linkAttached, url);
     }
@@ -808,7 +812,7 @@ export async function runPlatformTurn(
     // a MISSED manage operation fires only when nothing was attached.
     const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
     const m = manageLinkFor(upcoming, ctx.business.slug, customerPhone, customerId);
-    replyText = appendPlatformLink(buildManageHelpReply(upcoming.length, escapeOp), m.label, m.url, lastAssistant, messageText);
+    ({ replyText, interactive } = attachPlatformLink(buildManageHelpReply(upcoming.length, escapeOp), m.label, m.url, lastAssistant, messageText));
     linkAttached = m.kind;
     platformRoute = escapeOp ?? "HELP";
     platformRouteReason = "help_escape";
@@ -816,7 +820,7 @@ export async function runPlatformTurn(
     console.log(`[platform-turn] help-escape: truth-safe manage/help (op=${escapeOp ?? "-"}, upcoming=${upcoming.length})`);
   } else if (decision.ok && linkAttached === null && wantsBook && !suppressLinkFor(latest)) {
     const url = buildBookingLink(ctx.business.slug, customerPhone);
-    replyText = appendPlatformLink(`בטח! ${FENCE_BRIDGE_BOOK}`, BOOK_LINE, url, lastAssistant, messageText);
+    ({ replyText, interactive } = attachPlatformLink(`בטח! ${FENCE_BRIDGE_BOOK}`, BOOK_LINE, url, lastAssistant, messageText));
     linkAttached = "booking";
     platformRoute = "BOOK";
     platformRouteReason = pendingBookConfirm ? "pending_confirm" : confirmIntoBooking ? "contextual_confirm" : "action_escape";
@@ -831,7 +835,7 @@ export async function runPlatformTurn(
     const refused = defuseActionRefusal(warm, "BOOK");
     if (refused.defused) warm = refused.text;
     const url = buildBookingLink(ctx.business.slug, customerPhone);
-    replyText = appendPlatformLink(warm, BOOK_LINE, url, lastAssistant, messageText);
+    ({ replyText, interactive } = attachPlatformLink(warm, BOOK_LINE, url, lastAssistant, messageText));
     linkAttached = "booking";
     platformRoute = "BOOK";
     platformRouteReason = "soft_intent";
@@ -851,7 +855,7 @@ export async function runPlatformTurn(
       || (affirm && (lastContract.sentBookingLink || lastContract.offeredBooking || prevPending?.kind === "BOOK"));
     if (bookingContext && !suppressLinkFor(latest)) {
       const url = buildBookingLink(ctx.business.slug, customerPhone);
-      replyText = appendPlatformLink(defuseCapabilityPromise(replyText).text, BOOK_LINE, url, lastAssistant, messageText);
+      ({ replyText, interactive } = attachPlatformLink(defuseCapabilityPromise(replyText).text, BOOK_LINE, url, lastAssistant, messageText));
       linkAttached = "booking";
       platformRoute = "BOOK";
       platformRouteReason = "capability_fence";
@@ -1029,7 +1033,9 @@ export async function runPlatformTurn(
     action: `${suppressReply ? "suppressed" : "reply"}${linkAttached ? `+${linkAttached}` : ""}`,
   });
 
-  return { replyText, decision, linkAttached, suppressReply };
+  // interactive is sent ONLY when a link is still attached at the end — a guard that revoked the link
+  // (low-signal / recovery set linkAttached=null) also drops the stale button, falling back to text.
+  return { replyText, decision, linkAttached, suppressReply, interactive: linkAttached !== null ? interactive : undefined };
 }
 
 // ── DETERMINISTIC MENU NAVIGATION runner ──────────────────────────────────────────
@@ -1981,6 +1987,25 @@ function appendPlatformLink(
     return `${reply}\n\nהקישור שכבר שלחתי קודם עדיין מחכה לך — בודקים שם 🙂`;
   }
   return `${reply}\n\n${label}\n${url}`;
+}
+
+/**
+ * AI-mode platform-link attachment with PRESENTATION PARITY to deterministic mode. Returns BOTH:
+ *   - replyText: the text-with-URL fallback (identical to appendPlatformLink — older clients / an
+ *     interactive-send failure still get the link), and
+ *   - interactive: a clean cta_url button (the URL lives in the BUTTON, never in the body).
+ * The anti-spam "reference the link I already sent" case carries NO url → interactive=undefined, so it
+ * stays text-only (there's nothing to button-ize). The URL is system-built and deterministic; the model
+ * never writes it. Gender/emoji enforcement on the cta_url body happens at the outbound chokepoint.
+ */
+export function attachPlatformLink(
+  reply: string, label: string, url: string, lastAssistant: string | null, message: string
+): { replyText: string; interactive: WhatsAppInteractive | undefined } {
+  const replyText = appendPlatformLink(reply, label, url, lastAssistant, message);
+  const referencedPrevious = !!lastAssistant?.includes(url) && !isExplicitLinkRequest(message);
+  if (referencedPrevious) return { replyText, interactive: undefined }; // reference line has no URL → text only
+  // Length-cap the cta_url body so a long model reply never trips an avoidable interactive rejection.
+  return { replyText, interactive: { kind: "cta_url", body: capInteractiveBody(`${reply}\n\n${label}`), buttonText: "לחץ כאן", url } };
 }
 
 // In-chat selection questions the model must never ask in platform mode (the

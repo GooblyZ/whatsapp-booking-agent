@@ -8,6 +8,17 @@
 // the action (the website/system did) and NEVER invent details — every value is passed in
 // by the deterministic action layer.
 
+import { capInteractiveBody, type WhatsAppInteractive } from "@/lib/whatsapp";
+
+/** Turns a confirmation message (body + a trailing "label:\n<url>") into a cta_url interactive (the URL
+ *  lives in the BUTTON, never the visible body) PLUS the original text as the fallback — so post-action
+ *  confirmations get the same clean CTA look as AI/deterministic links. The body is length-capped so
+ *  WhatsApp never rejects it. PURE: the url is system-built; nothing here writes to the DB or network. */
+export function confirmationCta(fallbackText: string, url: string): { interactive: WhatsAppInteractive; fallbackText: string } {
+  const body = capInteractiveBody(fallbackText.replace(url, "").replace(/\s+$/, "")); // strip the URL line; keep the label
+  return { interactive: { kind: "cta_url", body, buttonText: "לחץ כאן", url }, fallbackText };
+}
+
 /** "YYYY-MM-DD" (business-local) → "DD/MM/YYYY". Returns the input unchanged if malformed. */
 export function formatApptDate(dateISO: string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((dateISO ?? "").trim());

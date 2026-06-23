@@ -35,6 +35,7 @@ import {
   readPendingFailedNeed, PENDING_FAILED_NEED_TTL_MS,
   isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
   resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
+  attachPlatformLink, stripModelUrls,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -48,9 +49,9 @@ import {
   getGeminiHealth, resetGeminiHealth,
   nextStrikeCount, strikesTripOutage, providerHealthFromCounters, OVERLOAD_STRIKES, STRIKE_WINDOW_MS,
 } from "../../lib/ai/gemini";
-import { extractInboundMessage } from "../../lib/whatsapp";
+import { extractInboundMessage, capInteractiveBody, INTERACTIVE_BODY_MAX } from "../../lib/whatsapp";
 import {
-  buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate,
+  buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate, confirmationCta,
 } from "../../lib/booking/notifications";
 import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../../lib/ai/reply-polish";
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
@@ -1060,6 +1061,82 @@ async function main(): Promise<void> {
       return o.link === "manage" && !/תור פעיל/.test(o.text)
         && o.interactive.kind === "cta_url" && o.interactive.url === "https://x/appointment/abc";
     })());
+
+  // ── 16b. AI-mode link PRESENTATION PARITY: booking/manage links go out as cta_url buttons (URL in
+  //    the button, NOT the body), with the text-with-URL kept as the fallback — matching deterministic.
+  section("16b. AI-mode platform links → cta_url button (parity with deterministic), URL-in-button only");
+  const BOOK_URL = "https://x/book/biz";
+  const MANAGE_URL = "https://x/appointment/abc";
+  check("AI booking link → cta_url primary; body has NO raw URL; fallback text KEEPS the URL",
+    (() => {
+      const a = attachPlatformLink("בשמחה!", "לקביעת תור:", BOOK_URL, null, "אפשר לקבוע תור?");
+      return a.interactive?.kind === "cta_url" && a.interactive.url === BOOK_URL
+        && a.interactive.buttonText === "לחץ כאן"
+        && !a.interactive.body.includes(BOOK_URL) && a.interactive.body.includes("לקביעת תור:") // label kept, URL not in body
+        && a.replyText.includes(BOOK_URL);                                                       // fallback still carries the URL
+    })());
+  check("AI manage link → cta_url primary; body has NO raw URL; fallback KEEPS the URL",
+    (() => {
+      const a = attachPlatformLink("בטח, אפשר לנהל את התור.", "לניהול התור:", MANAGE_URL, null, "אני רוצה להזיז את התור");
+      return a.interactive?.kind === "cta_url" && a.interactive.url === MANAGE_URL
+        && !a.interactive.body.includes(MANAGE_URL) && a.replyText.includes(MANAGE_URL);
+    })());
+  check("AI anti-spam 'reference previous link' case stays TEXT-only (no cta_url, no URL re-spam)",
+    (() => {
+      // lastAssistant already contains this exact url AND the customer didn't explicitly ask again
+      const a = attachPlatformLink("בטח!", "לקביעת תור:", BOOK_URL, `קודם שלחתי: ${BOOK_URL}`, "תודה");
+      return a.interactive === undefined && !a.replyText.includes(BOOK_URL); // references it, no button, no raw URL
+    })());
+  check("AI link parity: an EXPLICIT 'send the link again' DOES re-attach the cta_url",
+    (() => {
+      const a = attachPlatformLink("בטח!", "לקביעת תור:", BOOK_URL, `קודם שלחתי: ${BOOK_URL}`, "תשלח לי שוב את הקישור");
+      return a.interactive?.kind === "cta_url" && a.replyText.includes(BOOK_URL);
+    })());
+  check("Gemini-written URLs are still STRIPPED (model never owns the link)",
+    stripModelUrls("אפשר לקבוע פה https://evil.example/x עכשיו") === "אפשר לקבוע פה עכשיו"
+    && !/https?:\/\//.test(stripModelUrls("קישור https://x/book/biz בתוך טקסט")));
+  check("AI cta_url body is LENGTH-SAFE: a very long reply is capped to WhatsApp's limit (avoids rejection)",
+    (() => {
+      const longReply = "משפט ארוך מאוד עם הרבה מילים. ".repeat(60); // ~1800 chars
+      const a = attachPlatformLink(longReply, "לקביעת תור:", "https://x/book/biz", null, "אפשר לקבוע תור?");
+      return (a.interactive?.body.length ?? 0) <= INTERACTIVE_BODY_MAX && a.replyText.includes("https://x/book/biz");
+    })());
+
+  // ── 16c. POST-ACTION confirmations (booking / cancel / reschedule) → cta_url button too (same parity).
+  //    The pure message builders stay text-with-URL (the FALLBACK); confirmationCta turns them into a
+  //    cta_url whose body carries NO raw URL. The website action + idempotency are untouched.
+  section("16c. Post-action confirmations → cta_url button (URL in button, text-with-URL fallback)");
+  check("booking confirmation → cta_url; body has NO raw URL; fallback KEEPS the URL",
+    (() => {
+      const url = "https://x/appointment/abc";
+      const text = `התור נקבע בהצלחה!\n\nשירות: שיעור יוגה\nתאריך: 18/06/2026\nשעה: 11:15\n\nלצפייה, שינוי או ביטול: ${url}`;
+      const c = confirmationCta(text, url);
+      return c.interactive.kind === "cta_url" && c.interactive.url === url && c.interactive.buttonText === "לחץ כאן"
+        && !c.interactive.body.includes(url) && c.interactive.body.includes("נקבע בהצלחה")
+        && c.fallbackText.includes(url);
+    })());
+  check("cancellation confirmation → cta_url; body has NO raw URL; fallback KEEPS the URL",
+    (() => {
+      const url = "https://x/book/biz";
+      const text = buildCancellationMessage({ serviceName: "שיעור יוגה", dateISO: "2026-06-18", time: "11:15", bookingLink: url });
+      const c = confirmationCta(text, url);
+      return c.interactive.kind === "cta_url" && !c.interactive.body.includes(url) && c.interactive.body.includes("בוטל")
+        && c.fallbackText.includes(url);
+    })());
+  check("reschedule confirmation → cta_url; body has NO raw URL; fallback KEEPS the URL",
+    (() => {
+      const url = "https://x/appointment/abc";
+      const text = buildRescheduleMessage({ serviceName: null, fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: url });
+      const c = confirmationCta(text, url);
+      return c.interactive.kind === "cta_url" && !c.interactive.body.includes(url) && c.interactive.body.includes("עודכן")
+        && c.fallbackText.includes(url);
+    })());
+  check("confirmationCta body stays length-safe (capped to WhatsApp's interactive limit)",
+    confirmationCta(`${"א".repeat(2000)} https://x/book/biz`, "https://x/book/biz").interactive.body.length <= INTERACTIVE_BODY_MAX);
+  check("capInteractiveBody: short text untouched; over-limit text capped (… elision) at a word boundary",
+    capInteractiveBody("טקסט קצר", INTERACTIVE_BODY_MAX) === "טקסט קצר"
+    && capInteractiveBody("מילה ".repeat(400)).length <= INTERACTIVE_BODY_MAX
+    && capInteractiveBody("מילה ".repeat(400)).endsWith("…"));
 
   // ── 17. Operating-state resolver (Phase 2) — single source of truth, no drift ──
   // One pure resolver names the turn's lane; isDeterministicMenuActive / operatingModeReason / the
