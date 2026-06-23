@@ -25,9 +25,13 @@ const REMINDER_LEAD_HOURS = 24;
 const MAX_WAITLIST_NOTIFY_PER_SLOT = 1;
 /** Safety cap per runner invocation. */
 const MAX_EVENTS_PER_RUN = 200;
+/** Grace after end_time before a finished appointment is auto-completed — so a just-ended (or
+ *  slightly-running-over) appointment is never flipped prematurely. Absolute time, not business TZ. */
+export const AUTO_COMPLETE_GRACE_MS = 60 * 60 * 1000; // 1 hour
 
 export interface ProcessSummary {
   remindersEnqueued: number;
+  appointmentsCompleted: number;
   scanned: number;
   processed: number;
   skipped: number;
@@ -92,10 +96,55 @@ export async function enqueueDueReminders(db: DB, now: Date): Promise<number> {
   }
 }
 
+/**
+ * PURE eligibility for auto-completion: a CONFIRMED appointment whose end_time is older than
+ * (now − grace) is finished and should become 'completed'. ONLY 'confirmed' transitions — every other
+ * status (pending / cancelled / completed / no_show) is left untouched, and future / in-progress /
+ * within-grace appointments are excluded. Absolute-time comparison (never the business timezone).
+ */
+export function isAutoCompletable(status: string, endTimeISO: string | null, now: Date): boolean {
+  if (status !== "confirmed" || !endTimeISO) return false;
+  const end = new Date(endTimeISO).getTime();
+  if (Number.isNaN(end)) return false;
+  return end < now.getTime() - AUTO_COMPLETE_GRACE_MS;
+}
+
+/**
+ * Auto-completes finished appointments: status='confirmed' AND end_time < (now − grace) → 'completed'.
+ * Deterministic, idempotent (the conditional update only matches still-'confirmed' past rows, so a
+ * re-run flips nothing more), and fail-soft (a missing table / error is logged and reported as 0, never
+ * thrown). UTC comparison against the timestamptz column — completion is based on absolute time having
+ * passed, never the business timezone. Touches ONLY 'confirmed' rows. Returns how many were completed.
+ */
+export async function completePastAppointments(db: DB, now: Date): Promise<number> {
+  try {
+    const cutoff = new Date(now.getTime() - AUTO_COMPLETE_GRACE_MS).toISOString();
+    const { data, error } = await db
+      .from("appointments")
+      .update({ status: "completed" })
+      .eq("status", "confirmed")
+      .lt("end_time", cutoff)
+      .select("id");
+    if (error) {
+      console.warn(`[events] completePastAppointments skipped: ${error.message}`);
+      return 0;
+    }
+    const n = data?.length ?? 0;
+    if (n > 0) console.log(`[events] auto-completed ${n} past confirmed appointment(s) (end_time < now − ${AUTO_COMPLETE_GRACE_MS / 60000}m)`);
+    return n;
+  } catch (err) {
+    console.error("[events] completePastAppointments error:", err instanceof Error ? err.message : String(err));
+    return 0;
+  }
+}
+
 /** Processes all pending events. Fail-soft; returns a summary for the runner. */
 export async function processPendingEvents(db: DB, now: Date = new Date()): Promise<ProcessSummary> {
-  const summary: ProcessSummary = { remindersEnqueued: 0, scanned: 0, processed: 0, skipped: 0, byType: {} };
+  const summary: ProcessSummary = { remindersEnqueued: 0, appointmentsCompleted: 0, scanned: 0, processed: 0, skipped: 0, byType: {} };
 
+  // Lifecycle hygiene: flip finished confirmed appointments to 'completed' so the dashboard no longer
+  // shows them as active/approved (the chatbot already ignores past appointments). Fail-soft + idempotent.
+  summary.appointmentsCompleted = await completePastAppointments(db, now);
   summary.remindersEnqueued = await enqueueDueReminders(db, now);
 
   const { data, error } = await db

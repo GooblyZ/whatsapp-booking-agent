@@ -53,6 +53,7 @@ import { extractInboundMessage, capInteractiveBody, INTERACTIVE_BODY_MAX } from 
 import {
   buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate, confirmationCta,
 } from "../../lib/booking/notifications";
+import { isAutoCompletable, completePastAppointments, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
 import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../../lib/ai/reply-polish";
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
@@ -1629,6 +1630,43 @@ async function main(): Promise<void> {
       return p.language === "he" && p.assistantName === "עוזר" && p.responseLength === "medium"
         && p.emojiUsage === "low" && p.emojiCap === 1 && p.assistantGender === "neutral" && p.promptProfileHash.length > 0;
     })());
+
+  // ── 22. Appointment lifecycle — auto-complete past CONFIRMED appointments (jobs runner) ──────────
+  // status='confirmed' AND end_time < now−grace → 'completed'. Absolute-time (UTC), idempotent,
+  // touches ONLY 'confirmed'. The chatbot/manage stay upcoming-only, so a flipped row simply leaves the
+  // active set. Pure eligibility predicate is unit-asserted; the DB update is verified against a stub.
+  section("22. Auto-complete past confirmed appointments — pure eligibility + idempotent fail-soft update");
+  const acNow = new Date("2026-06-23T12:00:00Z"); // grace = 1h ⇒ cutoff = 11:00:00Z
+  check("grace period is exactly 1 hour",
+    AUTO_COMPLETE_GRACE_MS === 60 * 60 * 1000);
+  check("eligible: CONFIRMED appointment that ended > 1h ago → auto-completable",
+    isAutoCompletable("confirmed", "2026-06-23T10:00:00Z", acNow) === true);
+  check("NOT eligible: future confirmed / currently running / within-grace / on the grace boundary",
+    isAutoCompletable("confirmed", "2026-06-24T10:00:00Z", acNow) === false   // future
+    && isAutoCompletable("confirmed", "2026-06-23T12:30:00Z", acNow) === false // running (after now)
+    && isAutoCompletable("confirmed", "2026-06-23T11:30:00Z", acNow) === false // ended 30m ago (within grace)
+    && isAutoCompletable("confirmed", "2026-06-23T11:00:00Z", acNow) === false); // exactly at cutoff (strict <)
+  check("NOT eligible: every NON-confirmed status in the past is left untouched (pending/cancelled/completed/no_show)",
+    ["pending", "cancelled", "completed", "no_show"].every((s) => isAutoCompletable(s, "2026-06-23T09:00:00Z", acNow) === false));
+  check("idempotent: a row already 'completed' is never re-eligible (re-run is a no-op)",
+    isAutoCompletable("completed", "2026-06-23T08:00:00Z", acNow) === false
+    && isAutoCompletable("completed", "2026-06-23T08:00:00Z", acNow) === false);
+  // The real DB helper: verify it issues the right conditional update (status=confirmed ∧ end_time<cutoff),
+  // returns the rows-completed count, and is fail-soft (missing table / error → 0, never throws).
+  const acCap: { patch: Record<string, unknown> | null; statusEq: string | null; ltCol: string | null; ltVal: string | null } =
+    { patch: null, statusEq: null, ltCol: null, ltVal: null };
+  const acDb = (result: { data: { id: string }[] | null; error: { message: string } | null }) =>
+    ({ from: () => ({ update: (p: Record<string, unknown>) => { acCap.patch = p; return {
+      eq: (c: string, v: string) => { if (c === "status") acCap.statusEq = v; return {
+        lt: (c2: string, v2: string) => { acCap.ltCol = c2; acCap.ltVal = v2; return {
+          select: async () => result } } } } } } }) }) as unknown as Parameters<typeof completePastAppointments>[0];
+  const acN = await completePastAppointments(acDb({ data: [{ id: "a" }, { id: "b" }], error: null }), acNow);
+  check("completePastAppointments: conditional update is status='confirmed' ∧ end_time < (now−1h), returns completed count",
+    acN === 2 && acCap.patch?.status === "completed" && acCap.statusEq === "confirmed"
+    && acCap.ltCol === "end_time" && acCap.ltVal === new Date(acNow.getTime() - AUTO_COMPLETE_GRACE_MS).toISOString());
+  const acFail = await completePastAppointments(acDb({ data: null, error: { message: "relation \"appointments\" missing" } }), acNow);
+  check("completePastAppointments is FAIL-SOFT: a DB error → 0 completed, never throws",
+    acFail === 0);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
