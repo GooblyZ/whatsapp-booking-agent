@@ -605,7 +605,7 @@ export async function runPlatformTurn(
   //    Escalation tiers mirror the emoji-only pre-Gemini skip exactly, so repeated low-signal still climbs
   //    to boundary/quiet. SKIPPED in deterministic mode (every turn there is menu-anchored). The whole
   //    message is checked (multi-fragment bursts have whitespace → never skipped → they reach Gemini).
-  if (!deterministicMenu && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, activeServiceNames)) {
+  if (!deterministicMenu && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, lastAssistant ?? "", activeServiceNames)) {
     const newCount = prevLowSignal + 1;
     const action = lowSignalActionFor(newCount);
     let replyText = LOW_SIGNAL_SHORT;
@@ -1967,12 +1967,44 @@ export function forcesDeterministicClarify(
   return false;
 }
 
+// A GENERIC smalltalk / presence question ("מה שלומך?", "הכל בסדר?", "איך הולך?", "מה חדש?") — it asks
+// for NO specific datum, so a lone signal-less token after it is still unclear (not a meaningful answer).
+const GENERIC_SMALLTALK_Q_RE =
+  /מה\s+שלומ|מה\s+קורה|מה\s+נשמע|מה\s+המצב|מה\s+חדש|מה\s+איתך|מה\s+העניינים|מה\s+אתה\s+עושה|איך\s+הולך|איך\s+את(?:ה|ם)?(?=[\s?!.,…]|$)|הכל\s+בסדר|הכל\s+טוב|מה\s+טוב/;
+/** True for a generic smalltalk/presence question (asks nothing specific). */
+export function isGenericSmalltalkQuestion(text: string): boolean {
+  return GENERIC_SMALLTALK_Q_RE.test(text ?? "");
+}
+
+// A question that expects a SPECIFIC answer the customer may give in one word — name, service, day,
+// time, phone, a choice/preference, a yes/no action, or a link/booking confirmation. Conservative.
+const ANSWER_EXPECTED_Q_RE =
+  /איך\s+קוראים|מה\s+שמ|מה\s+השם|השם\s+שלך|איזה\s+שירות|איזו\s+שירות|איזה\s+יום|איזה\s+שעה|איזו\s+שעה|מתי\s+(?:נוח|מתאים|תרצ|בא\s+לך|מתי)|נוח\s+לך|מתאים\s+לך|מה\s+תרצ|מה\s+בא\s+לך|רוצה\s+ש|אתה\s+רוצה|את\s+רוצה|אתם\s+רוצים|לשלוח\s+(?:לך\s+)?(?:את\s+ה)?(?:קישור|לינק)|מספר\s+(?:ה)?טלפון|הטלפון\s+שלך|לקבוע\s+(?:לך\s+)?תור/;
+/** True when our last reply asked for a specific answer (a one-word reply may be a valid answer). */
+export function asksAnswerExpectedQuestion(text: string): boolean {
+  return ANSWER_EXPECTED_Q_RE.test(text ?? "");
+}
+
+/**
+ * Is a REAL answer-expected question pending from our last reply? True iff we asked a question AND it is
+ * either an explicit answer-expected request OR not recognizably generic smalltalk (conservative: an
+ * UNRECOGNIZED question blocks the skip). False when there was no question, or it was PURELY generic
+ * smalltalk with no answer-expected request — so a lone signal-less token after "מה שלומך?" can still skip.
+ */
+export function hasPendingAnswerExpectedQuestion(askedQuestion: boolean, lastAssistantText: string): boolean {
+  if (!askedQuestion) return false;
+  if (asksAnswerExpectedQuestion(lastAssistantText)) return true; // explicit request (covers mixed smalltalk+request)
+  return !isGenericSmalltalkQuestion(lastAssistantText);          // unrecognized question → conservatively block
+}
+
 /**
  * PRE-GEMINI decidability of the single-token `unclear` clarify: true when this turn is ALREADY going to
  * ship the deterministic LOW_SIGNAL_SHORT regardless of the model, so the full Gemini call can be skipped.
  * It is the DETERMINISTIC precondition of forcesDeterministicClarify — a lone short token carrying NO
  * signal of any kind — computed without the model. Conditions (ALL required):
- *   1. our last reply did NOT ask a direct question (a one-word ANSWER may be valid — e.g. a name),
+ *   1. no REAL answer-expected question is pending (a generic smalltalk question like "מה שלומך?" does
+ *      NOT block; only a name/service/date/time/choice/confirm/link question does — see
+ *      hasPendingAnswerExpectedQuestion), so a valid one-word ANSWER is never swallowed,
  *   2. the WHOLE message is a single short token (multi-fragment bursts have whitespace → excluded),
  *   3. not a bare affirmation (כן / אוקי / בטח / סבבה …),
  *   4. not a meta/presence token (מה / למה / נו / "?" via isGoodFaithLowSignal),
@@ -1983,9 +2015,9 @@ export function forcesDeterministicClarify(
  * Mirrors the post-Gemini forced-clarify outcome; that override stays as defense-in-depth.
  */
 export function shouldPreSkipSingleTokenClarify(
-  message: string, askedQuestion: boolean, serviceNames: string[] = []
+  message: string, askedQuestion: boolean, lastAssistantText: string, serviceNames: string[] = []
 ): boolean {
-  if (askedQuestion) return false;
+  if (hasPendingAnswerExpectedQuestion(askedQuestion, lastAssistantText)) return false;
   if (!isSingleShortToken(message)) return false;
   const t = message.trim();
   if (isBareAffirmation(t)) return false;

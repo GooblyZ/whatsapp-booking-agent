@@ -38,7 +38,8 @@ import {
   attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
   forcesDeterministicClarify, LOW_SIGNAL_SHORT,
   planTransientContinuity, TRANSIENT_MICRO_ACK, fallbackTypeForLowSignal,
-  shouldPreSkipSingleTokenClarify,
+  shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
+  hasPendingAnswerExpectedQuestion,
 } from "../../lib/ai/platform-turn";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
@@ -1944,39 +1945,76 @@ async function main(): Promise<void> {
   // SHOULD skip: lone signal-less tokens, no question pending → general, not phrase-specific.
   check("skips a lone signal-less token (אורי/דני/איתי/typo) when no question is pending",
     ["אורי", "דני", "איתי", "בלהט", "אוריון"].every(
-      (t) => shouldPreSkipSingleTokenClarify(t, false, SVC) === true));
-  // askedQuestion=true → a one-word answer may be valid (e.g. a name after "איך קוראים לך?").
-  check("does NOT skip when our last reply asked a question (one-word answer allowed)",
-    shouldPreSkipSingleTokenClarify("דני", true, SVC) === false
-    && shouldPreSkipSingleTokenClarify("אורי", true, SVC) === false);
+      (t) => shouldPreSkipSingleTokenClarify(t, false, "", SVC) === true));
+  // A REAL answer-expected question pending → a one-word answer may be valid (e.g. a name) → do NOT skip.
+  check("does NOT skip when an answer-expected question is pending (one-word answer allowed)",
+    shouldPreSkipSingleTokenClarify("דני", true, "איך קוראים לך?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("אורי", true, "מה השם שלך?", SVC) === false);
   // Bare affirmations are contextual → must reach the normal pipeline, never forced-clarified.
   check("does NOT skip bare affirmations (כן / אוקי / אוקיי / בטח / סבבה)",
     ["כן", "אוקי", "אוקיי", "בטח", "סבבה"].every(
-      (t) => shouldPreSkipSingleTokenClarify(t, false, SVC) === false));
+      (t) => shouldPreSkipSingleTokenClarify(t, false, "", SVC) === false));
   // Meta/presence and greetings keep their own warm/meta handling — not a signal-less clarify.
   check("does NOT skip meta (מה / למה / נו) or greetings (היי / הי / שלום / אהלן)",
     ["מה", "למה", "נו", "היי", "הי", "שלום", "אהלן"].every(
-      (t) => shouldPreSkipSingleTokenClarify(t, false, SVC) === false));
+      (t) => shouldPreSkipSingleTokenClarify(t, false, "", SVC) === false));
   // Multi-word contextual answers must continue to Gemini (whitespace ⇒ not a single token).
   check("does NOT skip a multi-word contextual message ('נראלי קצר')",
-    shouldPreSkipSingleTokenClarify("נראלי קצר", false, SVC) === false
-    && shouldPreSkipSingleTokenClarify("האמת מתלבט", false, SVC) === false);
+    shouldPreSkipSingleTokenClarify("נראלי קצר", false, "", SVC) === false
+    && shouldPreSkipSingleTokenClarify("האמת מתלבט", false, "", SVC) === false);
   // A meaningful lone token (a real service name / a price-FAQ word) still reaches Gemini.
   check("does NOT skip a meaningful lone token (a configured service name, or a price-FAQ word 'מחיר')",
-    shouldPreSkipSingleTokenClarify(SVC[0], false, SVC) === false
-    && shouldPreSkipSingleTokenClarify("מחיר", false, SVC) === false);
+    shouldPreSkipSingleTokenClarify(SVC[0], false, "", SVC) === false
+    && shouldPreSkipSingleTokenClarify("מחיר", false, "", SVC) === false);
   // Explicit booking / manage intent (multi-word) never skips.
   check("does NOT skip booking ('אני רוצה לקבוע תור') or manage ('לבטל תור') intent",
-    shouldPreSkipSingleTokenClarify("אני רוצה לקבוע תור", false, SVC) === false
-    && shouldPreSkipSingleTokenClarify("לבטל תור", false, SVC) === false);
+    shouldPreSkipSingleTokenClarify("אני רוצה לקבוע תור", false, "", SVC) === false
+    && shouldPreSkipSingleTokenClarify("לבטל תור", false, "", SVC) === false);
   // An over-long single token is not treated as a short lone token (conservative bound).
   check("does NOT skip an over-long single token (length-bounded single-token rule)",
-    shouldPreSkipSingleTokenClarify("אבגדהוזחטיכלמנ", false, SVC) === false);
+    shouldPreSkipSingleTokenClarify("אבגדהוזחטיכלמנ", false, "", SVC) === false);
   // Defense-in-depth: the post-Gemini forcesDeterministicClarify still fires for the same class, so a
   // model call that DID happen (e.g. helper later tightened) is still corrected to LOW_SIGNAL_SHORT.
   check("post-Gemini forcesDeterministicClarify remains as defense-in-depth for the same class",
     forcesDeterministicClarify("unclear", "normal_clarify", "אורי", false) === true
     && fallbackTypeForLowSignal("normal_clarify", true) === "low_signal_short");
+
+  // ── 29. Refine the skip past a pending question: generic smalltalk vs answer-expected ─────────────
+  // The live miss: a smalltalk reply ending in "מה שלומך?" set askedQuestion=true, which BLOCKED the
+  // single-token skip for "אורי". A generic smalltalk/presence question is NOT an answer-expected question,
+  // so it must NOT block the skip; a real name/service/date/time/choice/confirm/link question still does.
+  section("29. Pre-skip refinement — generic smalltalk vs answer-expected questions");
+  // The classifier helpers (explicit unit coverage).
+  check("isGenericSmalltalkQuestion: true for מה שלומך / מה קורה / הכל בסדר / איך הולך / מה חדש",
+    ["מה שלומך?", "מה קורה?", "הכל בסדר?", "איך הולך?", "מה חדש?", "איך אתה?"].every((q) => isGenericSmalltalkQuestion(q) === true)
+    && isGenericSmalltalkQuestion("איך קוראים לך?") === false);
+  check("asksAnswerExpectedQuestion: true for name/service/day/time/choice/confirm/link questions",
+    ["איך קוראים לך?", "מה השם שלך?", "איזה שירות תרצה?", "איזה יום נוח לך?", "איזה שעה?",
+     "רוצה שאשלח קישור לקביעת תור?", "אתה רוצה לקבוע תור?"].every((q) => asksAnswerExpectedQuestion(q) === true)
+    && asksAnswerExpectedQuestion("מה שלומך?") === false);
+  check("hasPendingAnswerExpectedQuestion: smalltalk question → false; real question / unrecognized → true; no question → false",
+    hasPendingAnswerExpectedQuestion(true, "מה שלומך?") === false
+    && hasPendingAnswerExpectedQuestion(true, "איך קוראים לך?") === true
+    && hasPendingAnswerExpectedQuestion(true, "הכל בסדר? מה השם שלך?") === true // mixed → answer-expected wins
+    && hasPendingAnswerExpectedQuestion(true, "???") === true                   // unrecognized question → conservative block
+    && hasPendingAnswerExpectedQuestion(false, "מה שלומך?") === false);
+  // 1/2. Generic smalltalk question pending → a lone signal-less token still skips.
+  check("after a generic smalltalk question (מה שלומך? / מה קורה?), a lone token (אורי / דני) SKIPS",
+    shouldPreSkipSingleTokenClarify("אורי", true, "הכל בסדר, מה שלומך?", SVC) === true
+    && shouldPreSkipSingleTokenClarify("דני", true, "מה קורה אחי?", SVC) === true);
+  // 3-6. Real answer-expected questions still block the skip (one-word reply may be a valid answer).
+  check("after a real answer-expected question (name/service/link/day), a lone token does NOT skip",
+    shouldPreSkipSingleTokenClarify("דני", true, "איך קוראים לך?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("צביעה", true, "איזה שירות תרצה?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("כן", true, "רוצה שאשלח קישור לקביעת תור?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("מחר", true, "איזה יום נוח לך?", SVC) === false);
+  // 7/8. Affirmations / meta / greetings stay protected EVEN after a generic smalltalk question.
+  check("affirmations/meta/greetings stay protected even past a generic smalltalk question",
+    ["אוקי", "כן", "בטח", "סבבה", "מה", "היי", "שלום"].every(
+      (t) => shouldPreSkipSingleTokenClarify(t, true, "מה שלומך?", SVC) === false));
+  // 9. Multi-word still not skipped, even past a smalltalk question.
+  check("multi-word ('נראלי קצר') still not skipped past a smalltalk question",
+    shouldPreSkipSingleTokenClarify("נראלי קצר", true, "מה שלומך?", SVC) === false);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
