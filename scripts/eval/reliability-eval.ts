@@ -37,8 +37,11 @@ import {
   resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
   attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
   forcesDeterministicClarify, LOW_SIGNAL_SHORT,
-  planTransientContinuity, TRANSIENT_MICRO_ACK,
+  planTransientContinuity, TRANSIENT_MICRO_ACK, fallbackTypeForLowSignal,
 } from "../../lib/ai/platform-turn";
+import {
+  estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
+} from "../../lib/ai/telemetry";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
   detectInfoTopic, isMenuRequest, isBusinessQuestion, resolveInfoAnswer, findKbAnswer,
@@ -1872,6 +1875,64 @@ async function main(): Promise<void> {
   // low-signal / emoji / gibberish / outage paths (unchanged), never a normal customer message.
   check("no provider-transient plan suppresses a normal message (suppression reserved for noise/superseded)",
     tSoft.suppress === false && tMicro.suppress === false);
+
+  // ── 27. Gemini observability helpers (PURE — logging only, no behavior) ──────────────────────────
+  // Pre-call size estimation, size buckets, one-way correlation hashes, error classification, and the
+  // structured-line builders. These feed the new [gemini-prompt]/[gemini-attempt]/[gemini-health] logs
+  // so 503s can later be correlated with prompt size / intent / provider state. Nothing here routes.
+  section("27. Gemini observability helpers (prompt budget, per-attempt, hashing) — pure");
+  // estimateTokens: ~4 chars/token, ceil; non-positive → 0.
+  check("estimateTokens: ~chars/4 (ceil), 0/negative → 0",
+    estimateTokens(4000) === 1000 && estimateTokens(10) === 3
+    && estimateTokens(0) === 0 && estimateTokens(-5) === 0);
+  // promptSizeBucket: token-boundary buckets for grouping.
+  check("promptSizeBucket: xs<500 ≤ s<1500 ≤ m<3000 ≤ l<6000 ≤ xl",
+    promptSizeBucket(400) === "xs" && promptSizeBucket(499) === "xs"
+    && promptSizeBucket(500) === "s" && promptSizeBucket(1499) === "s"
+    && promptSizeBucket(1500) === "m" && promptSizeBucket(2999) === "m"
+    && promptSizeBucket(3000) === "l" && promptSizeBucket(5999) === "l"
+    && promptSizeBucket(6000) === "xl");
+  // safeHash: stable, one-way (never echoes the source), short hex, "" → "0".
+  const h1 = safeHash("נראלי קצר"); const h2 = safeHash("נראלי קצר");
+  check("safeHash: stable for same input, differs for different, never exposes raw text, '' → '0'",
+    h1 === h2 && safeHash("אחר") !== h1 && /^[0-9a-f]{10}$/.test(h1)
+    && !h1.includes("נראלי") && safeHash("") === "0");
+  // classifyGeminiError: the analysis granularity we need (503 overloaded is the live case).
+  check("classifyGeminiError: 503/'high demand' → overloaded, 429 → rate_limit, 401/403 → auth, 400 → bad_request, 5xx → server, else unknown",
+    classifyGeminiError(503) === "overloaded" && classifyGeminiError(200, "high demand") === "overloaded"
+    && classifyGeminiError(429) === "rate_limit" && classifyGeminiError(401) === "auth"
+    && classifyGeminiError(403) === "auth" && classifyGeminiError(400) === "bad_request"
+    && classifyGeminiError(500) === "server" && classifyGeminiError(418) === "unknown");
+  // kv: stable insertion order; null/undefined → "-".
+  check("kv: stable k=v order, nullish → '-'",
+    kv({ a: 1, b: null, c: "x", d: true, e: undefined }) === "a=1 b=- c=x d=true e=-");
+  // geminiAttemptLine: the per-attempt builder carries attempt #, status, latency, size — for success AND failure.
+  const apiErrLine = geminiAttemptLine({
+    turnId: "abc123", attempt: 2, model: "gemini-2.5-flash-lite", status: "api_error",
+    httpStatus: 503, errorClass: "overloaded", latencyMs: 812, recoveryProbe: true,
+    providerStateBefore: "transient", promptTokensEst: 3500, promptBucket: "l",
+  });
+  check("geminiAttemptLine: prefixed line carries attempt/status/http/latency/bucket (failure path included)",
+    apiErrLine.startsWith("[gemini-attempt] ")
+    && apiErrLine.includes("attempt=2") && apiErrLine.includes("status=api_error")
+    && apiErrLine.includes("http=503") && apiErrLine.includes("errorClass=overloaded")
+    && apiErrLine.includes("latencyMs=812") && apiErrLine.includes("promptBucket=l")
+    && apiErrLine.includes("turn=abc123"));
+  const okLine = geminiAttemptLine({
+    attempt: 1, model: "m", status: "success", latencyMs: 240,
+    recoveryProbe: false, providerStateBefore: "healthy", promptTokensEst: 800, promptBucket: "s",
+  });
+  check("geminiAttemptLine: success path has attempt/status/latency and omits http/errorClass as '-'",
+    okLine.includes("attempt=1") && okLine.includes("status=success")
+    && okLine.includes("latencyMs=240") && okLine.includes("http=-") && okLine.includes("errorClass=-"));
+  // fallbackTypeForLowSignal: turn-trace label, accurate (normal_clarify only counts when it actually fired).
+  check("fallbackTypeForLowSignal: short_clarify/forced→low_signal_short, boundary→boundary, quiet→quiet, else undefined",
+    fallbackTypeForLowSignal("short_clarify", false) === "low_signal_short"
+    && fallbackTypeForLowSignal("normal_clarify", true) === "low_signal_short"
+    && fallbackTypeForLowSignal("normal_clarify", false) === undefined
+    && fallbackTypeForLowSignal("boundary", false) === "boundary"
+    && fallbackTypeForLowSignal("quiet_mode", false) === "quiet"
+    && fallbackTypeForLowSignal("none", false) === undefined);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

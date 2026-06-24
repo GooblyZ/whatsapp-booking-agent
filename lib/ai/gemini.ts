@@ -12,6 +12,8 @@
 // This module knows nothing about the business, the prompt, or intents.
 // It only sends a system instruction + conversation turns and returns raw text.
 
+import { estimateTokens, promptSizeBucket, classifyGeminiError, geminiAttemptLine, kv } from "./telemetry";
+
 // Single production model (no routing, no classifier, no fallback model).
 // Override via GEMINI_MODEL env var.
 const DEFAULT_MODEL = "gemini-2.5-flash-lite";
@@ -138,6 +140,20 @@ function noteSuccess(): void {
   cooldownUntil = 0;
 }
 
+/** LOG-ONLY: emits a structured `[gemini-health]` line when the provider state/strikes actually changed
+ *  around a note*() call. Lets us see flapping (healthy↔degraded) and recovery without changing behavior. */
+function logHealthTransition(turnId: string, before: GeminiHealth, reason: string, recoveryProbe: boolean): void {
+  const after = getGeminiHealth();
+  if (before.state === after.state && before.strikes === after.strikes) return; // no real transition → no noise
+  console.log(`[gemini-health] ` + kv({
+    turn: turnId,
+    stateBefore: before.state, stateAfter: after.state,
+    strikesBefore: before.strikes, strikesAfter: after.strikes,
+    cooldownBeforeMs: before.cooldownRemainingMs, cooldownAfterMs: after.cooldownRemainingMs,
+    reason, recoveryProbe,
+  }));
+}
+
 /** 503 / high-demand / quota-pressure responses — transient and retry-worthy. */
 function isOverloadResponse(status: number, msg: string): boolean {
   return status === 503 || status === 429 ||
@@ -213,6 +229,9 @@ export interface GeminiCallOptions {
   /** Caller's supersede signal (per-conversation single-flight). When it fires, the in-flight
    *  request is CANCELLED and returns a benign error — never a 503/overload strike. */
   signal?: AbortSignal;
+  /** LOG-ONLY correlation id (e.g. a phone-safe hash from brain.ts) tying this call's `[gemini-attempt]`
+   *  / `[gemini-usage]` / `[gemini-health]` lines to its `[gemini-prompt]` line. Never the raw phone. */
+  turnId?: string;
 }
 
 export async function geminiGenerateConversation(
@@ -278,11 +297,22 @@ async function callGemini(
     return { ok: false, code: "overloaded", error: "Simulated 503 (high demand)" };
   }
 
+  // ── Observability (LOG-ONLY): pre-call prompt-size estimate + provider state, captured ONCE so they
+  //    are available for BOTH the success and failure paths (failed calls can be analyzed too). No
+  //    behavior change — these only feed the structured `[gemini-attempt]` / `[gemini-health]` lines.
+  const turnId = opts.turnId ?? "-";
+  const promptChars = systemInstruction.length +
+    contents.reduce((n, c) => n + c.parts.reduce((m, p) => m + p.text.length, 0), 0);
+  const promptTokensEst = estimateTokens(promptChars);
+  const promptBucket = promptSizeBucket(promptTokensEst);
+  const recoveryProbe = overloadStrikes > 0;
+  const providerStateBefore = getGeminiHealth().state;
+
   // HALF-OPEN recovery probe: if we're still carrying overload strikes (the cooldown just
   // expired, or we're in the transient/flaky window) this live call is the probe that decides
   // whether AI is restored (noteSuccess) or we stay degraded (noteOverload). Logged so the
   // recovery attempt is explicit, not implicit.
-  if (overloadStrikes > 0) {
+  if (recoveryProbe) {
     console.log(
       `[gemini] RECOVERY PROBE — live call after degraded state (strikes=${overloadStrikes},` +
       ` cooldown ${isGeminiCoolingDown() ? "active" : "expired"})`
@@ -291,6 +321,7 @@ async function callGemini(
 
   // One quick in-call retry on overload — most 503s are per-request transients.
   for (let attempt = 1; attempt <= 2; attempt++) {
+  const attemptStartedAt = Date.now(); // per-attempt latency anchor (success + failure)
   // Superseded before this attempt (e.g. during the retry backoff) → stop, benignly.
   if (opts.signal?.aborted) {
     return { ok: false, code: "network", error: "Gemini request superseded (newer turn)" };
@@ -317,6 +348,11 @@ async function callGemini(
         `[gemini] api error — status=${res.status} model=${model} attempt=${attempt}` +
         `${overloaded ? " (overloaded)" : ""} msg=${safeMsg}`
       );
+      console.log(geminiAttemptLine({
+        turnId, attempt, model, status: "api_error", httpStatus: res.status,
+        errorClass: classifyGeminiError(res.status, safeMsg), latencyMs: Date.now() - attemptStartedAt,
+        recoveryProbe, providerStateBefore, promptTokensEst, promptBucket,
+      }));
       if (overloaded) {
         // A turn the caller has already SUPERSEDED (a newer inbound arrived) must not retry and
         // must not count toward the global cooldown — otherwise obsolete/aggregated burst work
@@ -329,14 +365,23 @@ async function callGemini(
           await sleep(RETRY_DELAY_MS);
           continue;
         }
+        const healthBefore = getGeminiHealth();
         noteOverload(model);
+        logHealthTransition(turnId, healthBefore, "overloaded", recoveryProbe);
         return { ok: false, code: "overloaded", error: `Gemini overloaded (${res.status})` };
       }
       return { ok: false, code: "api_error", error: `Gemini API error (${res.status})` };
     }
 
     // Any successful HTTP round trip means the model is reachable again.
+    const latencyMs = Date.now() - attemptStartedAt;
+    const healthBefore = getGeminiHealth();
     noteSuccess();
+    logHealthTransition(turnId, healthBefore, "success", recoveryProbe);
+    console.log(geminiAttemptLine({
+      turnId, attempt, model, status: "success", latencyMs,
+      recoveryProbe, providerStateBefore, promptTokensEst, promptBucket,
+    }));
 
     const json: unknown = await res.json().catch(() => null);
     const text = extractText(json);
@@ -356,9 +401,10 @@ async function callGemini(
     const usage = buildUsage(model, meta);
     if (usage) {
       console.log(
-        `[gemini-usage] model=${usage.model} in=${usage.promptTokens} out=${usage.outputTokens}` +
+        `[gemini-usage] turn=${turnId} model=${usage.model} in=${usage.promptTokens} out=${usage.outputTokens}` +
         ` thoughts=${usage.thoughtTokens} total=${usage.totalTokens}` +
-        ` estCost=$${usage.estCostUSD !== null ? usage.estCostUSD.toFixed(6) : "?"}`
+        ` estCost=$${usage.estCostUSD !== null ? usage.estCostUSD.toFixed(6) : "?"}` +
+        ` latencyMs=${latencyMs} attempt=${attempt}`
       );
     }
 
@@ -378,6 +424,11 @@ async function callGemini(
     const msg = redact(err instanceof Error ? err.message : String(err));
     const aborted = err instanceof Error && err.name === "AbortError";
     console.error(`[gemini] request failed${aborted ? " (timeout)" : ""}: ${msg}`);
+    console.log(geminiAttemptLine({
+      turnId, attempt, model, status: "network_error",
+      errorClass: "unknown", latencyMs: Date.now() - attemptStartedAt,
+      recoveryProbe, providerStateBefore, promptTokensEst, promptBucket,
+    }));
     return { ok: false, code: "network", error: aborted ? "Gemini request timed out" : "Gemini request failed" };
   } finally {
     clearTimeout(timer);

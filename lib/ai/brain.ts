@@ -23,6 +23,7 @@ import { verifyGrounding, extractTimeTokens, extractPhoneDigits } from "./ground
 import { parseAiJsonResponse } from "./json-parse";
 import { buildContextReply, type BookingSession } from "./booking-session";
 import { renderVerdictReplyHe, type AvailabilityInfo } from "./availability-facts";
+import { estimateTokens, promptSizeBucket, safeHash } from "./telemetry";
 import type { AIEventResponseType } from "./events";
 
 export type ReceptionistIntent =
@@ -243,24 +244,34 @@ export async function runReceptionistTurn(
     { role: "user", text: input.message.slice(0, 1000) },
   ];
 
+  // LOG-ONLY correlation id for this turn — a phone-safe one-way hash (never the raw phone), tying this
+  // `[gemini-prompt]` line to the `[gemini-attempt]` / `[gemini-usage]` / `[gemini-health]` lines emitted
+  // by the call below. Time-seeded so each turn is distinct.
+  const turnId = safeHash(`${ctx.business.id}:${input.customerPhone ?? ""}:${Date.now()}`);
+
   // Cost instrumentation: per-request prompt composition (CHAR sizes only — safe
   // metadata, no content). persona_base = instruction minus the injected blocks.
   {
     const sz = (s: string | undefined) => (s ?? "").length;
     const historyChars = (input.historyTurns ?? []).reduce((n, t) => n + t.text.length, 0);
+    const messageChars = Math.min(input.message.length, 1000);
     const injected =
       sz(factsBlock) + sz(input.availabilityBlock) + sz(input.bookingBlock) +
       sz(input.replyGuidance) + (useNativeHistory ? 0 : sz(input.conversationContext)) +
       sz(ctx.aiSettings?.custom_instructions ?? undefined);
+    // Whole-call estimate (system instruction + native-history turns + the user message) → tokens + bucket,
+    // so a FAILED call (no API usage metadata) can still be analyzed by size. ~4 chars/token heuristic.
+    const promptTokensEst = estimateTokens(instruction.length + historyChars + messageChars);
     console.log(
-      `[gemini-prompt] chars: instruction=${instruction.length}` +
+      `[gemini-prompt] turn=${turnId} business=${ctx.business.id} mode=full chars: instruction=${instruction.length}` +
       ` (persona_base≈${Math.max(0, instruction.length - injected)}` +
       ` facts=${sz(factsBlock)} availability=${sz(input.availabilityBlock)}` +
       ` booking=${sz(input.bookingBlock)} guidance=${sz(input.replyGuidance)}` +
       ` custom=${sz(ctx.aiSettings?.custom_instructions ?? undefined)}` +
       ` transcript=${useNativeHistory ? 0 : sz(input.conversationContext)})` +
       ` + history_turns=${input.historyTurns?.length ?? 0} (${historyChars} chars)` +
-      ` + message=${Math.min(input.message.length, 1000)}` +
+      ` + message=${messageChars}` +
+      ` | promptTokensEst=${promptTokensEst} bucket=${promptSizeBucket(promptTokensEst)} instrHash=${safeHash(instruction)}` +
       // Settings traceability (safe metadata only — no prompt, message, phone, or custom-instruction text):
       ` | profileHash=${profile.promptProfileHash} settingsVersion=${profile.settingsVersion ?? "-"}`
     );
@@ -269,6 +280,7 @@ export async function runReceptionistTurn(
   const res = await geminiGenerateConversation(instruction, turns, {
     abortIfSuperseded: input.abortIfSuperseded,
     signal: input.abortSignal,
+    turnId,
   });
   if (!res.ok) {
     if (res.code === "not_configured") {

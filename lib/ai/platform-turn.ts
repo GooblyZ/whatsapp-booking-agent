@@ -540,6 +540,11 @@ export async function runPlatformTurn(
       staleTopicGuard: false, softIntent: false, contextualConfirmation: false,
       capabilityFence: false, recoveryFollowup: degIntent === "recovery", pendingResolved: false, coldYes: false,
       customerVisible: !suppress, action: suppress ? "continuity_suppressed" : `continuity_${reason}${link ? `+${link}` : menuKind !== "-" ? `+${menuKind}` : ""}`,
+      // Observability (LOG-ONLY): the deterministic fallback kind, live provider health, and whether a
+      // transient-503 need was PRESERVED this turn (recovered later on the next healthy turn).
+      fallbackType: menuKind !== "-" ? menuKind : `continuity_${reason}`,
+      providerHealth: getGeminiHealth().state, strikes: getGeminiHealth().strikes,
+      failedNeedStored: !!storeFailedNeed, failedNeedRecovered: false,
     });
     return { replyText: text, decision, linkAttached: link, suppressReply: suppress, interactive: suppress ? undefined : interactive };
   };
@@ -941,6 +946,7 @@ export async function runPlatformTurn(
   let newGreeting = prevGreeting;
   let lowSignalAct: LowSignalAction = "none";
   let suppressReply = false;
+  let forcedClarify = false; // LOG-ONLY: did the tier-1 deterministic clarify actually override the reply?
   if (decision.ok && decision.turn) {
     newLowSignal = lowSignal ? prevLowSignal + 1 : 0;
     // Greeting LOOP counter (cost cap) advances ONLY on an actual bare opener — NOT on
@@ -953,7 +959,7 @@ export async function runPlatformTurn(
     // lone contentless `unclear` token the model tends to "interpret" as a name ("אורי" → "מה שלומך,
     // אורי?") — unless our last reply asked a direct question a one-word answer could resolve. Those get
     // the deterministic clarify (no link). See forcesDeterministicClarify.
-    if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
+    if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; forcedClarify = true; }
     else if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
     else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
     else if (lowSignalAct === "quiet_mode") {
@@ -1077,6 +1083,13 @@ export async function runPlatformTurn(
     coldYes,
     customerVisible: !suppressReply && replyText.trim().length > 0,
     action: `${suppressReply ? "suppressed" : "reply"}${linkAttached ? `+${linkAttached}` : ""}`,
+    // Observability (LOG-ONLY): the low-signal deterministic override that shaped the reply (if any),
+    // live provider health, and whether a transient-503 need was recovered this (healthy) turn.
+    fallbackType: fallbackTypeForLowSignal(lowSignalAct, forcedClarify),
+    providerHealth: getGeminiHealth().state,
+    strikes: getGeminiHealth().strikes,
+    failedNeedStored: false,
+    failedNeedRecovered: !!prevFailedNeed,
   });
 
   // interactive is sent ONLY when a link is still attached at the end — a guard that revoked the link
@@ -1861,6 +1874,16 @@ export function lowSignalActionFor(count: number): LowSignalAction {
   return "quiet_mode";
 }
 
+/** LOG-ONLY: maps the low-signal action (+ whether the tier-1 clarify actually fired) to a fallback-type
+ *  label for the turn trace. Returns undefined when the model's own reply shipped (no deterministic
+ *  override). Pure — observability only, never gates behavior. */
+export function fallbackTypeForLowSignal(action: LowSignalAction, forcedClarify: boolean): string | undefined {
+  if (action === "short_clarify" || (action === "normal_clarify" && forcedClarify)) return "low_signal_short";
+  if (action === "boundary") return "boundary";
+  if (action === "quiet_mode") return "quiet";
+  return undefined;
+}
+
 /** A single short word (name-like / typo-like): no internal whitespace and short, after trimming any
  *  trailing punctuation. The class of token the model tends to "interpret" (e.g. adopt a lone Hebrew
  *  name token as the customer's name). NOT exported — only forcesDeterministicClarify consults it. */
@@ -2316,6 +2339,13 @@ export interface TurnTrace {
   customerVisible: boolean;         // false ⇒ this turn sent the customer nothing (silence)
   action: string;         // short human summary, e.g. "reply+booking" / "suppressed"
   interactivePayloadId?: string;    // stable id when this turn was a TAP on a clickable option
+  // ── Observability (LOG-ONLY) — optional so existing call sites stay valid. Let later analysis group by
+  //    fallback kind + live provider health and see whether a failed need was preserved/recovered. ──
+  fallbackType?: string;            // transient_soft | transient_micro | outage_entry | low_signal_short | boundary | quiet | …
+  providerHealth?: string;          // getGeminiHealth().state at trace time: healthy | transient | outage
+  strikes?: number;                 // overload strikes at trace time
+  failedNeedStored?: boolean;       // a transient-503 need was PRESERVED this turn for later recovery
+  failedNeedRecovered?: boolean;    // a previously-preserved transient-503 need was consumed this turn
 }
 
 function logTurnTrace(t: TurnTrace): void {
