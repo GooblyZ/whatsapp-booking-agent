@@ -37,6 +37,7 @@ import {
   resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
   attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
   forcesDeterministicClarify, LOW_SIGNAL_SHORT,
+  planTransientContinuity, TRANSIENT_MICRO_ACK,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -1835,6 +1836,42 @@ async function main(): Promise<void> {
   // An over-long single token is not treated as a short lone token (conservative length bound).
   check("an over-long single token is not forced (length-bounded single-token rule)",
     forcesDeterministicClarify("unclear", "normal_clarify", "אבגדהוזחטיכלמנ", false) === false);
+
+  // ── 26. Provider-transient continuity is VISIBLE, never silent (no transient_quiet suppression) ──
+  // Live bug: after a 503 blip a good-faith contextual message ("נראלי קצר") was SILENTLY suppressed
+  // (transient_quiet) because the fuller notice was rate-limited → the customer saw nothing and sent
+  // "הלו?". Now a REPEAT provider-transient blip sends a SHORT VISIBLE micro-ack instead of silence;
+  // the original need is still preserved (storeFailedNeed) for the next healthy turn.
+  section("26. Provider-transient continuity is visible, never silent (transient_micro)");
+  const tSoft  = planTransientContinuity(true);
+  const tMicro = planTransientContinuity(false);
+  // 1. First hit (notice allowed) → the EXISTING soft fallback wording, VISIBLE, stamps the 90s clock.
+  check("notice allowed → existing soft fallback, visible, persistNotice (clock stamped)",
+    tSoft.kind === "transient_soft" && tSoft.suppress === false
+    && tSoft.text === continuityText("provider_transient", "menu") && tSoft.persistNotice === true);
+  // 2/6. Repeat inside the gap → VISIBLE micro-ack, NOT suppressed (the 'נראלי קצר' silence fix).
+  check("notice denied → micro-ack, VISIBLE (suppress=false) — no more silent transient_quiet",
+    tMicro.kind === "transient_micro" && tMicro.suppress === false
+    && tMicro.text === TRANSIENT_MICRO_ACK && tMicro.text.trim().length > 0 && tMicro.persistNotice === false);
+  // The contextual incident message routes to the generic 'menu' degraded-intent (this exact branch),
+  // not booking/manage — so it is precisely the case that must now stay visible.
+  check("'נראלי קצר' is a generic/contextual degraded-intent (menu) → the visible-not-silent branch",
+    classifyDegradedIntent("נראלי קצר") === "menu");
+  // 4. The micro-ack is DISTINCT from (and shorter than) the long soft notice — no repeated long line.
+  check("micro-ack is distinct from + shorter than the soft notice (no repeated long fallback)",
+    tMicro.text !== tSoft.text && tMicro.text.length < tSoft.text.length);
+  // 5. Micro-ack carries NO link / URL / link wording (generic/contextual message).
+  check("micro-ack has no link / URL / link wording",
+    !/https?:\/\//.test(TRANSIENT_MICRO_ACK) && !/קישור|לינק|link/i.test(TRANSIENT_MICRO_ACK));
+  // Honest, non-technical, gender-neutral phrasing (neutral "אפשר לשלוח", no masculine "נסה" imperative,
+  // no raw provider/API words leaked to the customer).
+  check("micro-ack is short, neutral and non-technical (no raw API/provider words, no gendered imperative)",
+    TRANSIENT_MICRO_ACK.length < 60 && TRANSIENT_MICRO_ACK.includes("אפשר לשלוח")
+    && !/נסה\b/.test(TRANSIENT_MICRO_ACK) && !/503|API|gemini|error/i.test(TRANSIENT_MICRO_ACK));
+  // Neither provider-transient plan ever suppresses — suppression stays reserved for superseded /
+  // low-signal / emoji / gibberish / outage paths (unchanged), never a normal customer message.
+  check("no provider-transient plan suppresses a normal message (suppression reserved for noise/superseded)",
+    tSoft.suppress === false && tMicro.suppress === false);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

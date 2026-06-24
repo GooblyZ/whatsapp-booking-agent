@@ -159,6 +159,33 @@ export function continuityText(reason: DegradedReason, kind: "booking" | "manage
   if (kind === "manage") return `${notice} לניהול התור — צפייה, שינוי או ביטול — אפשר ישירות בקישור:\n${url}`;
   return `${notice} נסו שוב עוד רגע. בינתיים ${CONTINUITY_MENU_BODY}`;
 }
+// SHORT visible micro-ack for a REPEAT provider-transient blip inside the notice-gap window — replaces
+// the old SILENT `transient_quiet`, so a good-faith customer message is NEVER met with silence. Distinct
+// from (and shorter than) the soft "resend?" notice, carries no link, gender-neutral ("אפשר לשלוח", not a
+// masculine imperative). Emoji is stripped at the emojiNone chokepoint like every other continuity line.
+export const TRANSIENT_MICRO_ACK =
+  "עדיין יש עומס קטן אצלי 🙏 אפשר לשלוח שוב עוד רגע.";
+
+export interface TransientPlan {
+  kind: "transient_soft" | "transient_micro";
+  text: string;
+  suppress: boolean;      // always false — a provider-transient blip is never silent for a normal message
+  persistNotice: boolean; // only the fuller soft notice stamps the rate-limit clock
+}
+/**
+ * Provider-transient (ONE 503 blip, still AI-lane) reply plan for a GENERIC/CONTEXTUAL message — the
+ * branch that previously went SILENT (`transient_quiet`). First hit (notice allowed) → the fuller soft
+ * "resend?" line, which stamps the 90s notice clock. A REPEAT inside that window → a SHORT visible
+ * micro-ack: never the long line again, and NEVER silence. Booking / manage / recovery / accountability
+ * are resolved BEFORE this branch — this covers only the "menu" (FAQ / contextual / unknown) case and
+ * never attaches a link. Pure + exported so the visible-not-silent contract is unit-testable.
+ */
+export function planTransientContinuity(noticeAllowed: boolean): TransientPlan {
+  return noticeAllowed
+    ? { kind: "transient_soft", text: continuityText("provider_transient", "menu"), suppress: false, persistNotice: true }
+    : { kind: "transient_micro", text: TRANSIENT_MICRO_ACK, suppress: false, persistNotice: false };
+}
+
 const STILL_DEGRADED_ACK =
   "עדיין יש קצת עומס במערכת 🙏 אפשר להמשיך — אם מדובר בתור, הכי מהיר דרך הקישור. נסו שוב עוד רגע ואשמח לעזור.";
 const RECOVERY_ACK =
@@ -453,11 +480,13 @@ export async function runPlatformTurn(
       text = mo.text; interactive = mo.interactive; link = mo.link; logPlatformLink(m.kind, m.url);
       menuNode = { node: "main", at: now };
     } else if (reason === "provider_transient") {
-      // ONE brief blip — keep the AI experience: a soft "resend?" (rate-limited like the notice),
-      // and PRESERVE the original need below so the next healthy turn recovers it. We deliberately
-      // do NOT switch to the full deterministic FAQ menu over a single 503 (no permanent downgrade).
-      if (degradedNoticeAllowed(priorContext, now)) { text = continuityText(reason, "menu"); persistNotice = true; menuKind = "transient_soft"; }
-      else { suppress = true; menuKind = "transient_quiet"; }
+      // ONE brief blip — keep the AI experience and PRESERVE the original need below (storeFailedNeed)
+      // so the next healthy turn recovers it. NEVER the full deterministic FAQ menu over a single 503.
+      // First hit → the fuller soft "resend?" (stamps the 90s clock); a REPEAT inside that window → a
+      // SHORT VISIBLE micro-ack (transient_micro) — never silence for a good-faith message (this replaces
+      // the old transient_quiet suppression that made the customer feel ignored → "הלו?").
+      const plan = planTransientContinuity(degradedNoticeAllowed(priorContext, now));
+      text = plan.text; menuKind = plan.kind; suppress = plan.suppress; persistNotice = plan.persistNotice;
     } else if (isProvider && !hasCursor) {
       // AXIS C — OUTAGE / severe-failure ENTRY (no active cursor): the customer was talking to the AI
       // and it became unavailable. Anchor to the MAIN MENU, VISIBLY — bypass the vague rate-limit so
