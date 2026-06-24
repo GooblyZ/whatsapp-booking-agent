@@ -55,6 +55,9 @@ import {
 } from "../../lib/booking/notifications";
 import { isAutoCompletable, completePastAppointments, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
 import { authorizeJobRequest } from "../../lib/jobs/auth";
+import {
+  isActiveAppointment, isHistoryAppointment, filterAppointmentsForView, ACTIVE_GRACE_MS,
+} from "../../lib/booking/appointment-views";
 import { claimsBookingCompleted, sameOutboundText, nearDuplicateText } from "../../lib/ai/reply-polish";
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
@@ -1690,6 +1693,95 @@ async function main(): Promise<void> {
   check("GET cron: NEITHER CRON_SECRET nor JOBS_SECRET set → disabled (fail-closed, never public)",
     authorizeJobRequest("Bearer anything", [undefined, undefined]) === "disabled"
     && authorizeJobRequest("Bearer anything", ["", ""]) === "disabled"); // empty strings ignored
+
+  // ── 24. Dashboard Active/History classification — pure, deletes nothing, agrees with the cron ──
+  // The dashboard splits appointments into ACTIVE (still needs attention) vs HISTORY (preserved record)
+  // using the SAME grace window the auto-complete job uses, so the two never disagree on when a past
+  // confirmed appointment stops being active. Every row lands in exactly one view; no row is dropped.
+  section("24. Dashboard Active/History appointment classification (pure)");
+  const vNow = new Date("2026-06-23T12:00:00Z"); // grace 1h ⇒ end_time cutoff = 11:00:00Z
+  const vRow = (status: string, startISO: string, endISO: string | null) =>
+    ({ status, start_time: startISO, end_time: endISO });
+
+  // The dashboard active window must be exactly the auto-complete grace — else the dashboard and the
+  // cron would disagree about when a past confirmed row stops being active.
+  check("active grace window == auto-complete grace (no drift between dashboard and cron)",
+    ACTIVE_GRACE_MS === AUTO_COMPLETE_GRACE_MS);
+
+  // 1. active includes future/current pending and confirmed
+  check("active includes a future pending and a future confirmed appointment",
+    isActiveAppointment(vRow("pending",   "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), vNow) === true
+    && isActiveAppointment(vRow("confirmed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), vNow) === true);
+  // 2. active includes a confirmed appointment that ended WITHIN the 1-hour grace
+  check("active includes a confirmed appointment that ended 30m ago (within grace)",
+    isActiveAppointment(vRow("confirmed", "2026-06-23T10:30:00Z", "2026-06-23T11:30:00Z"), vNow) === true);
+  // 3. active excludes an old past confirmed beyond grace (even before the cron flips it)
+  check("active EXCLUDES a confirmed appointment that ended 2h ago (past beyond grace)",
+    isActiveAppointment(vRow("confirmed", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), vNow) === false);
+  // 4/5/6. active excludes completed / cancelled / no_show (terminal status wins, even if future-dated)
+  check("active EXCLUDES completed / cancelled / no_show — terminal status wins even when future-dated",
+    isActiveAppointment(vRow("completed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), vNow) === false
+    && isActiveAppointment(vRow("cancelled", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), vNow) === false
+    && isActiveAppointment(vRow("no_show",   "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), vNow) === false);
+  // 7/8/9. history includes completed / cancelled / no_show
+  check("history includes completed, cancelled and no_show records",
+    isHistoryAppointment(vRow("completed", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), vNow) === true
+    && isHistoryAppointment(vRow("cancelled", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), vNow) === true
+    && isHistoryAppointment(vRow("no_show",   "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), vNow) === true);
+  // 10. history includes old past confirmed beyond grace
+  check("history includes an old past confirmed appointment (beyond grace)",
+    isHistoryAppointment(vRow("confirmed", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), vNow) === true);
+  // 11. future completed/cancelled rows still go to history (terminal status wins)
+  check("history includes future-dated completed / cancelled rows (terminal status wins)",
+    isHistoryAppointment(vRow("completed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), vNow) === true
+    && isHistoryAppointment(vRow("cancelled", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), vNow) === true);
+  // Boundary consistency with the auto-complete job: at exactly the cutoff BOTH say "still active";
+  // one second past the cutoff BOTH say "finished/history". The two helpers are exact complements there.
+  check("boundary: end exactly at cutoff → still active AND not auto-completable (consistent)",
+    isActiveAppointment(vRow("confirmed", "2026-06-23T10:00:00Z", "2026-06-23T11:00:00Z"), vNow) === true
+    && isAutoCompletable("confirmed", "2026-06-23T11:00:00Z", vNow) === false);
+  check("boundary: end 1s past cutoff → history AND auto-completable (consistent)",
+    isActiveAppointment(vRow("confirmed", "2026-06-23T09:00:00Z", "2026-06-23T10:59:59Z"), vNow) === false
+    && isAutoCompletable("confirmed", "2026-06-23T10:59:59Z", vNow) === true);
+  // Edge case 5: a PENDING appointment in the past beyond grace → history (NOT invented no_show; just
+  // moved out of the operational list, the row is preserved unchanged).
+  check("past pending beyond grace → history (conservative: not active, not marked no_show)",
+    isHistoryAppointment(vRow("pending", "2026-06-23T08:00:00Z", "2026-06-23T09:00:00Z"), vNow) === true
+    && isActiveAppointment(vRow("pending", "2026-06-23T08:00:00Z", "2026-06-23T09:00:00Z"), vNow) === false);
+  // A within-grace pending (just ended) stays active.
+  check("past pending WITHIN grace → still active",
+    isActiveAppointment(vRow("pending", "2026-06-23T10:30:00Z", "2026-06-23T11:30:00Z"), vNow) === true);
+  // Missing end_time falls back to start_time for the time reference.
+  check("end_time missing → start_time is the time reference (old start → history, future start → active)",
+    isHistoryAppointment(vRow("confirmed", "2026-06-23T09:00:00Z", null), vNow) === true
+    && isActiveAppointment(vRow("confirmed", "2026-06-24T09:00:00Z", null), vNow) === true);
+  // Unparseable time on an open-status row → kept active (never bury an operational row over a bad date).
+  check("open status + unparseable time → kept active (defensive)",
+    isActiveAppointment(vRow("confirmed", "not-a-date", null), vNow) === true);
+  // 12. PARTITION: filterAppointmentsForView splits a mixed set with NO row lost and NO overlap.
+  const vMixed = [
+    vRow("confirmed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z"), // active (future)
+    vRow("pending",   "2026-06-25T10:00:00Z", "2026-06-25T11:00:00Z"), // active (future)
+    vRow("confirmed", "2026-06-23T11:30:00Z", "2026-06-23T11:50:00Z"), // active (within grace)
+    vRow("confirmed", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z"), // history (past beyond grace)
+    vRow("completed", "2026-06-23T08:00:00Z", "2026-06-23T09:00:00Z"), // history
+    vRow("cancelled", "2026-06-24T08:00:00Z", "2026-06-24T09:00:00Z"), // history (future cancelled)
+    vRow("no_show",   "2026-06-22T08:00:00Z", "2026-06-22T09:00:00Z"), // history
+  ];
+  const vActive  = filterAppointmentsForView(vMixed, "active",  vNow);
+  const vHistory = filterAppointmentsForView(vMixed, "history", vNow);
+  check("partition: active(3) + history(4) == all(7), no row lost, no overlap",
+    vActive.length === 3 && vHistory.length === 4
+    && vActive.length + vHistory.length === vMixed.length
+    && vActive.every((r) => !vHistory.includes(r)));
+  // 13. Existing dashboard action behavior remains valid: action buttons gate on an OPEN+ACTIVE row.
+  // A terminal or past-beyond-grace row must NOT be action-eligible; a current open row must be.
+  const actionEligible = (r: { status: string; start_time: string; end_time: string | null }) =>
+    isActiveAppointment(r, vNow) && (r.status === "pending" || r.status === "confirmed");
+  check("dashboard actions remain valid: eligible only for currently-active open rows",
+    actionEligible(vRow("confirmed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z")) === true
+    && actionEligible(vRow("completed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z")) === false
+    && actionEligible(vRow("confirmed", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z")) === false);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
