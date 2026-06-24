@@ -919,10 +919,12 @@ export async function runPlatformTurn(
     // counter and risk later suppressing a real greeting (assistant-driven social drift).
     newGreeting = looksLikeGreetingOrMeta(latest, activeServiceNames) ? prevGreeting + 1 : 0;
     lowSignalAct = lowSignalActionFor(newLowSignal);
-    // count 1 → keep the model's (friendly) clarification; escalate from 2 up.
-    // Gibberish must NEVER reach the customer as a model-authored semantic guess
-    // ("במבח" → "אתה מתכוון למחר?"). Use the deterministic clarify even at tier 1.
-    if (lowSignalAct === "normal_clarify" && kind === "gibberish") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
+    // count 1 → normally keep the model's (friendly) clarification; escalate from 2 up. EXCEPT tier-1
+    // cases that must NOT ship a model-authored guess: gibberish ("במבח" → "אתה מתכוון למחר?"), and a
+    // lone contentless `unclear` token the model tends to "interpret" as a name ("אורי" → "מה שלומך,
+    // אורי?") — unless our last reply asked a direct question a one-word answer could resolve. Those get
+    // the deterministic clarify (no link). See forcesDeterministicClarify.
+    if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
     else if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
     else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
     else if (lowSignalAct === "quiet_mode") {
@@ -1824,10 +1826,44 @@ export function preGeminiAction(
 /** Escalation tier for N consecutive low-signal turns. */
 export function lowSignalActionFor(count: number): LowSignalAction {
   if (count <= 0) return "none";
-  if (count === 1) return "normal_clarify"; // friendly, keep the model's reply
+  if (count === 1) return "normal_clarify"; // friendly, keep the model's reply (unless forced below)
   if (count === 2) return "short_clarify";
   if (count === 3) return "boundary";
   return "quiet_mode";
+}
+
+/** A single short word (name-like / typo-like): no internal whitespace and short, after trimming any
+ *  trailing punctuation. The class of token the model tends to "interpret" (e.g. adopt a lone Hebrew
+ *  name token as the customer's name). NOT exported — only forcesDeterministicClarify consults it. */
+const SINGLE_SHORT_TOKEN_MAX = 12;
+function isSingleShortToken(message: string): boolean {
+  const t = (message ?? "").trim().replace(/[!?.…׳"'\s,־-]+$/g, "").trim();
+  if (t.length === 0 || t.length > SINGLE_SHORT_TOKEN_MAX) return false;
+  return !/\s/.test(t); // exactly one token
+}
+
+/**
+ * Decides whether the post-Gemini reply MUST be replaced by the deterministic low-signal clarification
+ * (LOW_SIGNAL_SHORT) instead of shipping the model's free text. Governs the tier-1 `normal_clarify`
+ * step ONLY — higher tiers (short_clarify / boundary / quiet_mode) already force their own deterministic
+ * line, so this returns false for every non-`normal_clarify` action.
+ *
+ *   • gibberish → ALWAYS force: a model-authored semantic guess on noise ("במבח" → "אתה מתכוון למחר?")
+ *                must never reach the customer. (Preserves the prior tier-1 gibberish behavior exactly.)
+ *   • unclear   → force when the message is a SINGLE SHORT TOKEN and our last reply did NOT ask a direct
+ *                question. A lone, contentless token carries no resolvable intent, and the model tends to
+ *                "interpret" it — e.g. adopt a name-like word as the customer's name ("אורי" → "מה שלומך,
+ *                אורי?"). A generic clarify is safer. The askedQuestion gate protects a legitimate one-word
+ *                ANSWER (e.g. after "איך קוראים לך?"). A MULTI-WORD unclear message keeps the model's
+ *                friendly clarification (unchanged). This is a structural class, NOT a per-phrase patch.
+ */
+export function forcesDeterministicClarify(
+  kind: LowSignalKind, action: LowSignalAction, message: string, askedQuestion: boolean
+): boolean {
+  if (action !== "normal_clarify") return false;
+  if (kind === "gibberish") return true;
+  if (kind === "unclear") return !askedQuestion && isSingleShortToken(message);
+  return false;
 }
 
 // ── Link-wording fence ─────────────────────────────────────────────────────────

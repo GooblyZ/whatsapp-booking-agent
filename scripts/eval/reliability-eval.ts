@@ -36,6 +36,7 @@ import {
   isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
   resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
   attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
+  forcesDeterministicClarify, LOW_SIGNAL_SHORT,
 } from "../../lib/ai/platform-turn";
 import { beginTurn, isCurrentTurn, endTurn, activeTurnCount, resetTurnRegistry } from "../../lib/ai/turn-registry";
 import {
@@ -1782,6 +1783,58 @@ async function main(): Promise<void> {
     actionEligible(vRow("confirmed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z")) === true
     && actionEligible(vRow("completed", "2026-06-24T10:00:00Z", "2026-06-24T11:00:00Z")) === false
     && actionEligible(vRow("confirmed", "2026-06-23T09:00:00Z", "2026-06-23T10:00:00Z")) === false);
+
+  // ── 25. Force deterministic clarify for a single-token `unclear` (name-adoption guard) ──
+  // Live bug: "אורי" (a typo / lone token) classified unclear=normal_clarify, but tier-1 only forced a
+  // deterministic clarify for GIBBERISH — so Gemini's "מה שלומך, אורי?" (adopting the token as a name)
+  // shipped. forcesDeterministicClarify now replaces a lone unclear token with LOW_SIGNAL_SHORT, UNLESS
+  // our last reply asked a direct question (a legitimate one-word answer). A structural class, not a patch.
+  section("25. Forced deterministic clarify — single-token unclear (no name adoption)");
+  // Reality anchor: the incident token classifies as `unclear` (not gibberish, not productive)…
+  check("'אורי' classifies as unclear and is not noise (so it reaches the tier-1 normal_clarify step)",
+    lowSignalKind(dec("unclear"), "אורי", SERVICES, "none") === "unclear"
+    && looksLikeNoise("אורי", SERVICES) === false);
+  // …and the forced reply is the generic deterministic clarify — it NEVER echoes the token as a name.
+  check("single-token unclear → forced, and the forced reply is the clarify (never 'מה שלומך, <name>?')",
+    forcesDeterministicClarify("unclear", "normal_clarify", "אורי", false) === true
+    && !LOW_SIGNAL_SHORT.includes("אורי") && !/מה שלומך/.test(LOW_SIGNAL_SHORT));
+  // 1. single-token unclear, normal_clarify, askedQuestion=false → FORCED, generally across tokens.
+  check("forced for ANY lone short token (אורי/דני/איתי/typo) — not phrase-specific",
+    ["אורי", "דני", "איתי", "בלהט", "אוריון"].every(
+      (t) => forcesDeterministicClarify("unclear", "normal_clarify", t, false) === true));
+  // 3. askedQuestion=true → NOT forced (protect a legitimate one-word answer, e.g. after "איך קוראים לך?").
+  check("our last reply ASKED a question → NOT forced (one-word answer allowed; also protects a bare 'לא')",
+    forcesDeterministicClarify("unclear", "normal_clarify", "אורי", true) === false
+    && forcesDeterministicClarify("unclear", "normal_clarify", "לא", true) === false);
+  // 4. multi-word unclear → NOT forced (keep the model's friendly clarification).
+  check("multi-word unclear → NOT forced (model clarification kept)",
+    forcesDeterministicClarify("unclear", "normal_clarify", "אהה אולי לא יודע", false) === false
+    && forcesDeterministicClarify("unclear", "normal_clarify", "בלה בלה משהו", false) === false);
+  // 5. gibberish at normal_clarify → still FORCED (prior behavior preserved), regardless of askedQuestion.
+  check("gibberish normal_clarify → still forced (preserved), independent of askedQuestion",
+    forcesDeterministicClarify("gibberish", "normal_clarify", "חכלגצג", false) === true
+    && forcesDeterministicClarify("gibberish", "normal_clarify", "חכלגצג", true) === true);
+  // 6. Legitimate short answers are NOT this case: כן/אוקי are bare affirmations (→ productive upstream);
+  //    מה is meta. When classified productive/meta the helper is a no-op.
+  check("כן / אוקי are bare affirmations (productive upstream) → helper is a no-op",
+    isBareAffirmation("כן") === true && isBareAffirmation("אוקי") === true
+    && forcesDeterministicClarify("productive", "none", "כן", false) === false
+    && forcesDeterministicClarify("productive", "none", "אוקי", false) === false);
+  check("'מה' (meta) is never forced (meta tier action is 'none')",
+    forcesDeterministicClarify("meta", "none", "מה", false) === false);
+  // Only the tier-1 `normal_clarify` step is governed; higher tiers force their own deterministic line.
+  check("non-normal_clarify actions are not governed by this helper (always false)",
+    forcesDeterministicClarify("unclear", "short_clarify", "אורי", false) === false
+    && forcesDeterministicClarify("unclear", "boundary", "אורי", false) === false
+    && forcesDeterministicClarify("unclear", "quiet_mode", "אורי", false) === false
+    && forcesDeterministicClarify("unclear", "none", "אורי", false) === false);
+  // 7/8. Booking and manage/list requests are productive here → never forced-clarified.
+  check("booking / manage-list requests are not forced-clarified (productive → helper no-op)",
+    forcesDeterministicClarify("productive", "none", "אני רוצה לקבוע תור", false) === false
+    && forcesDeterministicClarify("productive", "none", "לבטל תור", false) === false);
+  // An over-long single token is not treated as a short lone token (conservative length bound).
+  check("an over-long single token is not forced (length-bounded single-token rule)",
+    forcesDeterministicClarify("unclear", "normal_clarify", "אבגדהוזחטיכלמנ", false) === false);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
