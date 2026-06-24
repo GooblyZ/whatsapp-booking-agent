@@ -598,6 +598,55 @@ export async function runPlatformTurn(
     return { replyText: "", decision: supersededDecision, linkAttached: null, suppressReply: true };
   }
 
+  // ── PRE-GEMINI SINGLE-TOKEN CLARIFY SKIP (call-waste + safety). A lone short, SIGNAL-LESS token with
+  //    NO pending question is ALREADY going to ship the deterministic LOW_SIGNAL_SHORT after Gemini (the
+  //    forcesDeterministicClarify path) — so decide it HERE and skip a full ~3.3k-token call. This also
+  //    CLOSES the residual name-adoption hole (the model can't label a lone token as a name we then echo).
+  //    Escalation tiers mirror the emoji-only pre-Gemini skip exactly, so repeated low-signal still climbs
+  //    to boundary/quiet. SKIPPED in deterministic mode (every turn there is menu-anchored). The whole
+  //    message is checked (multi-fragment bursts have whitespace → never skipped → they reach Gemini).
+  if (!deterministicMenu && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, activeServiceNames)) {
+    const newCount = prevLowSignal + 1;
+    const action = lowSignalActionFor(newCount);
+    let replyText = LOW_SIGNAL_SHORT;
+    let suppressReply = false;
+    if (action === "boundary") replyText = LOW_SIGNAL_BOUNDARY;
+    else if (action === "quiet_mode") {
+      const plan = quietModePlan(newCount);
+      suppressReply = plan.suppressReply;
+      replyText = plan.suppressReply ? "" : LOW_SIGNAL_QUIET_REMINDER;
+    }
+    await persist(newCount, 0); // a lone unclear token breaks any greeting run
+    const decision = errorDecision("low_signal_single_token", true);
+    await safeLog(businessId, customerId, decision);
+    console.log(
+      `[platform-turn] ai_called=false action=false intent=unclear appt_intent=NONE route=NONE route_reason=not_actionable link=-` +
+      ` pre_gemini_guard=true pre_gemini_action=skip_gemini_single_token gemini_skipped_reason=single_token_unclear` +
+      ` low_signal=true low_signal_kind=unclear` +
+      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
+      ` greeting_count_before=${prevGreeting} greeting_count_after=0` +
+      ` low_signal_action=${action} cooldown_short_circuit=false reply_suppressed=${suppressReply} src=fallback`
+    );
+    logTurnTrace({
+      bookingMode: "platform", geminiCalled: false, route: "NONE", routeReason: "not_actionable",
+      signalKind: "unclear", linkKind: null, linkAttached: false, suppressReply,
+      guardBranch: decision.branch, bookingEvidence: false,
+      lowSignalBefore: prevLowSignal, lowSignalAfter: newCount,
+      greetingBefore: prevGreeting, greetingAfter: 0,
+      replySource: "fallback", memLines: memory.turnsUsed,
+      latestSignal: "none", aggregateSignal: "none",
+      lastAssistant: `${lastContract.sentBookingLink ? "B" : ""}${lastContract.sentManageLink ? "M" : ""}${lastContract.offeredHelp ? "H" : ""}${lastContract.offeredBooking ? "K" : ""}${lastContract.askedQuestion ? "Q" : ""}` || "-",
+      staleTopicGuard: false, softIntent: false, contextualConfirmation: false,
+      capabilityFence: false, recoveryFollowup: false, pendingResolved: false, coldYes: false,
+      customerVisible: !suppressReply && replyText.trim().length > 0,
+      action: suppressReply ? "suppressed" : "reply",
+      fallbackType: fallbackTypeForLowSignal(action, action === "normal_clarify"),
+      providerHealth: getGeminiHealth().state, strikes: getGeminiHealth().strikes,
+      failedNeedStored: false, failedNeedRecovered: !!prevFailedNeed,
+    });
+    return { replyText, decision, linkAttached: null, suppressReply };
+  }
+
   const decision = await runReceptionistTurn(ctx, {
     historyTurns: memory.turns,
     conversationContext: memory.transcript,
@@ -1916,6 +1965,37 @@ export function forcesDeterministicClarify(
   if (kind === "gibberish") return true;
   if (kind === "unclear") return !askedQuestion && isSingleShortToken(message);
   return false;
+}
+
+/**
+ * PRE-GEMINI decidability of the single-token `unclear` clarify: true when this turn is ALREADY going to
+ * ship the deterministic LOW_SIGNAL_SHORT regardless of the model, so the full Gemini call can be skipped.
+ * It is the DETERMINISTIC precondition of forcesDeterministicClarify — a lone short token carrying NO
+ * signal of any kind — computed without the model. Conditions (ALL required):
+ *   1. our last reply did NOT ask a direct question (a one-word ANSWER may be valid — e.g. a name),
+ *   2. the WHOLE message is a single short token (multi-fragment bursts have whitespace → excluded),
+ *   3. not a bare affirmation (כן / אוקי / בטח / סבבה …),
+ *   4. not a meta/presence token (מה / למה / נו / "?" via isGoodFaithLowSignal),
+ *   5. not a greeting (היי / הי / שלום / אהלן …),
+ *   6. not noise/gibberish (that keeps its own existing pre-Gemini path),
+ *   7. no manage/help topic, no booking signal, and no good-faith signal (faq / soft / action / help /
+ *      contextual) — so a meaningful lone token (a service name, a price-FAQ word) still reaches Gemini.
+ * Mirrors the post-Gemini forced-clarify outcome; that override stays as defense-in-depth.
+ */
+export function shouldPreSkipSingleTokenClarify(
+  message: string, askedQuestion: boolean, serviceNames: string[] = []
+): boolean {
+  if (askedQuestion) return false;
+  if (!isSingleShortToken(message)) return false;
+  const t = message.trim();
+  if (isBareAffirmation(t)) return false;
+  if (isGoodFaithLowSignal(t)) return false;                  // מה / למה / נו / "?" — meta/presence, not unclear
+  if (looksLikeGreetingOrMeta(t, serviceNames)) return false; // היי / הי / שלום / אהלן …
+  if (looksLikeNoise(t, serviceNames)) return false;          // gibberish keeps its existing pre-Gemini path
+  if (isManageHelpTopic(t)) return false;                     // cancel / reschedule / list / link-help
+  if (hasBookingSignal(t, serviceNames)) return false;        // a service name / booking verb
+  if (classifyGoodFaithSignal(t, { serviceNames }) !== "none") return false; // faq / soft / action / help / contextual
+  return true;                                                // a lone, signal-less token → deterministic clarify
 }
 
 // ── Link-wording fence ─────────────────────────────────────────────────────────

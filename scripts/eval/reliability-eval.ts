@@ -38,6 +38,7 @@ import {
   attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
   forcesDeterministicClarify, LOW_SIGNAL_SHORT,
   planTransientContinuity, TRANSIENT_MICRO_ACK, fallbackTypeForLowSignal,
+  shouldPreSkipSingleTokenClarify,
 } from "../../lib/ai/platform-turn";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
@@ -1933,6 +1934,49 @@ async function main(): Promise<void> {
     && fallbackTypeForLowSignal("boundary", false) === "boundary"
     && fallbackTypeForLowSignal("quiet_mode", false) === "quiet"
     && fallbackTypeForLowSignal("none", false) === undefined);
+
+  // ── 28. Pre-Gemini skip for single-token unclear (call-waste + safety) ───────────────────────────
+  // A lone short signal-less token ("אורי") whose post-Gemini outcome is ALREADY the deterministic
+  // LOW_SIGNAL_SHORT is decided BEFORE the model call — saving a full ~3.3k-token request and the 7.3s
+  // worst-case latency, and closing the residual name-adoption hole. Must NOT skip real conversation.
+  section("28. Pre-Gemini single-token unclear skip (no wasted Gemini call)");
+  const SVC = SERVICES; // the test tenant's real services
+  // SHOULD skip: lone signal-less tokens, no question pending → general, not phrase-specific.
+  check("skips a lone signal-less token (אורי/דני/איתי/typo) when no question is pending",
+    ["אורי", "דני", "איתי", "בלהט", "אוריון"].every(
+      (t) => shouldPreSkipSingleTokenClarify(t, false, SVC) === true));
+  // askedQuestion=true → a one-word answer may be valid (e.g. a name after "איך קוראים לך?").
+  check("does NOT skip when our last reply asked a question (one-word answer allowed)",
+    shouldPreSkipSingleTokenClarify("דני", true, SVC) === false
+    && shouldPreSkipSingleTokenClarify("אורי", true, SVC) === false);
+  // Bare affirmations are contextual → must reach the normal pipeline, never forced-clarified.
+  check("does NOT skip bare affirmations (כן / אוקי / אוקיי / בטח / סבבה)",
+    ["כן", "אוקי", "אוקיי", "בטח", "סבבה"].every(
+      (t) => shouldPreSkipSingleTokenClarify(t, false, SVC) === false));
+  // Meta/presence and greetings keep their own warm/meta handling — not a signal-less clarify.
+  check("does NOT skip meta (מה / למה / נו) or greetings (היי / הי / שלום / אהלן)",
+    ["מה", "למה", "נו", "היי", "הי", "שלום", "אהלן"].every(
+      (t) => shouldPreSkipSingleTokenClarify(t, false, SVC) === false));
+  // Multi-word contextual answers must continue to Gemini (whitespace ⇒ not a single token).
+  check("does NOT skip a multi-word contextual message ('נראלי קצר')",
+    shouldPreSkipSingleTokenClarify("נראלי קצר", false, SVC) === false
+    && shouldPreSkipSingleTokenClarify("האמת מתלבט", false, SVC) === false);
+  // A meaningful lone token (a real service name / a price-FAQ word) still reaches Gemini.
+  check("does NOT skip a meaningful lone token (a configured service name, or a price-FAQ word 'מחיר')",
+    shouldPreSkipSingleTokenClarify(SVC[0], false, SVC) === false
+    && shouldPreSkipSingleTokenClarify("מחיר", false, SVC) === false);
+  // Explicit booking / manage intent (multi-word) never skips.
+  check("does NOT skip booking ('אני רוצה לקבוע תור') or manage ('לבטל תור') intent",
+    shouldPreSkipSingleTokenClarify("אני רוצה לקבוע תור", false, SVC) === false
+    && shouldPreSkipSingleTokenClarify("לבטל תור", false, SVC) === false);
+  // An over-long single token is not treated as a short lone token (conservative bound).
+  check("does NOT skip an over-long single token (length-bounded single-token rule)",
+    shouldPreSkipSingleTokenClarify("אבגדהוזחטיכלמנ", false, SVC) === false);
+  // Defense-in-depth: the post-Gemini forcesDeterministicClarify still fires for the same class, so a
+  // model call that DID happen (e.g. helper later tightened) is still corrected to LOW_SIGNAL_SHORT.
+  check("post-Gemini forcesDeterministicClarify remains as defense-in-depth for the same class",
+    forcesDeterministicClarify("unclear", "normal_clarify", "אורי", false) === true
+    && fallbackTypeForLowSignal("normal_clarify", true) === "low_signal_short");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
