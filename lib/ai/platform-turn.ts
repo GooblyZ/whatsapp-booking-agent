@@ -1976,11 +1976,17 @@ export function isGenericSmalltalkQuestion(text: string): boolean {
   return GENERIC_SMALLTALK_Q_RE.test(text ?? "");
 }
 
-// A question that expects a SPECIFIC answer the customer may give in one word — name, service, day,
-// time, phone, a choice/preference, a yes/no action, or a link/booking confirmation. Conservative.
+// A question whose valid ONE-WORD answer may carry NO deterministic signal — NAME, DAY/DATE, TIME, or
+// PHONE. ONLY these block the single-token-unclear skip, because answers like "דני" / "מחר" / "12" / a
+// phone number look signal-less yet are meaningful. SERVICE-preference / yes-no / link / booking-offer
+// questions are deliberately NOT here: a valid service answer carries a booking signal (hasBookingSignal,
+// incl. colloquial short-forms), and "כן"/"אוקי" are bare affirmations — both already protect those, so
+// blocking on them was redundant and wrongly swallowed a lone NON-answer like "אורי" after a smalltalk
+// reply that ended "…מה בא לך לעשות?". (A PURE, non-smalltalk service/confirm/link question still blocks
+// via the conservative !isGenericSmalltalkQuestion arm in hasPendingAnswerExpectedQuestion.)
 const ANSWER_EXPECTED_Q_RE =
-  /איך\s+קוראים|מה\s+שמ|מה\s+השם|השם\s+שלך|איזה\s+שירות|איזו\s+שירות|איזה\s+יום|איזה\s+שעה|איזו\s+שעה|מתי\s+(?:נוח|מתאים|תרצ|בא\s+לך|מתי)|נוח\s+לך|מתאים\s+לך|מה\s+תרצ|מה\s+בא\s+לך|רוצה\s+ש|אתה\s+רוצה|את\s+רוצה|אתם\s+רוצים|לשלוח\s+(?:לך\s+)?(?:את\s+ה)?(?:קישור|לינק)|מספר\s+(?:ה)?טלפון|הטלפון\s+שלך|לקבוע\s+(?:לך\s+)?תור/;
-/** True when our last reply asked for a specific answer (a one-word reply may be a valid answer). */
+  /איך\s+קוראים|מה\s+שמ|מה\s+השם|השם\s+שלך|איזה\s+יום|איזה\s+שעה|איזו\s+שעה|מתי|נוח\s+לך|מספר\s+(?:ה)?טלפון|הטלפון\s+שלך/;
+/** True when our last reply asked a NAME / DAY / TIME / PHONE question (a one-word reply may be valid). */
 export function asksAnswerExpectedQuestion(text: string): boolean {
   return ANSWER_EXPECTED_Q_RE.test(text ?? "");
 }
@@ -2147,13 +2153,36 @@ const SIGNAL_RE = new RegExp([...BOOKING_DOMAIN, ...GENERIC_SERVICE].map(booking
  *  deterministic half of the two-gate link decision (the other half is Gemini's
  *  intent). Checks booking verbs, generic service words, and the business's own
  *  configured service names — all word-bounded so they don't misfire mid-word. */
+// Per-WORD service match (additive, BUSINESS-AGNOSTIC): a configured service name's individual significant
+// words also count as a booking signal — tolerating a Hebrew construct/absolute suffix swap on the final
+// letter (צביעת ↔ צביעה) and a leading vav-conjunction (ועיצוב → עיצוב). This recognizes colloquial
+// SHORT-FORMS of a multi-word service ("פן" for "פן ועיצוב", "צביעה" for "צביעת שיער") that the full-name
+// match misses — derived ENTIRELY from THIS business's configured names (no hardcoded industry terms).
+// Word-bounded both sides. Like every booking signal it is intent-gated downstream (no link without
+// Gemini ALSO judging an operation), and a false positive only ever fails SAFE: it routes the turn to
+// Gemini (and, for the pre-Gemini skip, simply declines to skip).
+function matchesServiceWord(message: string, serviceName: string): boolean {
+  for (const raw of serviceName.split(/\s+/)) {
+    const w = raw.replace(/^ו/, "").trim(); // drop a leading vav-conjunction ("ועיצוב" → "עיצוב")
+    if (w.length < 2) continue;
+    const endsCT = /[תה]$/.test(w);             // construct/absolute suffix (צביעת ↔ צביעה)
+    const stem = endsCT ? w.slice(0, -1) : w;
+    if (stem.length < 2) continue;
+    const body = endsCT ? `${escapeForRegex(stem)}[תה]` : escapeForRegex(w);
+    if (new RegExp(`(?<![${HEB}])[בהלושמכ]?${body}(?![${HEB}])`).test(message)) return true;
+  }
+  return false;
+}
+
 export function hasBookingSignal(message: string, serviceNames: string[] = []): boolean {
   const t = (message ?? "").trim();
   if (!t) return false;
   if (SIGNAL_RE.test(t)) return true;
   for (const name of serviceNames) {
     const n = (name ?? "").trim();
-    if (n.length >= 2 && new RegExp(bookingToken(escapeForRegex(n))).test(t)) return true;
+    if (n.length < 2) continue;
+    if (new RegExp(bookingToken(escapeForRegex(n))).test(t)) return true; // full configured name
+    if (matchesServiceWord(t, n)) return true;                            // colloquial short-form / suffix variant
   }
   return false;
 }

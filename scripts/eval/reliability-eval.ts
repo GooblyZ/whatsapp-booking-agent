@@ -1988,10 +1988,11 @@ async function main(): Promise<void> {
   check("isGenericSmalltalkQuestion: true for מה שלומך / מה קורה / הכל בסדר / איך הולך / מה חדש",
     ["מה שלומך?", "מה קורה?", "הכל בסדר?", "איך הולך?", "מה חדש?", "איך אתה?"].every((q) => isGenericSmalltalkQuestion(q) === true)
     && isGenericSmalltalkQuestion("איך קוראים לך?") === false);
-  check("asksAnswerExpectedQuestion: true for name/service/day/time/choice/confirm/link questions",
-    ["איך קוראים לך?", "מה השם שלך?", "איזה שירות תרצה?", "איזה יום נוח לך?", "איזה שעה?",
-     "רוצה שאשלח קישור לקביעת תור?", "אתה רוצה לקבוע תור?"].every((q) => asksAnswerExpectedQuestion(q) === true)
-    && asksAnswerExpectedQuestion("מה שלומך?") === false);
+  check("asksAnswerExpectedQuestion: true ONLY for name/day/time/phone; service/yes-no/link are now false",
+    ["איך קוראים לך?", "מה השם שלך?", "איזה יום נוח לך?", "איזה שעה נוחה לך?", "מתי נוח לך?",
+     "מה מספר הטלפון שלך?"].every((q) => asksAnswerExpectedQuestion(q) === true)
+    && ["מה שלומך?", "איזה שירות תרצה?", "מה בא לך לעשות היום?", "רוצה שאשלח קישור?", "אתה רוצה לקבוע תור?"]
+         .every((q) => asksAnswerExpectedQuestion(q) === false));
   check("hasPendingAnswerExpectedQuestion: smalltalk question → false; real question / unrecognized → true; no question → false",
     hasPendingAnswerExpectedQuestion(true, "מה שלומך?") === false
     && hasPendingAnswerExpectedQuestion(true, "איך קוראים לך?") === true
@@ -2015,6 +2016,47 @@ async function main(): Promise<void> {
   // 9. Multi-word still not skipped, even past a smalltalk question.
   check("multi-word ('נראלי קצר') still not skipped past a smalltalk question",
     shouldPreSkipSingleTokenClarify("נראלי קצר", true, "מה שלומך?", SVC) === false);
+
+  // ── 30. Narrowed answer-expected + colloquial service signal (live 'אורי' vs 'צביעה' fix) ────────
+  // Live miss: the assistant reply ended "…מה בא לך לעשות היום?" (a service-preference question), which
+  // `499ad91` treated as answer-expected → blocked the skip for "אורי". Narrowing answer-expected to
+  // name/day/time/phone fixes that; extending hasBookingSignal to colloquial service short-forms keeps a
+  // real service answer ("צביעה"/"פן") OUT of the skip (it's now a recognized booking signal).
+  section("30. Narrowed answer-expected + colloquial service signal (live 'אורי'/'צביעה')");
+  const LIVE_ASSISTANT = "מה קורה גבר? הכל טוב פה, תודה ששאלת! מה איתך? אם בא לך לחדש את הלוק, יש לנו פה פן ועיצוב, צביעת שיער או תספורת. מה בא לך לעשות היום?";
+  // 1. Exact live reproduction: a lone signal-less token now SKIPS past the mixed smalltalk+service reply.
+  check("live repro: 'אורי' after the smalltalk+service-preference reply → SKIPS (no Gemini)",
+    shouldPreSkipSingleTokenClarify("אורי", true, LIVE_ASSISTANT, SVC) === true);
+  // 2/5. Colloquial service short-forms are now booking signals → do NOT skip (service flow proceeds).
+  check("'צביעה'/'פן' are recognized service signals → do NOT skip after the same reply",
+    hasBookingSignal("צביעה", SVC) === true && hasBookingSignal("פן", SVC) === true
+    && shouldPreSkipSingleTokenClarify("צביעה", true, LIVE_ASSISTANT, SVC) === false
+    && shouldPreSkipSingleTokenClarify("פן", true, LIVE_ASSISTANT, SVC) === false);
+  // hasBookingSignal catches configured names + colloquial forms; not a lone name; no broad over-match.
+  check("hasBookingSignal: configured names + colloquial short-forms (צביעה/פן/תספורת); lone names stay false",
+    hasBookingSignal("תספורת", SVC) === true && hasBookingSignal("צביעת שיער", SVC) === true
+    && hasBookingSignal("פן ועיצוב", SVC) === true
+    && hasBookingSignal("אורי", SVC) === false && hasBookingSignal("דני", SVC) === false
+    && hasBookingSignal("אני טס לחו״ל עוד שבועיים", SVC) === false);
+  // 3. Bare affirmation still protected (pending-confirm behavior is unchanged — not touched here).
+  check("'אוקי' after the live reply still does NOT skip (bare affirmation)",
+    shouldPreSkipSingleTokenClarify("אוקי", true, LIVE_ASSISTANT, SVC) === false);
+  // 4/6/7. Name/day/time/phone questions still BLOCK the skip (a one-word answer may be valid).
+  check("name/day/time/phone questions still block: דני / מחר / 12 / phone do NOT skip",
+    shouldPreSkipSingleTokenClarify("דני", true, "איך קוראים לך?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("מחר", true, "איזה יום נוח לך?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("12", true, "איזה שעה נוחה לך?", SVC) === false
+    && shouldPreSkipSingleTokenClarify("0501234567", true, "מה מספר הטלפון שלך?", SVC) === false);
+  // 8. Pure generic smalltalk (§29) still allows the skip for a lone signal-less token.
+  check("pure smalltalk still allows the skip ('מה שלומך?'→'אורי', 'מה קורה?'→'דני')",
+    shouldPreSkipSingleTokenClarify("אורי", true, "הכל בסדר, מה שלומך?", SVC) === true
+    && shouldPreSkipSingleTokenClarify("דני", true, "מה קורה אחי?", SVC) === true);
+  // 9. Existing protections intact: affirmation/greeting/meta, multi-word, booking intent; post-Gemini fence.
+  check("existing protections intact (affirmations/greetings/meta/multi-word/booking; post-Gemini fence)",
+    ["כן", "בטח", "מה", "היי"].every((t) => shouldPreSkipSingleTokenClarify(t, false, "", SVC) === false)
+    && shouldPreSkipSingleTokenClarify("נראלי קצר", true, LIVE_ASSISTANT, SVC) === false
+    && shouldPreSkipSingleTokenClarify("אני רוצה לקבוע תור", false, "", SVC) === false
+    && forcesDeterministicClarify("unclear", "normal_clarify", "אורי", false) === true);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
