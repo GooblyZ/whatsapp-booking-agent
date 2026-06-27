@@ -127,7 +127,9 @@ export async function handleBookingFlow(
     // self-identifying in the logs (no untraceable sends).
     const chatSource: OutboundTrace = {
       source: outcome.decision.replySource === "gemini" ? "ai_turn" : "deterministic",
-      reason: outcome.linkAttached ? `link_${outcome.linkAttached}` : outcome.decision.branch,
+      // A durable history-hygiene reason (e.g. a scope-deflection) wins over the brain branch so a later
+      // turn can drop this off-topic message from AI-facing history (see DEFLECTED_REASONS).
+      reason: outcome.linkAttached ? `link_${outcome.linkAttached}` : (outcome.historyReason ?? outcome.decision.branch),
     };
     // A menu turn ships a CLICKABLE interactive message (with a guaranteed text fallback);
     // everything else sends plain text.

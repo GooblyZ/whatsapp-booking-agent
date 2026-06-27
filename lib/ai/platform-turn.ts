@@ -13,6 +13,7 @@ import { upsertConversationState } from "@/lib/booking/helpers";
 import { getBusinessAIContext } from "./context";
 import {
   getConversationContext, renderUpcomingAppointments, renderCustomerState, didLastReplyFailToSend,
+  OFF_TOPIC_REASON,
 } from "./conversation";
 import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured, getGeminiHealth, type GeminiHealthState } from "./gemini";
 import {
@@ -45,6 +46,10 @@ export interface PlatformTurnOutcome {
   /** CLICKABLE menu message for this turn (deterministic menu mode / navigation). When set,
    *  the router sends it as an interactive WhatsApp message; `replyText` is the text fallback. */
   interactive?: WhatsAppInteractive;
+  /** AI-FACING HISTORY HYGIENE: a durable `reason` token the router persists on this turn's outbound so a
+   *  later turn can drop it from Gemini's history. Set to OFF_TOPIC_REASON on a visible scope-deflection so
+   *  the preceding off-topic user message does not color the next real reply. Omitted ⇒ use decision.branch. */
+  historyReason?: string;
 }
 
 // ── OPERATING STATE — the SINGLE source of truth for AI-vs-deterministic routing (Phase 2) ──────
@@ -684,8 +689,7 @@ export async function runPlatformTurn(
   //    deflection) — this only caps a sustained off-topic loop so a bored/malicious user can't burn Gemini
   //    forever. Honest residual: a signal-less business question in DEEP quiet gets the boundary, not an answer
   //    — recoverable via any clear business message. SKIPPED in deterministic mode.
-  const isBusinessTopic = hasBookingSignal(messageText, activeServiceNames) || hasFaqSignal(messageText)
-    || isManageHelpTopic(messageText) || detectInfoTopic(messageText) !== null;
+  const isBusinessTopic = hasBusinessAnchor(messageText, activeServiceNames);
   if (!deterministicMenu && prevLowSignal >= LOW_VALUE_DEEP_AT && !isBusinessTopic
       && !isGoodFaithLowSignal(latest) && !looksLikePresenceCheck(latest)
       && !looksLikeGreetingOrMeta(latest, activeServiceNames)) {
@@ -700,7 +704,9 @@ export async function runPlatformTurn(
       ` gemini_skipped_reason=repeated_off_topic low_signal=true low_signal_kind=unclear route=NONE link=-` +
       ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount} reply_suppressed=${suppress}`
     );
-    return { replyText: suppress ? "" : (plan.replyText || LOW_VALUE_BOUNDARY), decision, linkAttached: null, suppressReply: suppress };
+    // A VISIBLE cap turn (boundary/sparse reminder) is a scope deflection → tag it so the off-topic user
+    // message drops from AI-facing history (suppressed turns carry no outbound, so the tag is a harmless no-op).
+    return { replyText: suppress ? "" : (plan.replyText || LOW_VALUE_BOUNDARY), decision, linkAttached: null, suppressReply: suppress, historyReason: OFF_TOPIC_REASON };
   }
 
   // ── PRE-GEMINI SINGLE-TOKEN CLARIFY SKIP (call-waste + safety). A lone short, SIGNAL-LESS token with
@@ -1110,6 +1116,7 @@ export async function runPlatformTurn(
   let lowSignalAct: LowSignalAction = "none";
   let suppressReply = false;
   let forcedClarify = false; // LOG-ONLY: did the tier-1 deterministic clarify actually override the reply?
+  let historyReason: string | undefined; // set on a visible scope-deflection → drops the off-topic turn from history
   if (decision.ok && decision.turn) {
     newLowSignal = lowSignal ? prevLowSignal + 1 : 0;
     // Greeting LOOP counter (cost cap) advances ONLY on an actual bare opener — NOT on
@@ -1125,12 +1132,16 @@ export async function runPlatformTurn(
     // OFF-TOPIC (general out-of-scope question): a SHORT, consistent business-scope deflection from turn 1
     // (no long warm re-intro, no CTA) — still counts toward quiet, so repeated off-topic de-escalates (quiet
     // suppression caps the cost). A genuine business FAQ is intent=faq (productive) and never lands here.
-    const isOffTopic = decision.turn.understanding.intent === "out_of_scope";
+    // OUTCOME-driven: the off-topic ladder + counting + history-tag all key off the SAME relevance verdict
+    // (kind === "out_of_domain" = the model judged it out_of_scope AND there is no business anchor). An
+    // anchored out_of_scope (a real FAQ the model mislabeled) is `productive` → it is NOT force-deflected here.
+    const isOffTopic = kind === "out_of_domain";
     if (isOffTopic && lowSignalAct !== "quiet_mode") {
       // off-topic ladder: tiers 1–2 → short scope deflection, tier 3 → the shared visible boundary (deep
       // off-topic in quiet is intercepted pre-Gemini by the off-topic cap above). Then quiet suppression.
       replyText = lowSignalAct === "boundary" ? LOW_VALUE_BOUNDARY : OFF_TOPIC_DEFLECTION;
       linkAttached = null;
+      historyReason = OFF_TOPIC_REASON; // visible scope deflection → drop this off-topic turn from AI history
     }
     else if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; forcedClarify = true; }
     else if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
@@ -1195,7 +1206,7 @@ export async function runPlatformTurn(
   //    rewritten clarify line) so a deterministic clarification can't fabricate a pending offer.
   const discussedService = (u?.serviceName ?? prevPending?.service) || undefined;
   let newPending: PendingOffer | null | undefined = undefined;
-  if (!coldYes && kind !== "gibberish" && kind !== "unclear") {
+  if (!coldYes && kind !== "gibberish" && kind !== "unclear" && kind !== "out_of_domain") {
     if (linkAttached === "booking") newPending = { kind: "BOOK", service: discussedService, at: now };
     else if (linkAttached === "manage") newPending = { kind: "MANAGE", service: discussedService, at: now };
     else if (decision.ok && BOOKING_OFFER_RE.test(decision.replyText)) newPending = { kind: "BOOK", service: discussedService, at: now };
@@ -1267,7 +1278,7 @@ export async function runPlatformTurn(
 
   // interactive is sent ONLY when a link is still attached at the end — a guard that revoked the link
   // (low-signal / recovery set linkAttached=null) also drops the stale button, falling back to text.
-  return { replyText, decision, linkAttached, suppressReply, interactive: linkAttached !== null ? interactive : undefined };
+  return { replyText, decision, linkAttached, suppressReply, interactive: linkAttached !== null ? interactive : undefined, historyReason };
 }
 
 // ── DETERMINISTIC MENU NAVIGATION runner ──────────────────────────────────────────
@@ -1745,7 +1756,19 @@ export function isLowSignalTurn(d: ReceptionistDecision): boolean {
   return u.intent === "unclear" || u.intent === "out_of_scope";
 }
 
-export type LowSignalKind = "gibberish" | "emoji" | "unclear" | "smalltalk" | "meta" | "productive";
+export type LowSignalKind = "gibberish" | "emoji" | "unclear" | "smalltalk" | "meta" | "productive" | "out_of_domain";
+
+// ── BUSINESS ANCHOR (deterministic FAQ protection) ───────────────────────────────
+// True when the message carries a concrete business signal — a booking/operation verb or configured
+// service (hasBookingSignal), a price/cost question (hasFaqSignal), a manage/cancel/list/link topic
+// (isManageHelpTopic), or a recognized business-info topic such as hours/location/parking/policy/contact
+// (detectInfoTopic). This is the SINGLE definition of "looks business-relevant", reused by the repeated-
+// off-topic cap and by lowSignalKind's relevance branch. It only ever RESCUES (protects a real FAQ from
+// being counted/suppressed) — it is never used to suppress a message, so it can't over-block. Pure.
+export function hasBusinessAnchor(message: string, serviceNames: string[] = []): boolean {
+  return hasBookingSignal(message, serviceNames) || hasFaqSignal(message)
+    || isManageHelpTopic(message) || detectInfoTopic(message) !== null;
+}
 
 /** Fine-grained kind for logging + counting. gibberish/unclear push toward quiet
  *  mode; smalltalk/meta/productive do not. */
@@ -1894,6 +1917,15 @@ export function lowSignalKind(
   // Gibberish wins over a model smalltalk/meta MISLABEL ("חבצב" labeled smalltalk is
   // still noise) — checked on the LATEST fragment so a burst's last line decides.
   if (looksLikeNoise(latest, serviceNames)) return "gibberish";
+  // RELEVANCE (model is the authority): an `out_of_scope` verdict means the turn is OUT-OF-DOMAIN and must
+  // COUNT toward quiet — REGARDLESS of question-shape. This closes the central cost loophole: a trivia
+  // question ("כמה אנשים יש באיטליה?") used to be rescued to `productive` by the faq-SHAPE check below
+  // (classifyGoodFaithSignal sees shape, not topic), so repeated trivia never escalated. ASYMMETRIC FAQ
+  // protection: if the message carries a real business anchor, the model likely erred on a genuine business
+  // topic → keep it `productive` (a real FAQ is never counted/suppressed). This rescues, never suppresses.
+  if (u.intent === "out_of_scope") {
+    return hasBusinessAnchor(message, serviceNames) ? "productive" : "out_of_domain";
+  }
   // Respect the model's conversational labels: a greeting/smalltalk/meta is not spam and
   // must keep feeding the greeting-loop counter (never flattened to "productive").
   if (u.intent === "smalltalk") return "smalltalk";
@@ -1911,9 +1943,10 @@ export function lowSignalKind(
   return "unclear";
 }
 
-/** Kinds that escalate toward quiet mode (the others reset the counter). */
+/** Kinds that escalate toward quiet mode (the others reset the counter). `out_of_domain` is the model's
+ *  `out_of_scope` relevance verdict (no business anchor) — repeated off-topic must de-escalate, not reset. */
 export function countsTowardQuiet(kind: LowSignalKind): boolean {
-  return kind === "gibberish" || kind === "unclear";
+  return kind === "gibberish" || kind === "unclear" || kind === "out_of_domain";
 }
 
 // ── CUSTOMER SAFETY: trajectory, operation inference & TRUTH-SAFE manage/help ─────

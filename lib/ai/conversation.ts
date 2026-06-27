@@ -252,7 +252,16 @@ const EMPTY = (windowTurns: number, maxAgeHours: number): ConversationContext =>
 // at the chokepoint (migration 012) — NOT by recomputing routing and NOT by matching the token text, so
 // it is general (any deflected token), never phrase-specific. Extend the Set as more deterministic
 // deflections gain a durable reason; it is a typed allowlist, not a per-case flag.
-export const DEFLECTED_REASONS = new Set<string>(["low_signal_single_token"]);
+//
+// `OFF_TOPIC_REASON` tags a VISIBLE scope-deflection turn (the model judged the message out-of-domain and
+// the system shipped a short scope deflection / boundary instead of a business answer). Dropping the
+// preceding trivia user-turn from AI-facing history stops a later real FAQ ("מתי פתוחים?") from being
+// colored by stale off-topic content ("כמה אנשים ברומא?"). The turn stays in the guard-facing transcript.
+// Owned here (the deflected-reason vocabulary) and EMITTED by runPlatformTurn → persisted as the outbound
+// `reason` at the chokepoint. NOTE: only VISIBLE deflections carry an outbound to tag; a deep-SUPPRESSED
+// off-topic turn has no outbound row, so its orphan user-token is a documented residual (Stage 3B tiering).
+export const OFF_TOPIC_REASON = "off_topic_deflection";
+export const DEFLECTED_REASONS = new Set<string>(["low_signal_single_token", OFF_TOPIC_REASON]);
 
 export interface HistoryRow { direction: string; body: string | null; reason?: string | null }
 

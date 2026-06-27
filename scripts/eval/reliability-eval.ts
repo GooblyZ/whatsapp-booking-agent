@@ -44,6 +44,7 @@ import {
   shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
   hasPendingAnswerExpectedQuestion,
   runPlatformTurn, type PlatformTurnTestDeps, type PlatformTurnOutcome,
+  hasBusinessAnchor,
 } from "../../lib/ai/platform-turn";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
@@ -81,7 +82,7 @@ import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
 import { applyOutboundSettings, formatOutboundTrace } from "../../lib/booking/outbound";
 import { saveOutboundMessage, buildOutboundRow, isMissingColumnError } from "../../lib/booking/helpers";
-import { buildHistoryTurns, DEFLECTED_REASONS, type ConversationContext } from "../../lib/ai/conversation";
+import { buildHistoryTurns, DEFLECTED_REASONS, OFF_TOPIC_REASON, type ConversationContext } from "../../lib/ai/conversation";
 import { FALLBACK, isLowValueAck, type ReceptionistTurn, type ReceptionistDecision } from "../../lib/ai/brain";
 import type { DB } from "../../lib/booking/helpers";
 import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
@@ -2802,31 +2803,42 @@ async function main(): Promise<void> {
       `low=${recover.low} link=${recover.outcome.linkAttached} model=${recover.modelCalled}`);
   }
 
-  // (42.4) REPEATED OFF-TOPIC DE-ESCALATION: a first off-topic reaches Gemini → short deflection; a SIGNAL-LESS
-  //        off-topic INCREMENTS the streak (de-escalates, never resets as productive); deep-streak signal-less
-  //        trivia is CAPPED without Gemini; a real business FAQ bypasses the cap and recovers. (emoji_usage=none
-  //        strips the deflection's emoji at the outbound fence → compare against stripEmojis(OFF_TOPIC_DEFLECTION).)
+  // (42.4) REPEATED OFF-TOPIC DE-ESCALATION (relevance-counting fix): a QUESTION-shaped off-topic now COUNTS
+  //        (the model's out_of_scope verdict is authoritative over question-shape), so repeated trivia ladders
+  //        deflection → boundary → pre-Gemini cap (Gemini stops). A real business FAQ is protected by the
+  //        anchor and a one-off tangent then a booking recovers. (emoji_usage=none strips the deflection's
+  //        emoji at the outbound fence → compare against stripEmojis(OFF_TOPIC_DEFLECTION).)
   {
     const deflect = stripEmojis(OFF_TOPIC_DEFLECTION);
-    const first = await runLane({ message: "כמה אנשים יש באיטליה?", prevLow: 0, model: { intent: "out_of_scope", reply: "x" } });
-    const counts = await runLane({ message: "הבית שלי צבוע אדום", prevLow: 0, model: { intent: "out_of_scope", reply: "x" } });
-    const capped = await runLane({ message: "מי הכי גבוה בעולם?", prevLow: 3, model: { intent: "out_of_scope", reply: "x" } });
-    const faq = await runLane({ message: "מה הכתובת?", prevLow: 3, model: { intent: "faq", reply: "הכתובת אצלנו…" } });
-    check("off-topic (runtime): a FIRST off-topic reaches Gemini → short scope deflection, no link (never an 'I didn't understand')",
-      first.modelCalled === true && first.outcome.replyText === deflect && first.outcome.linkAttached === null
-      && first.outcome.replyText !== LOW_SIGNAL_SHORT,
-      `model=${first.modelCalled} deflection=${first.outcome.replyText === deflect} reply=${JSON.stringify(first.outcome.replyText)}`);
-    check("off-topic (runtime): a SIGNAL-LESS off-topic INCREMENTS the streak (low 0→1, deflection) — de-escalates, not reset as productive",
-      counts.modelCalled === true && counts.outcome.replyText === deflect && counts.low === 1,
-      `model=${counts.modelCalled} deflection=${counts.outcome.replyText === deflect} low=${counts.low}`);
-    check("off-topic (runtime): DEEP-streak signal-less trivia is CAPPED WITHOUT Gemini (low→4, suppressed, branch=off_topic_capped)",
-      capped.modelCalled === false && capped.outcome.suppressReply === true && capped.low === 4 && capped.outcome.decision.branch === "off_topic_capped",
+    const boundary = stripEmojis(LOW_VALUE_BOUNDARY); // post-Gemini off-topic ladder passes through the emoji-none fence
+    // The SAME question-shaped trivia, climbing the streak across turns (previously a documented GAP: it
+    // never incremented because the faq-SHAPE rescue overrode the model's out_of_scope verdict — now fixed).
+    const t1 = await runLane({ message: "כמה אנשים יש באיטליה?", prevLow: 0, model: { intent: "out_of_scope", reply: "x" } });
+    const t2 = await runLane({ message: "מי הכי גבוה בעולם?", prevLow: 1, model: { intent: "out_of_scope", reply: "x" } });
+    const t3 = await runLane({ message: "מי המציא את הכיסא?", prevLow: 2, model: { intent: "out_of_scope", reply: "x" } });
+    const capped = await runLane({ message: "מי אכל הכי הרבה חמאה?", prevLow: 3, model: { intent: "out_of_scope", reply: "x" } });
+    const anchoredOoS = await runLane({ message: "מה הכתובת?", prevLow: 3, model: { intent: "out_of_scope", reply: "x" } });
+    const faq = await runLane({ message: "מתי פתוחים?", prevLow: 3, model: { intent: "faq", reply: "אנחנו פתוחים…" } });
+    check("off-topic (runtime): question-shaped trivia now COUNTS — turn1 → deflection + low 0→1 + tagged off_topic_deflection, reaches Gemini",
+      t1.modelCalled === true && t1.outcome.replyText === deflect && t1.low === 1
+      && t1.outcome.linkAttached === null && t1.outcome.historyReason === OFF_TOPIC_REASON,
+      `model=${t1.modelCalled} deflection=${t1.outcome.replyText === deflect} low=${t1.low} hist=${t1.outcome.historyReason}`);
+    check("off-topic (runtime): repeated question-shaped trivia ESCALATES — turn2 low→2 (deflection), turn3 low→3 (visible boundary)",
+      t2.low === 2 && t2.outcome.replyText === deflect && t2.modelCalled === true
+      && t3.low === 3 && t3.outcome.replyText === boundary && t3.modelCalled === true,
+      `t2.low=${t2.low}/${t2.outcome.replyText === deflect} t3.low=${t3.low}/${t3.outcome.replyText === boundary}`);
+    check("off-topic (runtime): the 4th trivia is CAPPED WITHOUT Gemini (low→4, suppressed, off_topic_capped, tagged) — cost bounded",
+      capped.modelCalled === false && capped.outcome.suppressReply === true && capped.low === 4
+      && capped.outcome.decision.branch === "off_topic_capped" && capped.outcome.historyReason === OFF_TOPIC_REASON,
       `model=${capped.modelCalled} sup=${capped.outcome.suppressReply} low=${capped.low} branch=${capped.outcome.decision.branch}`);
-    check("off-topic (runtime): a real business FAQ ('מה הכתובת?') BYPASSES the cap in a deep streak → Gemini, not suppressed, recovers (low→0)",
+    check("off-topic (runtime): FAQ protection — even a model out_of_scope on an anchored 'מה הכתובת?' does NOT count and is NOT suppressed (low→0)",
+      anchoredOoS.modelCalled === true && anchoredOoS.outcome.suppressReply !== true && anchoredOoS.low === 0,
+      `model=${anchoredOoS.modelCalled} sup=${anchoredOoS.outcome.suppressReply} low=${anchoredOoS.low}`);
+    check("off-topic (runtime): a real business FAQ ('מתי פתוחים?', model faq) BYPASSES the cap in a deep streak → Gemini, not suppressed, recovers (low→0)",
       faq.modelCalled === true && faq.outcome.suppressReply !== true && faq.low === 0,
       `model=${faq.modelCalled} sup=${faq.outcome.suppressReply} low=${faq.low}`);
-    gap("Documented cost residual: a QUESTION-shaped off-topic ('כמה אנשים יש באיטליה?') is deflected but does NOT increment the streak",
-      "classifyGoodFaithSignal sees only QUESTION SHAPE, not topic, so a trivia question reads as 'faq' (productive) → it is deflected each turn but never counts toward quiet, so the pre-Gemini cap only engages once the streak is deep via OTHER low-signal. A deterministic pre-Gemini off-topic SKIP is unsafe (it would also suppress a real FAQ like 'מה הכתובת?'). This is the intentional boundary from the audit, not a regression.");
+    gap("Honest residual (Stage 3B — model relevance ACCURACY): if the model itself labels trivia intent=faq (not out_of_scope), it is treated productive and may be answered — no deflection to count",
+      "Pre-Stage-3B safely bounds only the cases the model calls out_of_scope (now counted) + the deep-streak signal-less cap. Making the model DEFLECT off-domain instead of answering it is a persona/prompt-quality fix for Stage 3B; a deterministic 'no business anchor' override is unsafe (it would suppress real FAQs). Owner-approved boundary.");
   }
 
   // (42.5) BUSINESS-INTENT RECOVERY FROM QUIET: booking → booking link; explicit cancel + an upcoming appt → manage
@@ -2852,6 +2864,90 @@ async function main(): Promise<void> {
       price.modelCalled === true && price.outcome.suppressReply !== true
       && hours.modelCalled === true && hours.outcome.suppressReply !== true,
       `price.sup=${price.outcome.suppressReply} hours.sup=${hours.outcome.suppressReply}`);
+  }
+
+  // (42.6) MODEL-MISLABEL RELEVANCE (the owner's "middle path") — what is and is NOT safely closable.
+  //   SAFE & CLOSED: the model's OWN relevance verdict drives counting — out_of_scope (no anchor) counts as
+  //     out_of_domain regardless of question-shape (asserted in §42.4); a real business answer stays productive;
+  //     an anchored question is protected even if the model mislabels it.
+  //   NOT SAFELY CLOSABLE pre-Stage-3B: when the model labels trivia intent=faq/unclear with ok=true and a
+  //     GROUNDED reply (its own polite scope-deflection prose), the decision carries NO field distinguishing a
+  //     scope-deflection from a real business answer (responseType=faq_answer/unknown, grounded=true either
+  //     way). Counting it would require inspecting the model's reply PROSE (brittle, owner-forbidden) or the
+  //     unsafe grounding-failure signal (which fires mostly on REAL turns with a hallucinated time/phone, so it
+  //     would penalize real customers). The robust closure is Stage 3B: make the model emit out_of_scope, after
+  //     which §42.4 already counts it. These checks PIN the honest current behavior so it can't silently drift.
+  {
+    // #3 real business FAQ + model faq + real answer → productive, not counted, not tagged, recovers.
+    const realFaq = await runLane({ message: "כמה עולה תספורת?", prevLow: 2, model: { intent: "faq", reply: "תספורת אצלנו 80₪" } });
+    check("model-faq (runtime): a real business answer ('כמה עולה תספורת?') stays productive — low→0, not suppressed, NOT tagged off-topic",
+      realFaq.low === 0 && realFaq.outcome.suppressReply !== true && realFaq.outcome.historyReason === undefined,
+      `low=${realFaq.low} sup=${realFaq.outcome.suppressReply} hist=${realFaq.outcome.historyReason}`);
+    // #4 real business FAQ + model unclear + business anchor → protected (anchor), productive, recovers.
+    const anchorUnclear = await runLane({ message: "מתי פתוחים?", prevLow: 2, model: { intent: "unclear", reply: "x" } });
+    check("model-unclear (runtime): an ANCHORED question ('מתי פתוחים?') is protected → low→0, not suppressed",
+      anchorUnclear.low === 0 && anchorUnclear.outcome.suppressReply !== true,
+      `low=${anchorUnclear.low} sup=${anchorUnclear.outcome.suppressReply}`);
+    // #1/#2 HONEST RESIDUAL: trivia the MODEL labels faq/unclear (ok=true, grounded prose) is treated productive
+    // and RESETS the streak — the loophole persists for this sub-case (no safe deterministic signal). Pinned.
+    const faqTrivia = await runLane({ message: "מי המציא את הרולר בליידס?", prevLow: 2, model: { intent: "faq", reply: "אני כאן לעזור עם ענייני העסק" } });
+    const unclearTrivia = await runLane({ message: "כמה אנשים יש באיטליה?", prevLow: 2, model: { intent: "unclear", reply: "אני כאן לעזור עם ענייני העסק" } });
+    check("model-mislabel (runtime, PINNED): trivia labeled intent=faq/unclear by the model is treated productive (low→0) — NOT counted (the residual)",
+      faqTrivia.low === 0 && faqTrivia.modelCalled === true
+      && unclearTrivia.low === 0 && unclearTrivia.modelCalled === true,
+      `faqTrivia.low=${faqTrivia.low} unclearTrivia.low=${unclearTrivia.low}`);
+    gap("Main live loophole — NOT fully closed pre-Stage-3B: trivia the MODEL labels intent=faq/unclear (ok=true, grounded prose) does not count and resets the streak",
+      "There is no deterministic field that distinguishes a polite scope-deflection from a real business answer when ok=true & grounded=true (responseType=faq_answer/unknown either way). Safe signals only exist for the model's out_of_scope verdict (now counted) and grounding_failures (UNSAFE to count — they fire mostly on real turns with hallucinated times). Closing this requires Stage 3B prompt work so the model emits out_of_scope for off-domain; a reply-PROSE matcher would be brittle and is owner-forbidden. This commit does NOT pretend to solve this sub-case.");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 43. RELEVANCE ACCOUNTING (pure) — the model's out_of_scope verdict is authoritative over question-shape,
+  //     with asymmetric FAQ protection via a business anchor; off-topic deflections drop from AI history.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("43. Relevance accounting — out-of-domain counting, FAQ anchor protection, history hygiene");
+  // (1) The business anchor recognizes real business signals and rejects trivia (single definition, reused by
+  //     the off-topic cap AND lowSignalKind). It only ever RESCUES — it is never used to suppress.
+  check("hasBusinessAnchor: booking/price/service/info/manage are anchored; unrelated trivia is not",
+    ["אני רוצה לקבוע תור", "כמה עולה תספורת?", "מה הכתובת?", "מתי פתוחים?", "איזה שירותים יש?", "אפשר לבטל את התור"].every((m) => hasBusinessAnchor(m, SERVICES) === true)
+    && ["כמה אנשים יש באיטליה?", "מי הכי גבוה בעולם?", "מי המציא את הכיסא?", "הבית שלי צבוע אדום"].every((m) => hasBusinessAnchor(m, SERVICES) === false));
+  // (2) THE CORE FIX: a model out_of_scope verdict on a QUESTION-shaped trivia counts as out_of_domain — the
+  //     faq-SHAPE rescue (classifyGoodFaithSignal) no longer overrides the model's relevance verdict.
+  check("lowSignalKind: model out_of_scope on question-shaped trivia → 'out_of_domain' (not rescued to productive by shape)",
+    lowSignalKind(dec("out_of_scope"), "כמה אנשים יש באיטליה?", SERVICES) === "out_of_domain"
+    && lowSignalKind(dec("out_of_scope"), "מי הכי גבוה בעולם?", SERVICES) === "out_of_domain"
+    // …while the SAME messages read as 'faq' by pure SHAPE — proving the verdict now wins over shape:
+    && classifyGoodFaithSignal("כמה אנשים יש באיטליה?", { serviceNames: SERVICES }) === "faq");
+  // (3) ASYMMETRIC FAQ PROTECTION: a model out_of_scope on an ANCHORED business question stays productive
+  //     (the model erred on a real topic) → a real FAQ is never counted/suppressed.
+  check("lowSignalKind: model out_of_scope on an ANCHORED question ('מה הכתובת?'/price/service) → 'productive' (FAQ protected)",
+    lowSignalKind(dec("out_of_scope"), "מה הכתובת?", SERVICES) === "productive"
+    && lowSignalKind(dec("out_of_scope"), "כמה עולה תספורת?", SERVICES) === "productive"
+    && lowSignalKind(dec("out_of_scope"), "מתי פתוחים?", SERVICES) === "productive");
+  // (4) out_of_domain escalates toward quiet (others reset); the model is the relevance authority — repeated
+  //     off-topic de-escalates instead of resetting.
+  check("countsTowardQuiet('out_of_domain') === true; productive/smalltalk/meta still reset",
+    countsTowardQuiet("out_of_domain") === true && countsTowardQuiet("productive") === false
+    && countsTowardQuiet("smalltalk") === false && countsTowardQuiet("meta") === false);
+  // (5) HISTORY HYGIENE vocabulary: the off-topic deflection reason is a stable token in DEFLECTED_REASONS, so
+  //     buildHistoryTurns drops the preceding trivia user-turn from AI-facing history.
+  check("DEFLECTED_REASONS includes the off-topic deflection reason (drops trivia turns from AI-facing history)",
+    DEFLECTED_REASONS.has(OFF_TOPIC_REASON) === true && OFF_TOPIC_REASON.length > 0
+    && DEFLECTED_REASONS.has("low_signal_single_token") === true);
+  {
+    // buildHistoryTurns: a user trivia turn whose NEXT assistant row carries OFF_TOPIC_REASON is dropped from
+    // AI-facing `turns` but KEPT in the guard-facing transcript (`allTurns`).
+    const rows = [
+      { direction: "inbound", body: "כמה אנשים יש באיטליה?", reason: null },
+      { direction: "outbound", body: "אני כאן לעזור עם מה שקשור לעסק 🙂", reason: OFF_TOPIC_REASON },
+      { direction: "inbound", body: "מתי פתוחים?", reason: null },
+      { direction: "outbound", body: "אנחנו פתוחים א׳-ה׳ 9-19", reason: "ok" },
+    ];
+    const { turns, allTurns } = buildHistoryTurns(rows, 400, 10);
+    const aiText = turns.map((t) => t.text).join(" | ");
+    check("buildHistoryTurns: an off-topic-tagged trivia turn is dropped from AI-facing history but kept in the transcript",
+      !aiText.includes("איטליה") && turns.some((t) => t.text.includes("פתוחים"))
+      && allTurns.some((t) => t.text.includes("איטליה")),
+      `aiText=${JSON.stringify(aiText)}`);
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────
