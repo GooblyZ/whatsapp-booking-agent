@@ -44,7 +44,7 @@ import {
   shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
   hasPendingAnswerExpectedQuestion,
   runPlatformTurn, type PlatformTurnTestDeps, type PlatformTurnOutcome,
-  hasBusinessAnchor, ACK_REASON,
+  hasBusinessAnchor, ACK_REASON, isTerminalClosure, DETERMINISTIC_NONANSWER_REASONS, isSoftCloseAffirmation,
 } from "../../lib/ai/platform-turn";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
@@ -177,14 +177,14 @@ interface LaneResult { outcome: PlatformTurnOutcome; low: number | undefined; gr
 // whether the model was consulted; silences the function's verbose per-turn logging so eval output stays clean.
 async function runLane(opts: {
   message: string; prevLow: number; prevGreet?: number; model?: ModelScript; upcoming?: UpcomingRow[];
-  lastAssistantReason?: string;
+  lastAssistantReason?: string; transcript?: string;
 }): Promise<LaneResult> {
   const captured: Array<Record<string, unknown>> = [];
   const db = makeFakeDb(captured, opts.upcoming ?? []);
   const ctx = harnessCtx();
   let modelCalled = false;
   const memory = {
-    turns: [], transcript: "", turnsUsed: 0, windowTurns: 5, maxAgeHours: 24,
+    turns: [], transcript: opts.transcript ?? "", turnsUsed: 0, windowTurns: 5, maxAgeHours: 24,
     lastAssistantReason: opts.lastAssistantReason ?? null,
   } as unknown as ConversationContext;
   const testDeps: PlatformTurnTestDeps = {
@@ -2996,6 +2996,127 @@ async function main(): Promise<void> {
       book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0
       && addr.outcome.suppressReply !== true && addr.modelCalled === true && addr.low === 0,
       `book.link=${book.outcome.linkAttached} addr.sup=${addr.outcome.suppressReply}`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 45. CONTEXT-AWARE CLOSURE / LOW-PROGRESS LOOP GUARD — a positive closure ("יופי"/"אש"/…) after the
+  //     assistant helped is a terminal closer (not "לא הצלחתי להבין", not off-topic); repeated low-progress
+  //     does not loop or bounce to Gemini; business intent always bypasses; abuse streak is never reset.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("45. Context-aware closure / low-progress loop guard");
+  // (1) Terminal-closure recognition (small typed set + acks); business messages are never closures.
+  check("isTerminalClosure: positive-closure reactions ('יופי'/'אש'/'היידה'/'וואו') and acks are closers; business is not",
+    ["יופי", "אש", "היידה", "וואו", "מעולה", "תודה", "מעולה תודה"].every((m) => isTerminalClosure(m) === true)
+    && ["מה הכתובת?", "אני רוצה לקבוע תור", "מתי פתוחים?", "כמה עולה תספורת?"].every((m) => isTerminalClosure(m) === false));
+  check("DETERMINISTIC_NONANSWER_REASONS covers our clarify/closure/deflection lines (so their trailing '?' never blocks the skip)",
+    DETERMINISTIC_NONANSWER_REASONS.has("low_signal_single_token") && DETERMINISTIC_NONANSWER_REASONS.has(ACK_REASON)
+    && DETERMINISTIC_NONANSWER_REASONS.has("off_topic_deflection"));
+  const usefulFaq = "Assistant (you, earlier): אנחנו פתוחים א׳-ה׳ 9-19. צריך עוד משהו?"; // useful answer ending in a (non-data) '?'
+  // (2) 'יופי' after useful help → terminal close, no Gemini, never "לא הצלחתי להבין".
+  {
+    const r = await runLane({ message: "יופי", prevLow: 0, transcript: usefulFaq, lastAssistantReason: "gemini_reply" });
+    check("closure (runtime): 'יופי' after a useful answer → short close (ACK_CLOSE, not the clarify), no Gemini, low stays 0",
+      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false && r.outcome.suppressReply !== true
+      && r.outcome.decision.branch === ACK_REASON && r.low === 0,
+      `reply=${JSON.stringify(r.outcome.replyText)} model=${r.modelCalled} branch=${r.outcome.decision.branch} low=${r.low}`);
+  }
+  // (3) 'יופי' / other closures REPEATED (last reply was a closure) → suppressed, no Gemini, no loop.
+  {
+    const r = await runLane({ message: "יופי", prevLow: 0, lastAssistantReason: ACK_REASON });
+    const r2 = await runLane({ message: "אש", prevLow: 0, lastAssistantReason: ACK_REASON });
+    check("closure (runtime): a REPEATED closure ('יופי'/'אש' after a closure) is SUPPRESSED — no Gemini, no loop",
+      r.outcome.suppressReply === true && r.modelCalled === false
+      && r2.outcome.suppressReply === true && r2.modelCalled === false,
+      `r.sup=${r.outcome.suppressReply} r2.sup=${r2.outcome.suppressReply}`);
+  }
+  // (4) Closure variants after useful help do NOT call Gemini ('אש'/'היידה'/'אחלה'); 'סבבה' stays bare-affirmation.
+  //     NOTE: runLane patches the global console, so it MUST be awaited sequentially (never Promise.all).
+  {
+    const results: LaneResult[] = [];
+    for (const m of ["אש", "היידה", "אחלה"]) {
+      results.push(await runLane({ message: m, prevLow: 0, transcript: usefulFaq, lastAssistantReason: "gemini_reply" }));
+    }
+    check("closure (runtime): 'אש'/'היידה'/'אחלה' after useful help → no Gemini, branch=acknowledgement",
+      results.every((r) => r.modelCalled === false && r.outcome.decision.branch === ACK_REASON),
+      results.map((r) => `${r.modelCalled}/${r.outcome.decision.branch}`).join(" "));
+  }
+  // (5) Repeated UNKNOWN short token after OUR clarify (reason low_signal_single_token) stays DETERMINISTIC — it
+  //     no longer bounces to Gemini (which classified it smalltalk and reset the streak). Escalates instead.
+  {
+    const clarify = "Assistant (you, earlier): " + LOW_SIGNAL_SHORT; // our turn-1 clarify ends in a generic '?'
+    const r = await runLane({ message: "בלוף", prevLow: 1, transcript: clarify, lastAssistantReason: "low_signal_single_token" });
+    check("low-progress (runtime): a repeated unknown token after our clarify stays deterministic — no Gemini, streak climbs (low→2)",
+      r.modelCalled === false && r.low === 2 && r.outcome.decision.branch === "low_signal_single_token",
+      `model=${r.modelCalled} low=${r.low} branch=${r.outcome.decision.branch}`);
+  }
+  // (6) Business intent AFTER closures still recovers; (7) repeated business FAQ is never hostile-quieted.
+  {
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true } });
+    const faqDeep = await runLane({ message: "מה הכתובת?", prevLow: 4, lastAssistantReason: ACK_REASON, model: { intent: "faq", reply: "הכתובת…" } });
+    check("closure (runtime): business intent after closures recovers (booking link, Gemini) — and a repeated business FAQ is never suppressed",
+      book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0
+      && faqDeep.outcome.suppressReply !== true && faqDeep.modelCalled === true && faqDeep.low === 0,
+      `book.link=${book.outcome.linkAttached} faqDeep.sup=${faqDeep.outcome.suppressReply} faqDeep.low=${faqDeep.low}`);
+  }
+  // (8) Regression: gibberish still quiets without Gemini even right after a closure-close.
+  {
+    const r = await runLane({ message: "כלגלגצ", prevLow: 2, lastAssistantReason: ACK_REASON });
+    check("regression (runtime): gibberish in a streak still skips Gemini and suppresses (closure context doesn't rescue it)",
+      r.modelCalled === false && r.outcome.suppressReply === true && r.low === 3,
+      `model=${r.modelCalled} sup=${r.outcome.suppressReply} low=${r.low}`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 46. CONTEXT-SENSITIVE SOFT AFFIRMATION ('סבבה'/'אוקי') — a closure after a plain useful answer, but still
+  //     a confirmation when there's an OPEN offer/question. 'כן' stays affirmation-only.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("46. Context-sensitive soft affirmation — 'סבבה'/'אוקי' closure vs confirmation");
+  // (pure) 'סבבה'/'אוקי' are soft-close affirmations; 'כן'/'בטח' are not (affirmation-only).
+  check("isSoftCloseAffirmation: 'סבבה'/'אוקי'/'אוקיי' yes; 'כן'/'בטח'/'נכון' no",
+    ["סבבה", "אוקי", "אוקיי", "סבבהה"].every((m) => isSoftCloseAffirmation(m) === true)
+    && ["כן", "בטח", "נכון", "יאללה"].every((m) => isSoftCloseAffirmation(m) === false));
+  const usefulFaq46 = "Assistant (you, earlier): אנחנו פתוחים א׳-ה׳ 9-19. צריך עוד משהו?";
+  // (1) 'סבבה' after a useful FAQ answer (no open offer) → terminal closure, no Gemini.
+  {
+    const r = await runLane({ message: "סבבה", prevLow: 0, transcript: usefulFaq46, lastAssistantReason: "gemini_reply" });
+    check("soft-affirm (runtime): 'סבבה' after a useful answer → closure (ACK_CLOSE), no Gemini, low stays 0",
+      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false && r.outcome.decision.branch === ACK_REASON && r.low === 0,
+      `reply=${JSON.stringify(r.outcome.replyText)} model=${r.modelCalled} branch=${r.outcome.decision.branch} low=${r.low}`);
+  }
+  // (2) 'סבבה' after a closure already given → suppressed, no loop.
+  {
+    const r = await runLane({ message: "סבבה", prevLow: 0, lastAssistantReason: ACK_REASON });
+    check("soft-affirm (runtime): repeated 'סבבה' after a closure → suppressed, no Gemini, no loop",
+      r.outcome.suppressReply === true && r.modelCalled === false,
+      `sup=${r.outcome.suppressReply} model=${r.modelCalled}`);
+  }
+  // (3) 'סבבה' after an OPEN booking offer → still a CONFIRMATION (not swallowed as closure): reaches the
+  //     affirmation path and confirms the offer (booking link). Same for an answer-expected question.
+  {
+    const offer = "Assistant (you, earlier): רוצה שאקבע לך תור? אפשר לקבוע עכשיו.";
+    const r = await runLane({ message: "סבבה", prevLow: 0, transcript: offer, lastAssistantReason: "gemini_reply" });
+    check("soft-affirm (runtime): 'סבבה' after an OPEN booking offer is NOT closure — it confirms (reaches Gemini, booking link)",
+      r.modelCalled === true && r.outcome.decision.branch !== ACK_REASON && r.outcome.linkAttached === "booking",
+      `model=${r.modelCalled} branch=${r.outcome.decision.branch} link=${r.outcome.linkAttached}`);
+    const dataQ = "Assistant (you, earlier): מתי נוח לך להגיע?";
+    const r2 = await runLane({ message: "סבבה", prevLow: 0, transcript: dataQ, lastAssistantReason: "gemini_reply" });
+    check("soft-affirm (runtime): 'סבבה' after an answer-expected question is NOT closure (reaches the normal path)",
+      r2.modelCalled === true && r2.outcome.decision.branch !== ACK_REASON,
+      `model=${r2.modelCalled} branch=${r2.outcome.decision.branch}`);
+  }
+  // (4) 'כן' is NEVER converted to closure — it stays an affirmation even after a plain useful answer.
+  {
+    const r = await runLane({ message: "כן", prevLow: 0, transcript: usefulFaq46, lastAssistantReason: "gemini_reply" });
+    check("affirmation (runtime): 'כן' after a useful answer is NOT treated as closure (not the closure lane)",
+      r.outcome.decision.branch !== ACK_REASON && r.modelCalled === true,
+      `branch=${r.outcome.decision.branch} model=${r.modelCalled}`);
+  }
+  // (5) Regression: business recovery after a soft-affirm closure still works.
+  {
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true } });
+    check("soft-affirm (runtime): business intent after a 'סבבה' closure still recovers (booking link, Gemini)",
+      book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0,
+      `link=${book.outcome.linkAttached} low=${book.low}`);
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────

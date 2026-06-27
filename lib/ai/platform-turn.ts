@@ -662,18 +662,30 @@ export async function runPlatformTurn(
     return { replyText: "", decision: supersededDecision, linkAttached: null, suppressReply: true };
   }
 
-  // ── ACKNOWLEDGEMENT LANE (TERMINAL ack — post-CTA / post-answer): a positive ack ("מעולה"/"תודה"/
-  //    "מעולה תודה"/"מגניב"/"הבנתי") is NOT an unclear/off-topic token — it's a natural conversation CLOSER.
-  //    Answer it deterministically (no Gemini, no CTA) and CARRY the streak (an ack neither escalates NOR
-  //    rescues an abuse/quiet streak). TERMINAL: the FIRST ack gets one short close, but a REPEATED ack (our
-  //    last reply was itself an ack-close, via memory.lastAssistantReason) OR an ack arriving in a DEEP
-  //    low-value streak is SUPPRESSED (no outbound) — so "מעולה→בשמחה→מעולה→בשמחה…" can't loop forever and an
-  //    abuser can't farm replies. Excludes bare affirmations ("כן"/"סבבה" — pending-offer handling) and any
-  //    turn that ANSWERS a pending question. Recognized via the DURABLE ack reason, not by matching reply
-  //    text. SKIPPED in deterministic mode (menu-anchored there).
-  if (!deterministicMenu && isLowValueAck(messageText) && !isBareAffirmation(messageText)
-      && !hasPendingAnswerExpectedQuestion(lastContract.askedQuestion, lastAssistant ?? "")) {
-    const repeatedAck = memory.lastAssistantReason === ACK_REASON; // our last reply was already an ack-close
+  // ── TERMINAL CLOSURE LANE (context-aware — post-CTA / post-answer): a positive ack OR closure reaction
+  //    ("מעולה"/"תודה"/"מעולה תודה"/"יופי"/"אש"/"היידה"/"וואו" …) is NOT an unclear/off-topic token — it's a
+  //    natural conversation CLOSER. Answer it deterministically (no Gemini, no CTA) and CARRY the streak (it
+  //    neither escalates NOR rescues an abuse/quiet streak). TERMINAL: the FIRST closure gets one short close,
+  //    but a REPEATED closure (our last reply was itself a closure, via memory.lastAssistantReason) OR a
+  //    closure arriving in a DEEP low-value streak is SUPPRESSED (no outbound) — so "יופי→בשמחה→אש→…" can't
+  //    loop forever and an abuser can't farm replies. Excludes bare affirmations ("כן"/"סבבה" — pending-offer
+  //    handling) and a real DATA question we asked; a business anchor always wins. Recognized via a SMALL typed
+  //    closure set + the DURABLE closure reason, not by matching reply text. SKIPPED in deterministic mode.
+  // CONTEXT-AWARE: a positive closure is never a name/day/time answer, so it fires after ANY assistant turn
+  // EXCEPT when we explicitly asked for a concrete datum (asksAnswerExpectedQuestion) — there a token might be
+  // the answer, so we let it reach the normal path. A business anchor always wins (a real request is never a
+  // closure). Bare affirmations ("כן"/"סבבה") keep their pending-offer handling.
+  const askedForData = lastContract.askedQuestion && asksAnswerExpectedQuestion(lastAssistant ?? "");
+  // A bare affirmation counts as closure ONLY when it's a SOFT "ok/cool" token ("סבבה"/"אוקי") AND there is
+  // no OPEN offer it would confirm (a still-valid pending offer, or our last reply proposing a booking). With
+  // such a confirm-context it stays an affirmation (→ acts on the offer downstream). "כן"/"בטח"/… are never
+  // soft → always affirmations. Non-affirmation closures ("יופי"/"תודה") are unaffected.
+  const confirmContext = !!prevPending || lastContract.offeredBooking;
+  const closureEligible = isTerminalClosure(messageText)
+    && !hasBusinessAnchor(messageText, activeServiceNames) && !askedForData
+    && (!isBareAffirmation(messageText) || (isSoftCloseAffirmation(messageText) && !confirmContext));
+  if (!deterministicMenu && closureEligible) {
+    const repeatedAck = memory.lastAssistantReason === ACK_REASON; // our last reply was already a closure
     const ackSuppress = repeatedAck || prevLowSignal >= LOW_VALUE_DEEP_AT;
     await persist(prevLowSignal, 0); // neutral: carry low-signal (no escalate/rescue), break the greeting run
     const decision = errorDecision(ACK_REASON, true);
@@ -723,7 +735,7 @@ export async function runPlatformTurn(
   //    Escalation tiers mirror the emoji-only pre-Gemini skip exactly, so repeated low-signal still climbs
   //    to boundary/quiet. SKIPPED in deterministic mode (every turn there is menu-anchored). The whole
   //    message is checked (multi-fragment bursts have whitespace → never skipped → they reach Gemini).
-  if (!deterministicMenu && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, lastAssistant ?? "", activeServiceNames)) {
+  if (!deterministicMenu && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, lastAssistant ?? "", activeServiceNames, memory.lastAssistantReason)) {
     const newCount = prevLowSignal + 1;
     const action = lowSignalActionFor(newCount);
     let replyText = LOW_SIGNAL_SHORT;
@@ -1397,6 +1409,15 @@ export const ACK_REASON = "acknowledgement";
 // and a signal-less off-topic message is de-escalated WITHOUT Gemini. Below it, normal recovery applies.
 export const LOW_VALUE_DEEP_AT = 3;
 
+// Durable `reason`s of our OWN deterministic NON-ANSWER replies (clarify / closure / boundary / deflection /
+// quiet). Their trailing "…?" is a generic offer ("…או לשאול משהו על העסק?"), NOT a real answer-expected
+// question — so a lone token arriving AFTER one of these must NOT be bounced to Gemini (which would classify
+// it smalltalk and RESET the streak, the live infinite-loop). Recognized by the durable reason, not by text.
+export const DETERMINISTIC_NONANSWER_REASONS = new Set<string>([
+  "low_signal_single_token", ACK_REASON, OFF_TOPIC_REASON, "off_topic_capped", "presence_boundary",
+  "low_signal_machine_noise", "low_signal_emoji", "injection_refused", "low_signal_reset",
+]);
+
 // In a deep greeting loop, send a short reminder only every Nth turn (otherwise suppress).
 const GREETING_REMINDER_EVERY = 3;
 /**
@@ -1996,6 +2017,31 @@ export function isBareAffirmation(message: string): boolean {
   return BARE_AFFIRMATION_RE.test(t);
 }
 
+// Short POSITIVE-CLOSURE / satisfaction reactions that aren't "thanks/ok" acks but play the SAME terminal-
+// closer role after the assistant helped ("יופי", "אש", "היידה", "וואו" …). A SMALL typed set used as ONE
+// signal — the closure DECISION stays contextual (anchor bypass + repeat/deep suppression in the lane).
+// Deliberately NOT a growing phrase list: business words are never here, so a real request is never a closure.
+const POSITIVE_CLOSURE = new Set([
+  "יופי", "אש", "היידה", "וואו", "ואו", "פצצה", "תותח", "נהדר", "מושלם", "מצוין", "אדיר", "סחתיין", "כיף", "וואלה",
+]);
+/** Terminal CLOSURE token: a low-value ack ("תודה"/"מעולה"/"מעולה תודה") OR a short positive-closure reaction
+ *  ("יופי"/"אש"/…). Both are conversation closers — interpreted via context in the closure lane, not here. */
+export function isTerminalClosure(message: string): boolean {
+  if (isLowValueAck(message)) return true;
+  const t = (message ?? "").trim().toLowerCase().replace(/[!?.,…]+$/g, "").trim();
+  if (t.length === 0 || t.length > 12) return false;
+  return POSITIVE_CLOSURE.has(t);
+}
+
+/** SOFT "ok / cool" tokens ("סבבה", "אוקי") — bare affirmations that ALSO play a closure role. They confirm
+ *  an OPEN offer/question (so they stay affirmations there), but after a plain useful answer they're a closer.
+ *  The closure lane consults this WITH context (a pending offer keeps them affirmations). "כן"/"בטח"/… are
+ *  NOT here — they remain affirmation-only. */
+export function isSoftCloseAffirmation(message: string): boolean {
+  const t = (message ?? "").trim().toLowerCase().replace(/[!?.,…\s]+$/g, "").trim();
+  return /^סבבה+$/.test(t) || /^אוקי+$/.test(t);
+}
+
 // ── LAST-ASSISTANT CONTRACT (derived from transcript — no new stored state) ───────
 // What did our most recent reply actually DO? Used to interpret terse follow-ups
 // ("כן") and to detect a topic switch. Derived from the last assistant line.
@@ -2278,9 +2324,15 @@ export function hasPendingAnswerExpectedQuestion(askedQuestion: boolean, lastAss
  * Mirrors the post-Gemini forced-clarify outcome; that override stays as defense-in-depth.
  */
 export function shouldPreSkipSingleTokenClarify(
-  message: string, askedQuestion: boolean, lastAssistantText: string, serviceNames: string[] = []
+  message: string, askedQuestion: boolean, lastAssistantText: string, serviceNames: string[] = [],
+  lastAssistantReason: string | null = null
 ): boolean {
-  if (hasPendingAnswerExpectedQuestion(askedQuestion, lastAssistantText)) return false;
+  // Our OWN deterministic non-answer line (clarify/closure/boundary/deflection) ends in a generic "…?" that
+  // is NOT a real answer-expected question — so it must not block the skip (else a repeated lone token bounces
+  // to Gemini→smalltalk and RESETS the streak: the live infinite low-progress loop). A genuine model question
+  // still blocks normally.
+  const ourDeterministicLine = lastAssistantReason != null && DETERMINISTIC_NONANSWER_REASONS.has(lastAssistantReason);
+  if (!ourDeterministicLine && hasPendingAnswerExpectedQuestion(askedQuestion, lastAssistantText)) return false;
   if (!isSingleShortToken(message)) return false;
   const t = message.trim();
   if (isBareAffirmation(t)) return false;
