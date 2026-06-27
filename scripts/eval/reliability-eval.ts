@@ -24,7 +24,7 @@ import {
   hasFaqSignal, looksLikeContextualReference, lowSignalKind,
   classifyGoodFaithSignal, hasHelpSignal, isGenuineQuestion, isQuestionLike, latestFragment,
   inferOperation, isManageHelpTopic, isBareAffirmation, buildManageHelpReply,
-  deriveLastAssistantContract, replyLooksStaleManage,
+  deriveLastAssistantContract, replyLooksStaleManage, helpEscapesToManage, type LastAssistantContract,
   hasSoftServiceIntent, mentionsCapabilityPromise, defuseCapabilityPromise,
   looksLikeGreetingOrMeta, collapseElongation,
   looksLikePresenceCheck, looksLikeSocialOpener, isRecoveryFollowup, wasDegradedReply, preGeminiAction,
@@ -2452,6 +2452,50 @@ async function main(): Promise<void> {
       const out = stripDuplicateCtaWording("בטח, אפשר לבטל. לביטול התור דרך הקישור.");
       return out.includes("אפשר לבטל") && !out.includes("קישור") && !out.includes("לביטול התור");
     })());
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 38. HELP ROUTING — operational/location/access/frustration "help" stays FAQ, never a manage→booking escape.
+  // ════════════════════════════════════════════════════════════════════════════════
+  // Root cause (live): a customer outside asking where the entrance is ("…לא מבין מאיפה הכניסה") classifies as
+  // the good-faith "help" signal (HELP_RE matches the CONFUSION cue "לא מבין") and the escape treated EVERY
+  // "help" as appointment-MANAGE help → manageLinkFor(0 upcoming) → a BOOKING link + "אין תור פעיל…". Fix:
+  // helpEscapesToManage gates the help→manage escape on real manage EVIDENCE (isManageHelpTopic OR an active
+  // manage thread OR a pending MANAGE offer). General — reuses the discriminator, not a location/phrase list.
+  section("38. Help routing — confusion/location 'help' stays FAQ; manage help still escapes");
+  const NO_CTX: LastAssistantContract = { sentBookingLink: false, sentManageLink: false, offeredHelp: false, offeredBooking: false, askedQuestion: false };
+  const MANAGE_CTX: LastAssistantContract = { ...NO_CTX, sentManageLink: true };
+  // 1. The bug cases: messages that DO classify as "help" (confusion/frustration) but carry NO manage evidence
+  //    must NOT escape to manage — they stay in AI/FAQ (the model's reply is used).
+  const FAQ_HELP = ["אני פה בחוץ אבל לא מבין מאיפה הכניסה", "אתה לא מבין אותי?", "זה לא מה ששאלתי", "אני לא מבין איפה הסניף"];
+  check("confusion/frustration 'help' (no manage evidence) does NOT escape to manage — stays FAQ",
+    FAQ_HELP.every((m) => classifyGoodFaithSignal(m) === "help"      // it IS the 'help' signal (the bug's input)…
+      && isManageHelpTopic(m) === false                             // …with no manage topic…
+      && helpEscapesToManage("help", m, NO_CTX, null) === false));  // …so it never routes to manage/booking.
+  // 2. Pure location/directions questions never even reach the help path (they classify as faq/none, not help).
+  check("location/directions questions are not the 'help' signal at all (faq/none) — they never reach the escape",
+    ["איך מגיעים?", "מה הכתובת?", "איפה חונים?", "מה לשים בווייז?", "אני ליד הדלת", "איזה קומה?"]
+      .every((m) => classifyGoodFaithSignal(m) !== "help"));
+  // 3. Genuine appointment-manage / link-trouble 'help' STILL escapes to manage (no regression).
+  const MANAGE_HELP = ["איך אני מבטל את התור?", "לא נפתח הקישור", "איפה לוחצים?", "מסתבך עם הקישור"];
+  check("appointment-manage / link-trouble 'help' STILL escapes to manage (unchanged)",
+    MANAGE_HELP.every((m) => classifyGoodFaithSignal(m) === "help"
+      && isManageHelpTopic(m) === true
+      && helpEscapesToManage("help", m, NO_CTX, null) === true));
+  // 4. Manage CONTEXT path: the SAME confusion line escapes when we're already in a manage thread (sentManageLink)
+  //    or a pending MANAGE offer is open — but NOT under a pending BOOK offer (book ≠ manage).
+  check("manage context (sentManageLink / pending MANAGE) lets a confusion 'help' escape; pending BOOK does not",
+    helpEscapesToManage("help", "אתה לא מבין אותי?", MANAGE_CTX, null) === true
+    && helpEscapesToManage("help", "אתה לא מבין אותי?", NO_CTX, "MANAGE") === true
+    && helpEscapesToManage("help", "אתה לא מבין אותי?", NO_CTX, "BOOK") === false);
+  // 5. The helper acts ONLY on the "help" signal (action ops route via their own disjunct, not this one).
+  check("helpEscapesToManage is help-only: a non-'help' signal never escapes through it",
+    helpEscapesToManage("faq", "איך אני מבטל את התור?", NO_CTX, null) === false
+    && helpEscapesToManage("none", "לא נפתח הקישור", MANAGE_CTX, null) === false);
+  // 6. Not phrase-specific: keyed on isManageHelpTopic, so an unseen location wording with a confusion cue is
+  //    handled the same way (stays FAQ) without any location list.
+  check("general, not phrase-specific: an unseen location+confusion message stays FAQ (keyed on the discriminator)",
+    helpEscapesToManage("help", "אני בכניסה הלא נכונה ולא מבין לאן ללכת", NO_CTX, null) === false
+    && isManageHelpTopic("אני בכניסה הלא נכונה ולא מבין לאן ללכת") === false);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

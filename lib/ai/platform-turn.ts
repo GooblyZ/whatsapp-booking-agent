@@ -890,7 +890,10 @@ export async function runPlatformTurn(
   const pendingBookConfirm = affirm && !immediateBookCtx && prevPending?.kind === "BOOK";
   const pendingManageConfirm = affirm && !immediateBookCtx && prevPending?.kind === "MANAGE";
   const confirmIntoBooking = affirm && (immediateBookCtx || pendingBookConfirm);
-  const wantsManage = latestSignal === "help"
+  // A "help" signal escapes to MANAGE only with real manage evidence (helpEscapesToManage) — generic
+  // confusion / location / access / frustration "help" stays in AI/FAQ (the model's reply is used), never a
+  // manage→booking "no active appointment" reply. The action-op and pending-MANAGE escapes are unchanged.
+  const wantsManage = helpEscapesToManage(latestSignal, latest, lastContract, prevPending?.kind ?? null)
     || (latestSignal === "action" && (escapeOp === "CANCEL" || escapeOp === "RESCHEDULE" || escapeOp === "LIST"))
     || pendingManageConfirm;
   const wantsBook = (latestSignal === "action" && escapeOp === "BOOK") || confirmIntoBooking;
@@ -1792,6 +1795,27 @@ export function deriveLastAssistantContract(transcript: string): LastAssistantCo
     offeredBooking: BOOKING_OFFER_RE.test(last),
     askedQuestion: last.includes("?") || ASKED_WHICH_RE.test(last),
   };
+}
+
+/**
+ * Does a good-faith "help" signal mean the customer wants help with an APPOINTMENT (→ manage escape)?
+ * ONLY with real manage EVIDENCE: the message references a manage / link-trouble topic (isManageHelpTopic),
+ * OR we are already in a manage thread (a manage link was the last thing we sent), OR a still-valid pending
+ * MANAGE offer is open. A generic "help" — confusion, conversation-repair/frustration ("לא מבין", "אתה לא
+ * מבין"), or a location/access/directions question that merely contains a confusion cue — is NOT an
+ * appointment request: it must stay in AI/FAQ support (the model's own reply is used), never escape to a
+ * manage/booking link + "no active appointment". PURE → eval-testable. Reuses the existing discriminator;
+ * no phrase list, no new state. (The classifier still ranks "help" high so confused users are never
+ * silenced — this only narrows the ROUTING meaning of "help".)
+ */
+export function helpEscapesToManage(
+  latestSignal: GoodFaithSignal,
+  latest: string,
+  lastContract: LastAssistantContract,
+  prevPendingKind: string | null,
+): boolean {
+  if (latestSignal !== "help") return false;
+  return isManageHelpTopic(latest) || lastContract.sentManageLink || prevPendingKind === "MANAGE";
 }
 
 interface ManageLink { url: string; label: string; kind: PlatformLink; }
