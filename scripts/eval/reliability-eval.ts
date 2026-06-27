@@ -74,7 +74,7 @@ import { buildReceptionistInstruction } from "../../lib/ai/persona";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
-import { applyOutboundSettings } from "../../lib/booking/outbound";
+import { applyOutboundSettings, formatOutboundTrace } from "../../lib/booking/outbound";
 import type { ReceptionistTurn, ReceptionistDecision } from "../../lib/ai/brain";
 import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
 
@@ -2057,6 +2057,21 @@ async function main(): Promise<void> {
     && shouldPreSkipSingleTokenClarify("נראלי קצר", true, LIVE_ASSISTANT, SVC) === false
     && shouldPreSkipSingleTokenClarify("אני רוצה לקבוע תור", false, "", SVC) === false
     && forcesDeterministicClarify("unclear", "normal_clarify", "אורי", false) === true);
+
+  // ── 31. Outbound traceability — every customer-visible send is source-labeled ─────────────────────
+  // EVERY WhatsApp send goes through the ONE chokepoint (lib/booking/outbound.ts), which now stamps a
+  // `src=… reason=…` tag on the [outbound] line. This guarantees no send is untraceable (the audit that
+  // proved the "extra" messages were booking-platform confirmations, not autonomous sends).
+  section("31. Outbound traceability — source/reason labeling on the chokepoint");
+  check("formatOutboundTrace: source + reason rendered as 'src=… reason=…'",
+    formatOutboundTrace({ source: "ai_turn", reason: "link_booking" }) === "src=ai_turn reason=link_booking"
+    && formatOutboundTrace({ source: "booking_platform", reason: "cancel_confirm" }) === "src=booking_platform reason=cancel_confirm"
+    && formatOutboundTrace({ source: "job_reminder", reason: "reminder_due" }) === "src=job_reminder reason=reminder_due");
+  check("formatOutboundTrace: a source with no reason omits the reason field",
+    formatOutboundTrace({ source: "deterministic" }) === "src=deterministic");
+  check("formatOutboundTrace: an UNLABELED (unknown) send is flagged loudly (⚠) so it can never hide",
+    formatOutboundTrace({ source: "unknown" }) === "⚠ src=unknown"
+    && formatOutboundTrace({ source: "unknown", reason: "x" }).startsWith("⚠ src=unknown"));
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

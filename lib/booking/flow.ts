@@ -8,7 +8,7 @@ import {
   isBookingEnabled,
 } from "./helpers";
 import { getAvailableSlots, isIntervalFree, parseHebrewDate, businessTimeToUTC, todayInTZ } from "./availability";
-import { sendOutbound, sendOutboundInteractive } from "./outbound";
+import { sendOutbound, sendOutboundInteractive, type OutboundTrace } from "./outbound";
 import { runConversationTurn } from "@/lib/ai/idle-handler";
 import { runPlatformTurn } from "@/lib/ai/platform-turn";
 import { loadBookingSession } from "@/lib/ai/booking-session";
@@ -55,9 +55,10 @@ function warnConversationalModeLegacy(): void {
 // platform, so owner settings can never diverge between the two paths.
 // TODO: future — add a retry queue for failed WhatsApp sends (e.g. SQS, BullMQ).
 async function reply(
-  db: DB, businessId: string, customerId: string, toPhone: string, rawText: string
+  db: DB, businessId: string, customerId: string, toPhone: string, rawText: string,
+  trace: OutboundTrace = { source: "deterministic", reason: "chat" }
 ): Promise<void> {
-  await sendOutbound(db, businessId, customerId, toPhone, rawText);
+  await sendOutbound(db, businessId, customerId, toPhone, rawText, trace);
 }
 
 /**
@@ -92,7 +93,7 @@ export async function handleBookingFlow(
     context = {};
   }
 
-  const replyFn = (text: string) => reply(db, businessId, customerId, fromPhone, text);
+  const replyFn = (text: string, trace?: OutboundTrace) => reply(db, businessId, customerId, fromPhone, text, trace);
 
   // PLATFORM MODE (TRANSITION_PLAN.md): conversational scheduling is OFF — the
   // AI converses + detects intent; links route to the booking platform. The
@@ -121,12 +122,19 @@ export async function handleBookingFlow(
       console.log(`[router] platform reply suppressed (quiet mode) — no outbound sent`);
       return;
     }
+    // Outbound source (LOG-ONLY): a Gemini-authored reply is an AI turn; a fallback/menu/continuity reply
+    // is deterministic. reason = the attached link (if any) else the brain branch — so every chat send is
+    // self-identifying in the logs (no untraceable sends).
+    const chatSource: OutboundTrace = {
+      source: outcome.decision.replySource === "gemini" ? "ai_turn" : "deterministic",
+      reason: outcome.linkAttached ? `link_${outcome.linkAttached}` : outcome.decision.branch,
+    };
     // A menu turn ships a CLICKABLE interactive message (with a guaranteed text fallback);
     // everything else sends plain text.
     if (outcome.interactive) {
-      await sendOutboundInteractive(db, businessId, customerId, fromPhone, outcome.interactive, outcome.replyText);
+      await sendOutboundInteractive(db, businessId, customerId, fromPhone, outcome.interactive, outcome.replyText, chatSource);
     } else {
-      await replyFn(outcome.replyText);
+      await replyFn(outcome.replyText, chatSource);
     }
     return;
   }

@@ -274,7 +274,7 @@ export async function createPlatformBooking(db: DB, input: CreateBookingInput): 
     `לצפייה, שינוי או ביטול: ${apptUrl}`;
   // Clean cta_url button (URL in the button, not the body); the full text-with-URL is the fallback.
   const bookingCta = confirmationCta(bookingText, apptUrl);
-  await sendOutboundInteractive(db, input.businessId, customerId, input.phone, bookingCta.interactive, bookingCta.fallbackText);
+  await sendOutboundInteractive(db, input.businessId, customerId, input.phone, bookingCta.interactive, bookingCta.fallbackText, { source: "booking_platform", reason: "book_confirm" });
 
   return { ok: true, appointmentId };
 }
@@ -351,7 +351,7 @@ export async function cancelPlatformAppointment(db: DB, appointmentId: string): 
       serviceName: view.serviceName, dateISO: view.dateISO, time: view.time, bookingLink,
     });
     const cta = confirmationCta(cancelText, bookingLink); // cta_url button + text-with-URL fallback
-    await sendOutboundInteractive(db, view.business.id, view.customerId, view.customerPhone, cta.interactive, cta.fallbackText);
+    await sendOutboundInteractive(db, view.business.id, view.customerId, view.customerPhone, cta.interactive, cta.fallbackText, { source: "booking_platform", reason: "cancel_confirm" });
     console.log(`[platform] cancel notification sent appt=${maskId(appointmentId)}`);
   } else {
     console.log(`[platform] cancel notification skipped appt=${maskId(appointmentId)} reason=${!transitioned ? "no_transition_dedupe" : "no_phone"}`);
@@ -417,7 +417,7 @@ export async function reschedulePlatformAppointment(
       fromDateISO: view.dateISO, fromTime: view.time, toDateISO: dateISO, toTime: time, manageLink,
     });
     const cta = confirmationCta(rescheduleText, manageLink); // cta_url button + text-with-URL fallback
-    await sendOutboundInteractive(db, view.business.id, view.customerId, view.customerPhone, cta.interactive, cta.fallbackText);
+    await sendOutboundInteractive(db, view.business.id, view.customerId, view.customerPhone, cta.interactive, cta.fallbackText, { source: "booking_platform", reason: "reschedule_confirm" });
     console.log(`[platform] reschedule notification sent appt=${maskId(appointmentId)}`);
   } else {
     console.log(`[platform] reschedule notification skipped appt=${maskId(appointmentId)} reason=${!moved ? "no_change_dedupe" : "no_phone"}`);

@@ -6,6 +6,25 @@ import { recordWhatsAppSendResult } from "@/lib/integration-health";
 import { type DB, saveOutboundMessage } from "./helpers";
 import type { AISettings } from "@/types/database";
 
+// ── OUTBOUND TRACEABILITY (observability only — never changes routing/behavior) ──────────────────────
+// EVERY customer-visible WhatsApp send goes through this chokepoint, so labeling it HERE guarantees no
+// send is untraceable. `source` answers "WHO/WHY did this fire" at a glance in the logs; `reason` adds
+// the specific trigger. `unknown` is logged LOUDLY (⚠) so an unlabeled send can never hide.
+export type OutboundSource =
+  | "ai_turn"          // chat reply produced by Gemini (a customer message triggered it)
+  | "deterministic"    // chat reply from a deterministic / continuity / menu path
+  | "booking_platform" // booking / cancel / reschedule confirmation (a WEB-PAGE action triggered it)
+  | "job_reminder"     // scheduled jobs runner — appointment reminder
+  | "job_waitlist"     // scheduled jobs runner — waitlist opportunity
+  | "recovery"         // provider-recovery / degraded acknowledgement
+  | "dashboard"        // owner/manual send from the dashboard
+  | "unknown";         // UNLABELED — should never appear in a normal flow
+export interface OutboundTrace { source: OutboundSource; reason?: string }
+/** Compact `src=… reason=…` tag for the `[outbound]` line; flags an unlabeled send loudly. Pure. */
+export function formatOutboundTrace(t: OutboundTrace): string {
+  return `${t.source === "unknown" ? "⚠ " : ""}src=${t.source}${t.reason ? ` reason=${t.reason}` : ""}`;
+}
+
 // The owner-settings columns the chokepoint needs to build the PromptProfile. One read, fail-open.
 const PROFILE_COLUMNS =
   "assistant_name, assistant_gender, response_length, emoji_usage, custom_instructions, things_to_avoid, language, updated_at";
@@ -77,11 +96,12 @@ export async function applyOutboundSettings(db: DB, businessId: string, text: st
  * swallowed (telemetry and notifications must never fail the calling action).
  */
 export async function sendOutbound(
-  db: DB, businessId: string, customerId: string, toPhone: string, rawText: string
+  db: DB, businessId: string, customerId: string, toPhone: string, rawText: string,
+  trace: OutboundTrace = { source: "unknown" }
 ): Promise<void> {
   const text = await applyOutboundSettings(db, businessId, rawText);
   let sendStatus: "sent" | "failed" = "sent";
-  console.log(`[outbound] reply → "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}"`);
+  console.log(`[outbound] ${formatOutboundTrace(trace)} reply → "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}"`);
 
   const result = await sendWhatsAppTextMessage(toPhone, text);
   if (!result.success) {
@@ -124,7 +144,8 @@ function applyInteractiveSettings(i: WhatsAppInteractive, profile: PromptProfile
  */
 export async function sendOutboundInteractive(
   db: DB, businessId: string, customerId: string, toPhone: string,
-  interactive: WhatsAppInteractive, fallbackText: string
+  interactive: WhatsAppInteractive, fallbackText: string,
+  trace: OutboundTrace = { source: "unknown" }
 ): Promise<void> {
   let profile: PromptProfile | null = null;
   try { profile = await loadProfile(db, businessId); }
@@ -132,7 +153,7 @@ export async function sendOutboundInteractive(
 
   const enforced = profile ? applyInteractiveSettings(interactive, profile) : interactive;
   if (profile) logProfile(businessId, profile, `interactive(${enforced.kind})`);
-  console.log(`[outbound] interactive(${enforced.kind}) → "${enforced.body.slice(0, 60)}${enforced.body.length > 60 ? "…" : ""}"`);
+  console.log(`[outbound] ${formatOutboundTrace(trace)} interactive(${enforced.kind}) → "${enforced.body.slice(0, 60)}${enforced.body.length > 60 ? "…" : ""}"`);
   const result = await sendWhatsAppInteractiveMessage(toPhone, enforced);
 
   // Health + persistence use the BODY as the saved message text (the durable record).
@@ -140,9 +161,10 @@ export async function sendOutboundInteractive(
   catch (err) { console.error("[outbound] failed to record send health:", err instanceof Error ? err.message : String(err)); }
 
   if (!result.success) {
-    // Interactive delivery failed → guarantee a reply via the plain-text fallback (settings enforced inside).
+    // Interactive delivery failed → guarantee a reply via the plain-text fallback (settings enforced inside,
+    // and the SAME source is carried so the fallback is traceable too).
     console.warn(`[outbound] interactive send failed (${result.error}) — falling back to text`);
-    await sendOutbound(db, businessId, customerId, toPhone, fallbackText);
+    await sendOutbound(db, businessId, customerId, toPhone, fallbackText, trace);
     return;
   }
   try { await saveOutboundMessage(db, businessId, customerId, toPhone, enforced.body, "sent"); }

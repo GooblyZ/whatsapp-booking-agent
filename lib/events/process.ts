@@ -223,7 +223,7 @@ async function notifyWaitlistForFreedSlot(db: DB, ev: PlatformEvent): Promise<"p
       `התפנה תור ב-${ddmm(dateISO)} בשעה ${time}!\n` +
       `רצינו לעדכן אותך כי ביקשת להיכנס לרשימת ההמתנה. ` +
       `התור פתוח לכל מי שיקבע ראשון:\n${link}`;
-    await sendOutbound(db, ev.business_id, entry.customer_id, contact.phone, msg);
+    await sendOutbound(db, ev.business_id, entry.customer_id, contact.phone, msg, { source: "job_waitlist", reason: "freed_slot" });
     await markWaitlistNotified(db, entry.id);
     notified++;
   }
@@ -243,7 +243,8 @@ async function sendWaitlistOpportunity(db: DB, ev: PlatformEvent): Promise<"proc
   const link = buildBookingLink(slug, contact.phone);
   await sendOutbound(
     db, ev.business_id, ev.customer_id, contact.phone,
-    `התפנה תור${when}! ביקשת שנעדכן — אפשר לקבוע כאן:\n${link}`
+    `התפנה תור${when}! ביקשת שנעדכן — אפשר לקבוע כאן:\n${link}`,
+    { source: "job_waitlist", reason: "opportunity" }
   );
   return "processed";
 }
@@ -262,6 +263,6 @@ async function sendReminder(db: DB, ev: PlatformEvent): Promise<"processed" | "s
   const msg =
     `תזכורת ידידותית: יש לך תור${svc} ב-${ddmm(view.dateISO)} בשעה ${view.time}.\n` +
     `אם צריך לשנות או לבטל: ${buildAppointmentLink(view.id)}`;
-  await sendOutbound(db, view.business.id, view.customerId, contact.phone, msg);
+  await sendOutbound(db, view.business.id, view.customerId, contact.phone, msg, { source: "job_reminder", reason: "reminder_due" });
   return "processed";
 }
