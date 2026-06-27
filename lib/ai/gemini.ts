@@ -31,8 +31,10 @@ export type GeminiErrorCode = "not_configured" | "api_error" | "network" | "empt
 // Gemini 503 "high demand" is an UPSTREAM condition shared by every business
 // served by this process — so the cooldown is process-global, NOT per business
 // or per conversation. POLICY (Phase 3A — AI-first): a single transient blip must
-// NOT drop the product into the deterministic menu. Strikes (one per fully-failed
-// inbound) map to operating state via getGeminiHealth():
+// NOT drop the product into the deterministic menu. A strike is added per fully-failed
+// inbound for any TRANSIENT PROVIDER FAILURE — overload (503/429/"high demand"), a transient
+// 5xx (500/502/504), or a timeout/network error (Stage 2b). Strikes map to operating state via
+// getGeminiHealth():
 //   0 strikes            → healthy   (healthy_ai)
 //   1–2 strikes          → transient (degraded_ai — STILL AI-lane: soft fallback, Gemini retried)
 //   OVERLOAD_STRIKES (3) consecutive within STRIKE_WINDOW_MS (~90s) → cooldown → outage (deterministic)
@@ -40,7 +42,16 @@ export type GeminiErrorCode = "not_configured" | "api_error" | "network" | "empt
 // clears everything. Cooldown DURATION is unchanged (GEMINI_COOLDOWN_SECONDS, default 60s).
 export const OVERLOAD_STRIKES = 3;
 export const STRIKE_WINDOW_MS = 90_000;
-const RETRY_DELAY_MS = 1_200;
+// Retry backoff with BOUNDED jitter. The breaker is process-global / multi-tenant, so a fixed delay
+// risks a synchronized retry storm against an already-stressed provider; jitter spreads the retries.
+// Bounded so a retry adds at most RETRY_JITTER_MS to the WhatsApp latency budget.
+export const RETRY_DELAY_MS = 1_200;
+export const RETRY_JITTER_MS = 400;
+/** Retry delay = base + [0, RETRY_JITTER_MS) ms. PURE (rand injectable) → testable. Bounds: [1200, 1600). */
+export function retryDelayMs(rand: () => number = Math.random): number {
+  const r = Math.min(Math.max(rand(), 0), 0.999999);
+  return RETRY_DELAY_MS + Math.floor(r * RETRY_JITTER_MS);
+}
 
 function cooldownMs(): number {
   const n = parseInt(process.env.GEMINI_COOLDOWN_SECONDS ?? "", 10);
@@ -105,22 +116,25 @@ export function resetGeminiHealth(): void {
   cooldownUntil = 0;
 }
 
-function noteOverload(model: string): void {
+/** Provider-failure KIND for accurate strike logging (the breaker mechanism is identical for all). */
+type ProviderStrikeKind = "overload" | "server" | "timeout" | "network";
+
+function noteProviderStrike(model: string, kind: ProviderStrikeKind): void {
   const now = Date.now();
   overloadStrikes = nextStrikeCount(overloadStrikes, lastStrikeAt, now); // rolling-window aware
   lastStrikeAt = now;
   if (strikesTripOutage(overloadStrikes)) {
     cooldownUntil = now + cooldownMs();
-    // OUTAGE: OVERLOAD_STRIKES consecutive failures within the window → sustained problem. Serve
-    // deterministic menu mode until a recovery probe succeeds (see RECOVERY PROBE below).
+    // OUTAGE: OVERLOAD_STRIKES consecutive transient failures within the window → sustained problem.
+    // Serve deterministic menu mode until a recovery probe succeeds (see RECOVERY PROBE below).
     console.warn(
-      `[gemini] OUTAGE — model=${model} overloaded (strike ${overloadStrikes}/${OVERLOAD_STRIKES}` +
+      `[gemini] OUTAGE — model=${model} ${kind} (strike ${overloadStrikes}/${OVERLOAD_STRIKES}` +
       ` within ${Math.round(STRIKE_WINDOW_MS / 1000)}s); cooldown ${Math.round(cooldownMs() / 1000)}s — deterministic until recovery`
     );
   } else {
     // FLAKY/degraded_ai: 1–2 blips → STAY AI-first (soft recovery / resend), no deterministic menu.
     console.warn(
-      `[gemini] FLAKY — model=${model} transient overload (strike ${overloadStrikes}/${OVERLOAD_STRIKES});` +
+      `[gemini] FLAKY — model=${model} transient ${kind} (strike ${overloadStrikes}/${OVERLOAD_STRIKES});` +
       ` staying AI-first (degraded_ai, soft recovery)`
     );
   }
@@ -154,10 +168,18 @@ function logHealthTransition(turnId: string, before: GeminiHealth, reason: strin
   }));
 }
 
-/** 503 / high-demand / quota-pressure responses — transient and retry-worthy. */
+/** 503 / high-demand / quota-pressure responses — these get the customer-facing "high load" CODE. */
 function isOverloadResponse(status: number, msg: string): boolean {
   return status === 503 || status === 429 ||
     /high demand|overloaded|unavailable|resource exhausted/i.test(msg);
+}
+
+/** THE retry-once + strike gate for an HTTP failure (Stage 2b): overload OR a TRANSIENT 5xx
+ *  (500/502/504 — gateway / generic server / gateway-timeout). Excludes 4xx (client/config/auth) and
+ *  non-transient 5xx (e.g. 501). Exported for the policy eval. Timeouts/network errors are handled in the
+ *  catch path (they strike but are NOT retried — a 2nd ~12s wait would blow the WhatsApp latency budget). */
+export function isTransientProviderStatus(status: number, msg = ""): boolean {
+  return isOverloadResponse(status, msg) || status === 500 || status === 502 || status === 504;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -293,7 +315,7 @@ async function callGemini(
   // simulation suite to validate degraded mode end to end).
   if (process.env.GEMINI_SIMULATE_OVERLOAD === "1") {
     console.warn("[gemini] SIMULATED overload (GEMINI_SIMULATE_OVERLOAD=1)");
-    noteOverload(model);
+    noteProviderStrike(model, "overload");
     return { ok: false, code: "overloaded", error: "Simulated 503 (high demand)" };
   }
 
@@ -310,7 +332,7 @@ async function callGemini(
 
   // HALF-OPEN recovery probe: if we're still carrying overload strikes (the cooldown just
   // expired, or we're in the transient/flaky window) this live call is the probe that decides
-  // whether AI is restored (noteSuccess) or we stay degraded (noteOverload). Logged so the
+  // whether AI is restored (noteSuccess) or we stay degraded (noteProviderStrike). Logged so the
   // recovery attempt is explicit, not implicit.
   if (recoveryProbe) {
     console.log(
@@ -353,23 +375,31 @@ async function callGemini(
         errorClass: classifyGeminiError(res.status, safeMsg), latencyMs: Date.now() - attemptStartedAt,
         recoveryProbe, providerStateBefore, promptTokensEst, promptBucket,
       }));
-      if (overloaded) {
-        // A turn the caller has already SUPERSEDED (a newer inbound arrived) must not retry and
-        // must not count toward the global cooldown — otherwise obsolete/aggregated burst work
-        // amplifies the incident. Checked only on the (rare) failure path.
+      // Retry-once + strike for any TRANSIENT provider failure: overload (503/429/high-demand) OR a
+      // transient 5xx (500/502/504). The customer-facing CODE stays accurate so the reply is unchanged —
+      // true overload → "overloaded" (the "high load" line); a transient 5xx → "api_error" (the generic
+      // soft fallback). What's NEW for 5xx is that it now retries once and counts toward the shared breaker.
+      if (isTransientProviderStatus(res.status, safeMsg)) {
+        // A turn the caller has already SUPERSEDED (a newer inbound arrived) must not retry and must not
+        // count toward the global breaker — otherwise obsolete/aggregated burst work amplifies the incident.
         if (opts.abortIfSuperseded && (await opts.abortIfSuperseded())) {
-          console.warn(`[gemini] overloaded turn is SUPERSEDED — aborting (no retry, no cooldown strike)`);
-          return { ok: false, code: "overloaded", error: "superseded during overload" };
+          console.warn(`[gemini] transient provider failure on a SUPERSEDED turn — aborting (no retry, no strike)`);
+          return { ok: false, code: overloaded ? "overloaded" : "api_error", error: "superseded during provider failure" };
         }
         if (attempt === 1) {
-          await sleep(RETRY_DELAY_MS);
+          await sleep(retryDelayMs());           // one retry, bounded jitter (overload OR transient 5xx)
           continue;
         }
+        // Both attempts failed transiently → ONE provider strike (shared breaker).
         const healthBefore = getGeminiHealth();
-        noteOverload(model);
-        logHealthTransition(turnId, healthBefore, "overloaded", recoveryProbe);
-        return { ok: false, code: "overloaded", error: `Gemini overloaded (${res.status})` };
+        noteProviderStrike(model, overloaded ? "overload" : "server");
+        logHealthTransition(turnId, healthBefore, overloaded ? "overloaded" : "server_error", recoveryProbe);
+        return overloaded
+          ? { ok: false, code: "overloaded", error: `Gemini overloaded (${res.status})` }
+          : { ok: false, code: "api_error", error: `Gemini API error (${res.status})` };
       }
+      // Non-transient non-2xx (4xx client/config/auth, or a non-retryable 5xx like 501) → no retry, no
+      // strike (unchanged): a client/config error is not a provider outage and must not trip the breaker.
       return { ok: false, code: "api_error", error: `Gemini API error (${res.status})` };
     }
 
@@ -429,6 +459,13 @@ async function callGemini(
       errorClass: "unknown", latencyMs: Date.now() - attemptStartedAt,
       recoveryProbe, providerStateBefore, promptTokensEst, promptBucket,
     }));
+    // A genuine TIMEOUT or network error (NOT a supersede — that returned above) is a transient provider
+    // failure → ONE strike on the shared breaker, so repeated timeouts/network errors close together
+    // eventually protect the system (3-in-window → cooldown → deterministic). Deliberately NOT retried: a
+    // 2nd up-to-12s wait would blow the WhatsApp latency budget, so a single one stays AI-first (soft fallback).
+    const healthBefore = getGeminiHealth();
+    noteProviderStrike(model, aborted ? "timeout" : "network");
+    logHealthTransition(turnId, healthBefore, aborted ? "timeout" : "network_error", recoveryProbe);
     return { ok: false, code: "network", error: aborted ? "Gemini request timed out" : "Gemini request failed" };
   } finally {
     clearTimeout(timer);

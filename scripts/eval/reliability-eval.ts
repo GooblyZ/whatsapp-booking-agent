@@ -55,6 +55,7 @@ import {
 import {
   getGeminiHealth, resetGeminiHealth,
   nextStrikeCount, strikesTripOutage, providerHealthFromCounters, OVERLOAD_STRIKES, STRIKE_WINDOW_MS,
+  isTransientProviderStatus, retryDelayMs, RETRY_DELAY_MS, RETRY_JITTER_MS,
 } from "../../lib/ai/gemini";
 import { extractInboundMessage, capInteractiveBody, INTERACTIVE_BODY_MAX } from "../../lib/whatsapp";
 import {
@@ -2338,7 +2339,7 @@ async function main(): Promise<void> {
     })());
   // C2 — the retry/strike TRIGGER is OVERLOAD-only. 503/'high demand' is the retried+counted class; a non-503 5xx is
   //      classified 'server' (≠ 'overloaded'), and TODAY is neither retried nor counted (the basis of the C10 gap).
-  check("C2 retry/strike trigger is overload-only: 503/'high demand' → overloaded; non-503 5xx (500/502/504) → server (not retried/counted today)",
+  check("C2 error taxonomy: 503/'high demand' → overloaded; non-503 5xx (500/502/504) → server (Stage 2b: now retry-once + strike — see §36)",
     classifyGeminiError(503) === "overloaded" && classifyGeminiError(200, "high demand") === "overloaded"
     && classifyGeminiError(500) === "server" && classifyGeminiError(502) === "server" && classifyGeminiError(504) === "server");
   // C4 — degraded/outage still routes an EXPLICIT booking/manage operation to the right LINK; a loose service word does NOT.
@@ -2357,12 +2358,49 @@ async function main(): Promise<void> {
       return h.state === "healthy" && h.strikes === 0 && h.cooldownRemainingMs === 0
         && nextStrikeCount(2, T, T + STRIKE_WINDOW_MS + 1) === 1 && strikesTripOutage(1) === false;
     })());
-  // C10 — THE biggest risk, recorded honestly (not a failure): timeouts & non-503 5xx bypass the breaker today.
-  gap("C10 (biggest risk): timeouts & non-503 5xx are 'server'/'unknown' (≠ 'overloaded') → today NEITHER retried NOR counted",
-    "A persistent slow/timeout incident degrades every turn (~12s REQUEST_TIMEOUT_MS) with NO protective cooldown — the documented Stage-2 Step-2 hardening candidate (retry jitter + a gentle timeout/5xx breaker and/or a shorter timeout). The 503/overload path is unchanged and correct; this is the next runtime task, separately approved.");
+  // C10 — the Stage-2a "biggest risk" is now ADDRESSED by Stage 2b (§36): transient 5xx + timeout strike the
+  //       shared breaker (5xx also retries once); the full timeout/5xx → cooldown accumulation is asserted there.
+  check("C10 (Stage-2a biggest risk) ADDRESSED in §36: transient 5xx/timeout now feed the shared breaker; 4xx never does",
+    isTransientProviderStatus(500) === true && isTransientProviderStatus(503) === true && isTransientProviderStatus(400) === false);
   // C8/C9 — brain/gemini branch-mapping, only assertable end-to-end.
   gap("C8/C9 are integration-level (Phase 5 runPlatformTurn / mocked-provider harness — see §20)",
     "C8 'malformed JSON stays AI-first (no strike, no menu)' (parse_error → ai_error soft fallback, not in the cooldown path) and C9 'superseded turns never retry/strike' (abortIfSuperseded / abort signal) are brain/gemini branch properties, not reachable through the pure seams here. Assert them in the mocked-provider integration harness.");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 36. PROVIDER RUNTIME HARDENING (Stage 2b) — timeout / non-503 5xx now feed the breaker + retry jitter.
+  // ════════════════════════════════════════════════════════════════════════════════
+  // Closes the Stage-2a C10 gap WITHOUT making deterministic mode more aggressive (same 3-in-90s threshold,
+  // same cooldown). A TRANSIENT provider failure now = overload (503/429/'high demand') OR a transient 5xx
+  // (500/502/504) OR a timeout/network error — all feed the SAME shared breaker (no new counter). Retry is
+  // extended to transient 5xx (timeouts are NOT retried — a 2nd ~12s wait would blow the WhatsApp budget),
+  // and the one retry now carries bounded jitter. 503/overload behavior + the customer-facing CODE are unchanged.
+  section("36. Provider runtime hardening (Stage 2b) — timeout/5xx strike the breaker + retry jitter");
+  // The retry+strike GATE for an HTTP failure: overload ∪ transient 5xx (500/502/504); excludes 4xx + 501.
+  check("isTransientProviderStatus gate: 503/429/'high demand' + 500/502/504 → true (retry-once + strike)",
+    isTransientProviderStatus(503) === true && isTransientProviderStatus(429) === true
+    && isTransientProviderStatus(200, "high demand") === true
+    && isTransientProviderStatus(500) === true && isTransientProviderStatus(502) === true && isTransientProviderStatus(504) === true);
+  check("isTransientProviderStatus EXCLUDES 4xx (client/config/auth) and non-transient 5xx (501) — they never strike",
+    isTransientProviderStatus(400) === false && isTransientProviderStatus(401) === false
+    && isTransientProviderStatus(403) === false && isTransientProviderStatus(404) === false
+    && isTransientProviderStatus(422) === false && isTransientProviderStatus(501) === false);
+  // 503/overload UNCHANGED: still transient AND still classified 'overloaded' (its distinct customer "high
+  // load" CODE), whereas a transient 5xx is classified 'server' → keeps the generic soft-fallback CODE
+  // (the customer reply is unchanged for 5xx; only the breaker now learns from it).
+  check("503/overload path UNCHANGED: overload stays 'overloaded' (high-load reply); transient 5xx stays 'server' (generic soft fallback)",
+    classifyGeminiError(503) === "overloaded" && classifyGeminiError(429) === "rate_limit"
+    && classifyGeminiError(500) === "server" && classifyGeminiError(502) === "server" && classifyGeminiError(504) === "server");
+  // Retry jitter — bounded so a retry adds at most RETRY_JITTER_MS to the WhatsApp latency budget.
+  check("retryDelayMs bounds: min(rand=0)=RETRY_DELAY_MS; max(rand→1)=base+jitter−1; jitter ceiling is small/bounded",
+    retryDelayMs(() => 0) === RETRY_DELAY_MS
+    && retryDelayMs(() => 0.999999) === RETRY_DELAY_MS + RETRY_JITTER_MS - 1
+    && RETRY_DELAY_MS === 1_200 && RETRY_JITTER_MS === 400 && RETRY_JITTER_MS <= 500);
+  check("retryDelayMs stays within [base, base+jitter) across random samples (no excessive delay, never below base)",
+    Array.from({ length: 200 }, () => retryDelayMs())
+      .every((d) => d >= RETRY_DELAY_MS && d < RETRY_DELAY_MS + RETRY_JITTER_MS));
+  // What CANNOT be proven purely (needs the live call loop + process-global module state) — documented, not faked.
+  gap("Stage 2b end-to-end strike accumulation needs the mocked-provider integration harness (Phase 5)",
+    "Pure here: the transient-failure GATE (isTransientProviderStatus) and the jittered backoff (retryDelayMs). NOT pure (live loop + module state): a timeout strikes-but-is-not-retried; repeated timeout/5xx within 90s → cooldown; success resets after timeout/5xx strikes; exactly ONE strike per inbound; and malformed JSON never strikes (it is POST-success — the 200 already called noteSuccess, clearing strikes; the parse failure is handled in brain.ts, outside the breaker). These funnel into the SAME nextStrikeCount/cooldown/noteSuccess already proven in §18/§35, so the accumulation→outage→reset MATH is covered; only the wiring needs the harness.");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
