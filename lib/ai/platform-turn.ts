@@ -16,7 +16,7 @@ import {
 } from "./conversation";
 import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured, getGeminiHealth, type GeminiHealthState } from "./gemini";
 import {
-  runReceptionistTurn, FALLBACK, type ReceptionistDecision, type ReceptionistTurn,
+  runReceptionistTurn, FALLBACK, isLowValueAck, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording } from "./reply-polish";
 import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
@@ -29,7 +29,7 @@ import { buildFacts, type BusinessFacts } from "./facts";
 import {
   planContinuityMenu, resolveMenuNavigation, resolveMenuPayload, readMenuState,
   buildInteractiveForNav, buildMainMenu, buildInteractiveMainMenu, ctaBody, MENU_REMINDER,
-  NO_APPOINTMENT_PROMPT, noAppointmentCtaBody, type MenuState, type MenuNav,
+  NO_APPOINTMENT_PROMPT, noAppointmentCtaBody, detectInfoTopic, type MenuState, type MenuNav,
 } from "./continuity-menu";
 import { capInteractiveBody, type WhatsAppInteractive } from "@/lib/whatsapp";
 
@@ -225,6 +225,23 @@ export function softenRepeatTone(reply: string): { text: string; softened: boole
 }
 
 /**
+ * TEST-ONLY injection seam (exercised by reliability-eval §42 — the runtime-lane harness).
+ * Lets a PURE eval drive the REAL lane ordering + state transitions of `runPlatformTurn` with no DB,
+ * no network and no Gemini, by replacing the THREE external boundaries: the business-context load, the
+ * per-turn DB snapshot, and the model call. PRODUCTION NEVER passes this — every real call site omits
+ * the arg, so each `testDeps?.x ?? x` resolves to the real import and the live path is byte-identical.
+ * The types are derived from the real functions (`typeof …`) so an injected fake can never drift from
+ * the production signature.
+ */
+export interface PlatformTurnTestDeps {
+  loadContext?: typeof getBusinessAIContext;
+  loadTurnInputs?: (
+    db: DB, businessId: string, customerId: string, timezone: string,
+  ) => Promise<[Awaited<ReturnType<typeof getConversationContext>>, string, string, boolean]>;
+  runModel?: typeof runReceptionistTurn;
+}
+
+/**
  * Runs one platform-mode turn. Persists nothing except a state reset for
  * legacy non-idle states; the router sends `replyText`.
  */
@@ -239,7 +256,9 @@ export async function runPlatformTurn(
   checkSuperseded?: () => Promise<boolean>,
   /** When the inbound was a TAP on a clickable menu option, this is its stable payload id
    *  (e.g. "f:hours"). Resolved deterministically BEFORE any AI — a tap always acts. */
-  interactivePayloadId?: string
+  interactivePayloadId?: string,
+  /** TEST-ONLY (reliability-eval §42). Omitted by every production call site → live path unchanged. */
+  testDeps?: PlatformTurnTestDeps,
 ): Promise<PlatformTurnOutcome> {
   // Low-signal + greeting escalation counters — persisted in the (always-idle) platform state.
   const prevLowSignal = readLowSignalCount(priorContext);
@@ -280,7 +299,7 @@ export async function runPlatformTurn(
 
   let ctx;
   try {
-    ctx = await getBusinessAIContext(businessId);
+    ctx = await (testDeps?.loadContext ?? getBusinessAIContext)(businessId);
   } catch (err) {
     console.error("[platform-turn] failed to load business context:", err instanceof Error ? err.message : String(err));
     const decision = errorDecision("context_load_error");
@@ -289,12 +308,14 @@ export async function runPlatformTurn(
   }
 
   const timezone = ctx.business.timezone || "Asia/Jerusalem";
-  const [memory, upcomingBlock, customerBlock, lastSendFailed] = await Promise.all([
-    getConversationContext(db, businessId, customerId),
-    renderUpcomingAppointments(db, businessId, customerId, timezone, true),
-    renderCustomerState(db, businessId, customerId, timezone),
-    didLastReplyFailToSend(db, businessId, customerId),
-  ]);
+  const [memory, upcomingBlock, customerBlock, lastSendFailed] = testDeps?.loadTurnInputs
+    ? await testDeps.loadTurnInputs(db, businessId, customerId, timezone)
+    : await Promise.all([
+        getConversationContext(db, businessId, customerId),
+        renderUpcomingAppointments(db, businessId, customerId, timezone, true),
+        renderCustomerState(db, businessId, customerId, timezone),
+        didLastReplyFailToSend(db, businessId, customerId),
+      ]);
   const lastAssistant = lastAssistantLine(memory.transcript);
   // Were we recently degraded/overloaded? Scans the last few assistant lines (robust to the
   // degraded notice being followed by superseded/recovered turns). Drives recovery follow-ups
@@ -448,6 +469,22 @@ export async function runPlatformTurn(
       };
     }
     if (preGemini === "cheap_reset_reply") {
+      // ANTI-ABUSE: a presence/greeting ping while DEEP in a low-value streak must NOT fully reset the abuse
+      // counter (else "junk … אתה פה? … junk …" loops forever, burning nothing but never de-escalating). Deep
+      // streak → ONE visible boundary and CARRY the counter (don't zero it); a real business message still
+      // recovers (it resets via the productive path below). Shallow streak → the normal friendly reset, so a
+      // genuine slip ("oops, אתה פה?") recovers cleanly and is never trapped.
+      if (prevLowSignal >= LOW_VALUE_DEEP_AT) {
+        await persist(prevLowSignal, 0); // carry low-signal (no reset), break the greeting run
+        const decision = errorDecision("presence_boundary", true);
+        await safeLog(businessId, customerId, decision);
+        console.log(
+          `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=presence_boundary` +
+          ` gemini_skipped_reason=deep_streak_presence low_signal=true low_signal_kind=presence route=NONE link=-` +
+          ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${prevLowSignal} reply_suppressed=false`
+        );
+        return { replyText: LOW_VALUE_BOUNDARY, decision, linkAttached: null };
+      }
       // Clear human greeting/meta after low-signal history (B), as the recovery tail
       // of a noise burst (D), or a repeated-greeting loop (C): answer cheaply WITHOUT
       // Gemini and DE-escalate low-signal to 0. The reply DE-SPAMS as the greeting loop
@@ -620,6 +657,52 @@ export async function runPlatformTurn(
     return { replyText: "", decision: supersededDecision, linkAttached: null, suppressReply: true };
   }
 
+  // ── ACKNOWLEDGEMENT LANE (post-CTA / post-answer): a positive ack ("מעולה"/"תודה"/"מגניב"/"הבנתי") is NOT
+  //    an unclear token — it's a natural close. Answer it deterministically with a short close (no Gemini, no
+  //    CTA), and do NOT count it as low-signal (CARRY the streak — an ack neither escalates nor rescues abuse).
+  //    Excludes bare affirmations ("כן"/"סבבה") — they keep their existing pending-offer handling — and any
+  //    turn that ANSWERS a pending question. SKIPPED in deterministic mode (menu-anchored there).
+  if (!deterministicMenu && isLowValueAck(messageText) && !isBareAffirmation(messageText)
+      && !hasPendingAnswerExpectedQuestion(lastContract.askedQuestion, lastAssistant ?? "")) {
+    await persist(prevLowSignal, 0); // neutral: carry low-signal (no escalate/rescue), break the greeting run
+    const decision = errorDecision("acknowledgement", true);
+    await safeLog(businessId, customerId, decision);
+    console.log(
+      `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=acknowledgement` +
+      ` gemini_skipped_reason=acknowledgement low_signal=false low_signal_kind=ack route=NONE link=-` +
+      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${prevLowSignal} reply_suppressed=false`
+    );
+    return { replyText: ACK_CLOSE, decision, linkAttached: null };
+  }
+
+  // ── REPEATED OFF-TOPIC CAP (cost control for a SUSTAINED off-topic streak). Once the customer is already
+  //    DEEP in a low-value streak (prevLowSignal ≥ LOW_VALUE_DEEP_AT), a message with NO business signal is
+  //    de-escalated WITHOUT a Gemini call. RECOGNIZED business questions are PROTECTED and always proceed: a
+  //    booking/FAQ/manage signal OR a business-info topic (hours/prices/location/parking/policy/contact/about
+  //    via detectInfoTopic). Good-faith confusion, presence pings and greetings keep their own lanes (excluded
+  //    here). The FIRST few off-topic turns still reach Gemini (a one-off unrelated question gets a short
+  //    deflection) — this only caps a sustained off-topic loop so a bored/malicious user can't burn Gemini
+  //    forever. Honest residual: a signal-less business question in DEEP quiet gets the boundary, not an answer
+  //    — recoverable via any clear business message. SKIPPED in deterministic mode.
+  const isBusinessTopic = hasBookingSignal(messageText, activeServiceNames) || hasFaqSignal(messageText)
+    || isManageHelpTopic(messageText) || detectInfoTopic(messageText) !== null;
+  if (!deterministicMenu && prevLowSignal >= LOW_VALUE_DEEP_AT && !isBusinessTopic
+      && !isGoodFaithLowSignal(latest) && !looksLikePresenceCheck(latest)
+      && !looksLikeGreetingOrMeta(latest, activeServiceNames)) {
+    const newCount = prevLowSignal + 1;
+    const plan = machineNoisePlan(newCount);                       // boundary already shown earlier → quiet/sparse here
+    const suppress = plan.suppressReply && !isGoodFaithLowSignal(latest);
+    await persist(newCount, 0);
+    const decision = errorDecision("off_topic_capped", true);
+    await safeLog(businessId, customerId, decision);
+    console.log(
+      `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=off_topic_capped` +
+      ` gemini_skipped_reason=repeated_off_topic low_signal=true low_signal_kind=unclear route=NONE link=-` +
+      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount} reply_suppressed=${suppress}`
+    );
+    return { replyText: suppress ? "" : (plan.replyText || LOW_VALUE_BOUNDARY), decision, linkAttached: null, suppressReply: suppress };
+  }
+
   // ── PRE-GEMINI SINGLE-TOKEN CLARIFY SKIP (call-waste + safety). A lone short, SIGNAL-LESS token with
   //    NO pending question is ALREADY going to ship the deterministic LOW_SIGNAL_SHORT after Gemini (the
   //    forcesDeterministicClarify path) — so decide it HERE and skip a full ~3.3k-token call. This also
@@ -669,7 +752,7 @@ export async function runPlatformTurn(
     return { replyText, decision, linkAttached: null, suppressReply };
   }
 
-  const decision = await runReceptionistTurn(ctx, {
+  const decision = await (testDeps?.runModel ?? runReceptionistTurn)(ctx, {
     historyTurns: memory.turns,
     conversationContext: memory.transcript,
     message: messageText,
@@ -1043,7 +1126,12 @@ export async function runPlatformTurn(
     // (no long warm re-intro, no CTA) — still counts toward quiet, so repeated off-topic de-escalates (quiet
     // suppression caps the cost). A genuine business FAQ is intent=faq (productive) and never lands here.
     const isOffTopic = decision.turn.understanding.intent === "out_of_scope";
-    if (isOffTopic && lowSignalAct !== "quiet_mode") { replyText = OFF_TOPIC_DEFLECTION; linkAttached = null; }
+    if (isOffTopic && lowSignalAct !== "quiet_mode") {
+      // off-topic ladder: tiers 1–2 → short scope deflection, tier 3 → the shared visible boundary (deep
+      // off-topic in quiet is intercepted pre-Gemini by the off-topic cap above). Then quiet suppression.
+      replyText = lowSignalAct === "boundary" ? LOW_VALUE_BOUNDARY : OFF_TOPIC_DEFLECTION;
+      linkAttached = null;
+    }
     else if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; forcedClarify = true; }
     else if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
     else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
@@ -1277,6 +1365,16 @@ export const INJECTION_REFUSAL = "אני כאן לעזור עם תורים וש�
 // Short, consistent deflection for an OFF-TOPIC (out_of_scope) general question — no general-knowledge
 // answer, no long business re-introduction; keeps the customer in business scope.
 export const OFF_TOPIC_DEFLECTION = "זה לא בתחום שלי 🙂 לגבי העסק — תורים, שירותים ושאלות — אני כאן לעזור.";
+// ONE human-visible boundary shown by every low-value lane (machine-noise / injection / off-topic) BEFORE
+// it goes quiet — so the customer always knows how to recover instead of hitting sudden silence. Never says
+// "quiet mode"/"blocked"; just states the scope + how to get help. Shared + reusable.
+export const LOW_VALUE_BOUNDARY = "אני כאן לעזור עם תורים ושאלות על העסק 🙂 כתוב/כתבי לי ברור מה צריך ואשמח לעזור.";
+// Post-CTA / post-answer ACKNOWLEDGEMENT close (מעולה/תודה/מגניב …) — a natural, short close, never an
+// "I didn't understand" clarify and never a CTA.
+export const ACK_CLOSE = "בשמחה 🙂";
+// "Deep" low-value streak threshold: at/above this, a presence ping no longer fully resets the abuse counter,
+// and a signal-less off-topic message is de-escalated WITHOUT Gemini. Below it, normal recovery applies.
+export const LOW_VALUE_DEEP_AT = 3;
 
 // In a deep greeting loop, send a short reminder only every Nth turn (otherwise suppress).
 const GREETING_REMINDER_EVERY = 3;
@@ -1575,21 +1673,23 @@ export function quietModePlan(count: number): { isQuiet: boolean; suppressReply:
 
 // ── Low-Value-Input FAST quiet ladder (machine-noise + injection) ─────────────────
 // For CONFIDENT low-value input (deterministic machine-noise / a prompt-injection attempt) the lane is
-// faster than the good-faith ladder: turn 1 → ONE specific deterministic line, turn 2+ → quiet (mostly
-// suppressed, a sparse reminder every Nth turn so a (mis)detection never fully ghosts the customer). The
-// caller still applies the good-faith guard (isGoodFaithLowSignal) before suppressing, so a real confused
-// human is never silenced. PURE → eval-testable.
+// faster than the good-faith ladder, but ALWAYS shows ONE human-visible BOUNDARY before going silent:
+//   turn 1 → a specific deterministic line · turn 2 → the shared visible boundary (how to recover) ·
+//   turn 3+ → quiet (mostly suppressed, a sparse reminder every Nth turn so a (mis)detection never fully
+//   ghosts the customer). The caller still applies the good-faith guard (isGoodFaithLowSignal) before
+//   suppressing, so a real confused human is never silenced. PURE → eval-testable.
 function lowValueQuietPlan(count: number, firstLine: string): { replyText: string; suppressReply: boolean } {
   if (count <= 1) return { replyText: firstLine, suppressReply: false };
-  const idx = count - 1; // 1, 2, 3, … into the quiet phase (quiet begins at turn 2 — faster than good-faith)
+  if (count === 2) return { replyText: LOW_VALUE_BOUNDARY, suppressReply: false }; // ONE visible boundary before silence
+  const idx = count - 2; // 1, 2, 3, … into the quiet phase (quiet begins at turn 3, after the boundary)
   const sendReminder = idx % QUIET_REMINDER_EVERY === 0;
   return sendReminder ? { replyText: LOW_SIGNAL_QUIET_REMINDER, suppressReply: false } : { replyText: "", suppressReply: true };
 }
-/** Confident machine-noise: turn 1 → one short clarify, turn 2+ → quiet (faster than good-faith). */
+/** Confident machine-noise: turn 1 → clarify, turn 2 → visible boundary, turn 3+ → quiet. */
 export function machineNoisePlan(count: number): { replyText: string; suppressReply: boolean } {
   return lowValueQuietPlan(count, LOW_SIGNAL_SHORT);
 }
-/** Prompt-injection attempt: turn 1 → short scope refusal, repeated → quiet de-escalation (no Gemini). */
+/** Prompt-injection: turn 1 → scope refusal, turn 2 → visible boundary, turn 3+ → quiet (no Gemini). */
 export function injectionPlan(count: number): { replyText: string; suppressReply: boolean } {
   return lowValueQuietPlan(count, INJECTION_REFUSAL);
 }
