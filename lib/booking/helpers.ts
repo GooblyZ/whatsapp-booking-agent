@@ -56,23 +56,84 @@ export async function upsertConversationState(
   );
 }
 
+/** Durable outbound traceability (migration 012) — all fields OPTIONAL/nullable. `wamid` is the Meta
+ *  outbound wamid (stored in the existing meta_message_id column); `triggerRef` is an optional correlation
+ *  id (e.g. an appointment id). Observability only — never affects routing/send behavior. */
+export interface OutboundTraceMeta {
+  source?: string;
+  reason?: string;
+  wamid?: string | null;
+  triggerRef?: string | null;
+}
+
+/** The pre-012 (always-valid) outbound row. */
+function baseOutboundRow(
+  businessId: string, customerId: string, toPhone: string, body: string, sendStatus: string
+): Record<string, unknown> {
+  return { business_id: businessId, customer_id: customerId, direction: "outbound", channel: "whatsapp", to_phone: toPhone, body, send_status: sendStatus };
+}
+
+/** The base row PLUS migration-012 trace columns (nullish fields omitted). PURE — unit-tested. */
+export function buildOutboundRow(
+  businessId: string, customerId: string, toPhone: string, body: string, sendStatus: string,
+  meta: OutboundTraceMeta = {}
+): Record<string, unknown> {
+  const row = baseOutboundRow(businessId, customerId, toPhone, body, sendStatus);
+  if (meta.source) row.source = meta.source;
+  if (meta.reason) row.reason = meta.reason;
+  if (meta.wamid) row.meta_message_id = meta.wamid;   // outbound wamid → existing column
+  if (meta.triggerRef) row.trigger_ref = meta.triggerRef;
+  return row;
+}
+
+/** True for a "column does not exist / not in schema cache" error — i.e. migration 012 not yet applied. */
+export function isMissingColumnError(error: unknown): boolean {
+  const e = error as { code?: string; message?: string } | null;
+  if (!e) return false;
+  if (e.code === "42703" || e.code === "PGRST204") return true; // undefined_column / PostgREST schema-cache miss
+  const m = (e.message ?? "").toLowerCase();
+  return m.includes("does not exist") || m.includes("could not find") || m.includes("schema cache");
+}
+
+// One-time warning so a not-yet-applied migration is VISIBLE without spamming every send.
+let warnedMissingTraceColumns = false;
+
+/**
+ * Persists an outbound message. Additive trace metadata (migration 012) is included when present; if the
+ * trace columns are NOT YET in the DB (migration unapplied), it FALLS BACK to the legacy row so a message
+ * is NEVER dropped — byte-identical to pre-012 persistence. No behavior change to the send path.
+ */
 export async function saveOutboundMessage(
   db: DB,
   businessId: string,
   customerId: string,
   toPhone: string,
   body: string,
-  sendStatus: "pending" | "sent" | "failed" = "pending"
+  sendStatus: "pending" | "sent" | "failed" = "pending",
+  meta: OutboundTraceMeta = {}
 ): Promise<void> {
-  await db.from("messages").insert({
-    business_id: businessId,
-    customer_id: customerId,
-    direction: "outbound",
-    channel: "whatsapp",
-    to_phone: toPhone,
-    body,
-    send_status: sendStatus,
-  });
+  const base = baseOutboundRow(businessId, customerId, toPhone, body, sendStatus);
+  const full = buildOutboundRow(businessId, customerId, toPhone, body, sendStatus, meta);
+
+  // Nothing extra to persist → single insert, identical to pre-012 behavior.
+  if (Object.keys(full).length === Object.keys(base).length) {
+    await db.from("messages").insert(base);
+    return;
+  }
+
+  const { error } = await db.from("messages").insert(full);
+  if (!error) return;
+
+  // FAIL-OPEN: migration 012 not applied yet → retry with the legacy row so the message is still saved.
+  if (isMissingColumnError(error)) {
+    if (!warnedMissingTraceColumns) {
+      warnedMissingTraceColumns = true;
+      console.warn("[outbound] ⚠ messages.source/reason/trigger_ref not found — apply migration 012_outbound_trace_metadata.sql; persisting WITHOUT trace until then");
+    }
+    await db.from("messages").insert(base);
+    return;
+  }
+  // A different insert error (not a missing column): leave the legacy contract (ignored, like before).
 }
 
 export interface ServiceRow {

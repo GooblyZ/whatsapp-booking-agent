@@ -19,7 +19,7 @@ export type OutboundSource =
   | "recovery"         // provider-recovery / degraded acknowledgement
   | "dashboard"        // owner/manual send from the dashboard
   | "unknown";         // UNLABELED — should never appear in a normal flow
-export interface OutboundTrace { source: OutboundSource; reason?: string }
+export interface OutboundTrace { source: OutboundSource; reason?: string; triggerRef?: string }
 /** Compact `src=… reason=…` tag for the `[outbound]` line; flags an unlabeled send loudly. Pure. */
 export function formatOutboundTrace(t: OutboundTrace): string {
   return `${t.source === "unknown" ? "⚠ " : ""}src=${t.source}${t.reason ? ` reason=${t.reason}` : ""}`;
@@ -117,9 +117,15 @@ export async function sendOutbound(
     console.error("[outbound] failed to record send health:", err instanceof Error ? err.message : String(err));
   }
 
-  // Always save the outbound message regardless of send outcome so no reply is lost.
+  // Always save the outbound message regardless of send outcome so no reply is lost. Trace metadata
+  // (source/reason + the returned wamid) is persisted durably; saveOutboundMessage falls back to the
+  // legacy row if migration 012 isn't applied yet (no message ever dropped).
   try {
-    await saveOutboundMessage(db, businessId, customerId, toPhone, text, sendStatus);
+    await saveOutboundMessage(db, businessId, customerId, toPhone, text, sendStatus, {
+      source: trace.source, reason: trace.reason,
+      wamid: result.success ? result.messageId ?? null : null,
+      triggerRef: trace.triggerRef ?? null,
+    });
   } catch (err) {
     console.error("[outbound] failed to save outbound message:", err instanceof Error ? err.message : String(err));
   }
@@ -167,6 +173,10 @@ export async function sendOutboundInteractive(
     await sendOutbound(db, businessId, customerId, toPhone, fallbackText, trace);
     return;
   }
-  try { await saveOutboundMessage(db, businessId, customerId, toPhone, enforced.body, "sent"); }
+  try { await saveOutboundMessage(db, businessId, customerId, toPhone, enforced.body, "sent", {
+    source: trace.source, reason: trace.reason,
+    wamid: result.messageId ?? null,
+    triggerRef: trace.triggerRef ?? null,
+  }); }
   catch (err) { console.error("[outbound] failed to save outbound message:", err instanceof Error ? err.message : String(err)); }
 }

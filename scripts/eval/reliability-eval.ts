@@ -75,6 +75,7 @@ import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
 import { applyOutboundSettings, formatOutboundTrace } from "../../lib/booking/outbound";
+import { saveOutboundMessage, buildOutboundRow, isMissingColumnError } from "../../lib/booking/helpers";
 import type { ReceptionistTurn, ReceptionistDecision } from "../../lib/ai/brain";
 import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
 
@@ -2072,6 +2073,56 @@ async function main(): Promise<void> {
   check("formatOutboundTrace: an UNLABELED (unknown) send is flagged loudly (⚠) so it can never hide",
     formatOutboundTrace({ source: "unknown" }) === "⚠ src=unknown"
     && formatOutboundTrace({ source: "unknown", reason: "x" }).startsWith("⚠ src=unknown"));
+
+  // ── 32. Durable outbound trace metadata (migration 012) — fail-open, no message ever dropped ──────
+  // The outbound chokepoint persists source/reason + the returned wamid (in meta_message_id) so a send is
+  // auditable from the DB, not only logs. If migration 012 isn't applied yet, the insert FALLS BACK to the
+  // legacy row — byte-identical to pre-012 persistence (no behavior change, no lost message).
+  section("32. Durable outbound trace metadata (012) — pure builder + fail-open fallback");
+  // buildOutboundRow: trace columns present when provided (wamid → meta_message_id); omitted otherwise.
+  const fullRow = buildOutboundRow("b", "c", "p", "body", "sent", { source: "ai_turn", reason: "r", wamid: "wamid.ABC", triggerRef: "appt1" });
+  check("buildOutboundRow: includes source/reason/meta_message_id(wamid)/trigger_ref + base columns",
+    fullRow.source === "ai_turn" && fullRow.reason === "r" && fullRow.meta_message_id === "wamid.ABC"
+    && fullRow.trigger_ref === "appt1" && fullRow.direction === "outbound" && fullRow.body === "body");
+  const bareRow = buildOutboundRow("b", "c", "p", "body", "sent");
+  check("buildOutboundRow: no meta → legacy row only (no source/reason/meta_message_id/trigger_ref)",
+    !("source" in bareRow) && !("reason" in bareRow) && !("meta_message_id" in bareRow)
+    && !("trigger_ref" in bareRow) && bareRow.direction === "outbound");
+  // isMissingColumnError: recognizes "migration not applied" (undefined_column / PostgREST cache miss).
+  check("isMissingColumnError: true for 42703 / PGRST204 / 'does not exist' / 'schema cache'; false otherwise",
+    isMissingColumnError({ code: "42703" }) === true
+    && isMissingColumnError({ code: "PGRST204", message: "Could not find the 'source' column of 'messages' in the schema cache" }) === true
+    && isMissingColumnError({ message: "column \"reason\" does not exist" }) === true
+    && isMissingColumnError({ code: "23505", message: "duplicate key value" }) === false
+    && isMissingColumnError(null) === false);
+  // FAIL-OPEN integration: a stub DB that rejects the trace insert (missing column) → retries with the
+  // LEGACY row and still persists. A stub that accepts → uses the full traced row. No throw either way.
+  const mkStub = (failOnTrace: boolean) => {
+    const inserts: Record<string, unknown>[] = [];
+    const db = { from: () => ({ insert: async (row: Record<string, unknown>) => {
+      inserts.push(row);
+      if (failOnTrace && "source" in row) return { error: { code: "PGRST204", message: "schema cache" } };
+      return { error: null };
+    } }) } as unknown as Parameters<typeof saveOutboundMessage>[0];
+    return { db, inserts };
+  };
+  const failStub = mkStub(true);
+  await saveOutboundMessage(failStub.db, "b", "c", "p", "hi", "sent", { source: "ai_turn", reason: "x", wamid: "wamid.X" });
+  check("saveOutboundMessage: migration unapplied → traced insert fails, legacy insert succeeds (message NOT dropped)",
+    failStub.inserts.length === 2
+    && failStub.inserts[0].source === "ai_turn" && failStub.inserts[0].meta_message_id === "wamid.X"
+    && !("source" in failStub.inserts[1]) && !("meta_message_id" in failStub.inserts[1])
+    && failStub.inserts[1].direction === "outbound");
+  const okStub = mkStub(false);
+  await saveOutboundMessage(okStub.db, "b", "c", "p", "hi", "sent", { source: "booking_platform", reason: "book_confirm", wamid: "wamid.Y", triggerRef: "appt9" });
+  check("saveOutboundMessage: migration applied → single traced insert (source/reason/wamid/trigger_ref)",
+    okStub.inserts.length === 1 && okStub.inserts[0].source === "booking_platform"
+    && okStub.inserts[0].reason === "book_confirm" && okStub.inserts[0].meta_message_id === "wamid.Y"
+    && okStub.inserts[0].trigger_ref === "appt9");
+  const noMetaStub = mkStub(false);
+  await saveOutboundMessage(noMetaStub.db, "b", "c", "p", "hi", "sent");
+  check("saveOutboundMessage: no trace → single legacy insert (identical to pre-012 behavior)",
+    noMetaStub.inserts.length === 1 && !("source" in noMetaStub.inserts[0]) && noMetaStub.inserts[0].direction === "outbound");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

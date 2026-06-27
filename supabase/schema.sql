@@ -629,3 +629,19 @@ ALTER TABLE public.ai_settings          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.ai_events            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events               ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.waitlist_entries     ENABLE ROW LEVEL SECURITY;
+
+-- ============================================================
+-- Durable outbound traceability (migration 012)
+--
+-- The single outbound chokepoint (lib/booking/outbound.ts) stamps every customer-visible
+-- WhatsApp send with a source/reason; these columns make that durable in the row so it is
+-- auditable from the DB (e.g. matching a STATUS callback's wamid to the row that sent it).
+-- NULLABLE, no backfill, no behavior change. The outbound wamid is stored in the EXISTING
+-- meta_message_id column. `source` is free-text on purpose (enum lives in the TS type).
+-- ============================================================
+ALTER TABLE messages
+  ADD COLUMN IF NOT EXISTS source      TEXT,  -- ai_turn | deterministic | booking_platform | job_reminder | job_waitlist | recovery | dashboard | unknown
+  ADD COLUMN IF NOT EXISTS reason      TEXT,  -- specific trigger (book_confirm, reminder_due, link_booking, …)
+  ADD COLUMN IF NOT EXISTS trigger_ref TEXT;  -- optional correlation id (e.g. appointment id for a booking confirmation)
+
+CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source) WHERE source IS NOT NULL;
