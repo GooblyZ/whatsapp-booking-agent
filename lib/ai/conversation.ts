@@ -17,7 +17,7 @@
 //   AI_MEMORY_MAX_AGE_HOURS (default 24)  — ignore anything older (recent session only)
 //   AI_MAX_TURN_CHARS       (default 500) — per-message truncation
 
-import type { DB } from "@/lib/booking/helpers";
+import { isMissingColumnError, type DB } from "@/lib/booking/helpers";
 import { extractExplicitTime } from "./grounding";
 import { isKnownFallbackText } from "./brain";
 
@@ -245,6 +245,50 @@ const EMPTY = (windowTurns: number, maxAgeHours: number): ConversationContext =>
   maxAgeHours,
 });
 
+// ── AI-FACING HISTORY HYGIENE ────────────────────────────────────────────────────
+// A user token we ALREADY deflected with a deterministic clarify must not re-enter Gemini's history as
+// meaningful content next turn — otherwise the model fuses the junk with the next real message (the live
+// "אורי" → "אוריצביעה?" glitch). We identify a deflected turn from the DURABLE outbound `reason` recorded
+// at the chokepoint (migration 012) — NOT by recomputing routing and NOT by matching the token text, so
+// it is general (any deflected token), never phrase-specific. Extend the Set as more deterministic
+// deflections gain a durable reason; it is a typed allowlist, not a per-case flag.
+export const DEFLECTED_REASONS = new Set<string>(["low_signal_single_token"]);
+
+export interface HistoryRow { direction: string; body: string | null; reason?: string | null }
+
+/**
+ * PURE history splitter (unit-tested). Returns:
+ *   - allTurns: every non-empty turn — feeds the guard-facing TRANSCRIPT (unchanged behavior),
+ *   - turns:    the AI-FACING turns sent to Gemini, with (a) our own fallback/degraded lines removed
+ *               (isKnownFallbackText, unchanged) and (b) any USER turn we already DEFLECTED removed —
+ *               detected strictly: its reply (the adjacent next outbound row) carries a durable reason in
+ *               DEFLECTED_REASONS. A legitimate one-word answer (name/day/time/phone/service/affirmation)
+ *               that reached Gemini has a NON-deflection reason, so it is never dropped.
+ */
+export function buildHistoryTurns(
+  rows: HistoryRow[], maxChars: number, maxTurns: number
+): { turns: ConversationTurn[]; allTurns: ConversationTurn[] } {
+  const wasDeflected = (i: number): boolean =>
+    rows[i].direction === "inbound"
+    && i + 1 < rows.length
+    && rows[i + 1].direction === "outbound"
+    && DEFLECTED_REASONS.has(rows[i + 1].reason ?? "");
+  const built = rows
+    .map((r, i) => ({
+      role: r.direction === "inbound" ? ("user" as const) : ("model" as const),
+      text: (r.body ?? "").slice(0, maxChars).replace(/\s*\n\s*/g, " ").trim(),
+      deflected: r.direction === "inbound" && wasDeflected(i),
+    }))
+    .filter((t) => t.text.length > 0)
+    .slice(-(maxTurns * 2));
+  const allTurns: ConversationTurn[] = built.map(({ role, text }) => ({ role, text }));
+  const turns: ConversationTurn[] = built
+    .filter((t) => !(t.role === "user" && t.deflected))               // (b) drop a token we already deflected
+    .filter((t) => t.role === "user" || !isKnownFallbackText(t.text)) // (a) drop our own fallback lines
+    .map(({ role, text }) => ({ role, text }));
+  return { turns, allTurns };
+}
+
 /**
  * Builds a recent, recency-bounded, context-only transcript for one customer.
  * Excludes the current inbound message (already persisted before the flow runs).
@@ -261,40 +305,31 @@ export async function getConversationContext(
     const sinceISO = new Date(Date.now() - maxAgeHours * 3_600_000).toISOString();
     const limit = maxTurns * 2 + 1; // +1 for the current inbound row we drop
 
-    const { data, error } = await db
-      .from("messages")
-      .select("direction, body, created_at")
-      .eq("business_id", businessId)
-      .eq("customer_id", customerId)
-      .gte("created_at", sinceISO)
-      .order("created_at", { ascending: false })
-      .limit(limit);
+    // `reason` (migration 012) lets the AI-facing history drop a token we already deflected. FAIL-OPEN:
+    // on a pre-012 DB the column is missing → re-read without it (history still works, hygiene no-ops).
+    // `cols` is a widened string so both selects share one (untyped) response shape.
+    const runSelect = (cols: string) => db
+      .from("messages").select(cols)
+      .eq("business_id", businessId).eq("customer_id", customerId)
+      .gte("created_at", sinceISO).order("created_at", { ascending: false }).limit(limit);
+    let res = await runSelect("direction, body, created_at, reason");
+    if (res.error && isMissingColumnError(res.error)) res = await runSelect("direction, body, created_at");
 
-    if (error || !data) {
-      if (error) console.error("[ai-memory] read failed:", error.message);
+    if (res.error || !res.data) {
+      if (res.error) console.error("[ai-memory] read failed:", res.error.message);
       return EMPTY(maxTurns, maxAgeHours);
     }
 
-    let rows = data as { direction: string; body: string | null; created_at: string }[];
+    let rows = res.data as unknown as { direction: string; body: string | null; created_at: string; reason?: string | null }[];
     // Drop the newest row if it is the current inbound message.
     if (rows.length > 0 && rows[0].direction === "inbound") rows = rows.slice(1);
     rows.reverse(); // chronological
     // Cross-conversation hygiene: memory never crosses a long silence.
     rows = applyConversationGap(rows, getGapHours(), Date.now());
 
-    const maxChars = getMaxTurnChars();
-    const allTurns: ConversationTurn[] = rows
-      .filter((r) => (r.body ?? "").trim().length > 0)
-      .map((r) => ({
-        role: r.direction === "inbound" ? ("user" as const) : ("model" as const),
-        text: (r.body as string).slice(0, maxChars).replace(/\s*\n\s*/g, " ").trim(),
-      }))
-      .slice(-(maxTurns * 2));
-
-    // AI-facing turns drop our own failure/degraded lines — they carry no
-    // information, and as model turns they teach the model to talk about
-    // glitches. The transcript keeps EVERYTHING (guards compare against it).
-    const turns = allTurns.filter((t) => t.role === "user" || !isKnownFallbackText(t.text));
+    // allTurns → guard-facing transcript (unchanged); turns → AI-facing history (fallback lines AND
+    // already-deflected user tokens removed). See buildHistoryTurns.
+    const { turns, allTurns } = buildHistoryTurns(rows, getMaxTurnChars(), maxTurns);
 
     if (allTurns.length === 0) return EMPTY(maxTurns, maxAgeHours);
 

@@ -76,6 +76,7 @@ import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
 import { buildMyAppointmentsLink } from "../../lib/booking/appointment-token";
 import { applyOutboundSettings, formatOutboundTrace } from "../../lib/booking/outbound";
 import { saveOutboundMessage, buildOutboundRow, isMissingColumnError } from "../../lib/booking/helpers";
+import { buildHistoryTurns, DEFLECTED_REASONS } from "../../lib/ai/conversation";
 import type { ReceptionistTurn, ReceptionistDecision } from "../../lib/ai/brain";
 import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
 
@@ -2123,6 +2124,53 @@ async function main(): Promise<void> {
   await saveOutboundMessage(noMetaStub.db, "b", "c", "p", "hi", "sent");
   check("saveOutboundMessage: no trace → single legacy insert (identical to pre-012 behavior)",
     noMetaStub.inserts.length === 1 && !("source" in noMetaStub.inserts[0]) && noMetaStub.inserts[0].direction === "outbound");
+
+  // ── 33. AI-facing history hygiene — a deflected token never re-enters Gemini's history ────────────
+  // Live "אורי" → "אוריצביעה?" glitch: a single-token-unclear deflection was sent, but the junk token
+  // stayed in the AI-facing history, so the next turn's model fused it with "צביעה". buildHistoryTurns
+  // drops a USER turn whose reply carries a DEFLECTED reason (durable, migration 012) — general (any
+  // token), strict (only that reason), and never removes a legitimate answer. The transcript keeps all.
+  section("33. AI-facing history hygiene — drop already-deflected user tokens (not phrase-specific)");
+  const hrow = (direction: string, body: string, reason: string | null = null) => ({ direction, body, reason });
+  const CLARIFY = "לא הצלחתי להבין רוצה לקבוע תור, או לשאול משהו על העסק?";
+  // The exact live scenario: "אורי" deflected (its reply reason = low_signal_single_token), then "צביעה".
+  const liveRows = [
+    hrow("inbound", "היי"),                               hrow("outbound", "היי אמיר, הכל טוב", "gemini_reply"),
+    hrow("inbound", "אורי"),                              hrow("outbound", CLARIFY, "low_signal_single_token"),
+    hrow("inbound", "צביעה"),
+  ];
+  const live = buildHistoryTurns(liveRows, 500, 8);
+  const userTexts = (ts: { role: string; text: string }[]) => ts.filter((t) => t.role === "user").map((t) => t.text);
+  const modelTexts = (ts: { role: string; text: string }[]) => ts.filter((t) => t.role === "model").map((t) => t.text);
+  // 1. The deflected token is GONE from AI-facing turns…
+  check("deflected 'אורי' is removed from AI-facing turns (its reply reason = low_signal_single_token)",
+    !userTexts(live.turns).includes("אורי") && !modelTexts(live.turns).some((t) => t.includes("לא הצלחתי להבין")));
+  // 2. …but the following real service token still reaches Gemini, and earlier real turns are kept.
+  check("the next real service token 'צביעה' (and earlier real turns) still reach Gemini",
+    userTexts(live.turns).includes("צביעה") && userTexts(live.turns).includes("היי")
+    && modelTexts(live.turns).some((t) => t.includes("היי אמיר")));
+  // …and the guard-facing transcript (allTurns) keeps EVERYTHING (unchanged behavior).
+  check("the guard-facing transcript keeps the deflected token (allTurns unchanged)",
+    userTexts(live.allTurns).includes("אורי") && live.allTurns.length === 5);
+  // 3. Legitimate single-token ANSWERS are NOT removed (their reply has a non-deflection reason).
+  const answerRows = [
+    hrow("outbound", "איך קוראים לך?", "gemini_reply"), hrow("inbound", "דני"), hrow("outbound", "נעים מאוד דני", "gemini_reply"),
+    hrow("outbound", "איזה יום נוח לך?", "gemini_reply"), hrow("inbound", "מחר"), hrow("outbound", "סבבה", "link_booking"),
+    hrow("inbound", "פן"),                              hrow("outbound", "אחלה, פן ועיצוב", "link_booking"),
+  ];
+  const ans = buildHistoryTurns(answerRows, 500, 8);
+  check("legitimate one-word answers kept: name(דני)/day(מחר)/service(פן) all reach Gemini",
+    userTexts(ans.turns).includes("דני") && userTexts(ans.turns).includes("מחר") && userTexts(ans.turns).includes("פן"));
+  // 4. NOT phrase-specific: the drop is keyed on the REASON marker, not the token text.
+  const phraseRows = [
+    hrow("inbound", "דני"),  hrow("outbound", CLARIFY, "low_signal_single_token"), // a NAME token, but DEFLECTED → dropped
+    hrow("inbound", "אורי"), hrow("outbound", "אחלה!", "link_booking"),            // 'אורי' but NOT deflected → kept
+  ];
+  const ph = buildHistoryTurns(phraseRows, 500, 8);
+  check("not phrase-specific: a deflected 'דני' is dropped; a non-deflected 'אורי' is kept (reason drives it)",
+    !userTexts(ph.turns).includes("דני") && userTexts(ph.turns).includes("אורי"));
+  check("DEFLECTED_REASONS is a typed allowlist containing low_signal_single_token (extensible, not a per-case flag)",
+    DEFLECTED_REASONS.has("low_signal_single_token") && !DEFLECTED_REASONS.has("gemini_reply"));
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
