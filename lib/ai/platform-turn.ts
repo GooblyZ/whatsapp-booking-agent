@@ -18,7 +18,7 @@ import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured, get
 import {
   runReceptionistTurn, FALLBACK, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
-import { stripEmojis, sameOutboundText, claimsBookingCompleted } from "./reply-polish";
+import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording } from "./reply-polish";
 import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
@@ -695,7 +695,11 @@ export async function runPlatformTurn(
     return runContinuity(reason, decision);
   }
 
-  let replyText = decision.replyText;
+  // CTA COMPLEMENT FENCE (Stage 3a): the SYSTEM owns the CTA — strip a redundant call-to-action clause
+  // from the MODEL reply so the message reads once, not twice. Applied to the model output ONLY (ok=true);
+  // every deterministic bridge/fallback below is assigned AFTER this and legitimately references the link,
+  // so it is never fenced. Byte-identical no-op for any reply with no CTA pointer (every non-CTA turn).
+  let replyText = decision.ok ? stripDuplicateCtaWording(decision.replyText) : decision.replyText;
 
   // The model must never claim a booking action happened — in platform mode it
   // structurally can't have. Replace the lie with an honest router line.

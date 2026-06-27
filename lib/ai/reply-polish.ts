@@ -260,3 +260,53 @@ export function revealsInternalInstructions(reply: string): boolean {
     || DISCLOSURE_SCAFFOLD_RE.test(reply)
     || DISCLOSURE_META_RE.test(reply);
 }
+
+// ── CTA-COMPLEMENT FENCE (Stage 3a) ──────────────────────────────────────────────
+// The SYSTEM owns the call-to-action: it attaches the CTA label + link/button after the
+// reply (attachPlatformLink). A MODEL reply that ALSO points the customer at the link/action
+// duplicates it — the message reads the action twice and feels templated ("…לקביעת תור מהיר
+// ופשוט", "אפשר לקבוע דרך הקישור"). At temp 0.7 the persona's "leave the CTA to the system"
+// guidance leaks, so this is the deterministic backstop: it removes a model SENTENCE/clause
+// that is purely a CALL-TO-ACTION POINTER to the system link/action, while PRESERVING any
+// clause carrying a service detail (price/duration), and NEVER touching the label/URL (those
+// are appended separately by the caller). GENERAL, not phrase-specific — keyed on link-noun +
+// the label-style action-HEADER, never on the exact "מהר ופשוט" wording.
+//
+// Applied to the MODEL reply ONLY (platform-turn.ts, where decision.replyText enters routing);
+// the system's own deterministic bridges (FENCE_BRIDGE_*, NO_UPCOMING_MANAGE) are assigned AFTER
+// that point and legitimately reference the link, so they are never fenced.
+const HEB_RANGE = `${String.fromCharCode(0x0590)}-${String.fromCharCode(0x05ff)}`;
+// A link/CTA POINTER cue: a link NOUN (קישור/לינק/link) OR the label-style action-HEADER — a
+// ל-prefixed appointment ACTION NOUN (לקביעת/לתיאום/להזמנת/לניהול/לצפיית/לביטול/לשינוי/להזזת)
+// before "תור"/"תורים"/"פגישה", mirroring the system labels ("*לקביעת/לניהול… :*"). Deliberately
+// EXCLUDES the bare click verb "לחץ" (collides with לחץ=pressure / לחצים) and the bare word
+// "כאן"/"here" — both too common in normal prose — to stay high-precision (precision > recall;
+// the persona change is the primary guard, this is the backstop).
+const CTA_POINTER_RE = new RegExp(
+  `קישור|לינק|\\blink\\b|ל(?:קביעת|תיאום|הזמנת|ניהול|צפיי?ת|ביטול|שינוי|הזזת)\\s+ה?(?:תור|תורים|פגישה)(?![${HEB_RANGE}])`,
+  "i"
+);
+// Service DETAILS that must never be stripped: a price (₪ / שח / שקל) or a duration (NN דקות / min).
+const CTA_SERVICE_DETAIL_RE = /₪|ש"?ח|שקל|\b\d{1,3}\s*(?:דק|דקות|min|minutes)\b/i;
+
+/**
+ * Removes a redundant CALL-TO-ACTION clause from a MODEL reply when the system is attaching its
+ * own CTA — so the model text COMPLEMENTS the CTA instead of repeating it. PURE. Byte-identical
+ * no-op for any reply that carries no CTA pointer (every normal/non-CTA turn). A clause carrying a
+ * price/duration is always kept (service details preserved). NEVER returns the label/URL (the caller
+ * owns those). Conservative: if removal would empty/over-trim the reply, the ORIGINAL is returned —
+ * so a useful answer is never lost and the CTA is always still attached by the caller.
+ */
+export function stripDuplicateCtaWording(reply: string): string {
+  if (!reply || !CTA_POINTER_RE.test(reply)) return reply; // no CTA pointer → untouched (byte-identical)
+  const kept = reply
+    .split(/(?<=[.!?…])\s+|\n+/)
+    .filter((part) => {
+      const s = part.trim();
+      if (s.length === 0) return false;
+      if (CTA_SERVICE_DETAIL_RE.test(s)) return true;        // always keep price/duration clauses
+      return !CTA_POINTER_RE.test(s);                        // drop pure CTA-pointer clauses
+    });
+  const out = kept.join(" ").replace(/ {2,}/g, " ").replace(/\s+([,.!?…])/g, "$1").trim();
+  return out.replace(/\s/g, "").length >= 2 ? out : reply;   // over-trim guard → keep the original
+}

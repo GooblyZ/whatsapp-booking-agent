@@ -66,7 +66,7 @@ import { authorizeJobRequest } from "../../lib/jobs/auth";
 import {
   isActiveAppointment, isHistoryAppointment, filterAppointmentsForView, ACTIVE_GRACE_MS,
 } from "../../lib/booking/appointment-views";
-import { claimsBookingCompleted, sameOutboundText, nearDuplicateText, revealsInternalInstructions } from "../../lib/ai/reply-polish";
+import { claimsBookingCompleted, sameOutboundText, nearDuplicateText, revealsInternalInstructions, stripDuplicateCtaWording } from "../../lib/ai/reply-polish";
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
 import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
@@ -2401,6 +2401,57 @@ async function main(): Promise<void> {
   // What CANNOT be proven purely (needs the live call loop + process-global module state) — documented, not faked.
   gap("Stage 2b end-to-end strike accumulation needs the mocked-provider integration harness (Phase 5)",
     "Pure here: the transient-failure GATE (isTransientProviderStatus) and the jittered backoff (retryDelayMs). NOT pure (live loop + module state): a timeout strikes-but-is-not-retried; repeated timeout/5xx within 90s → cooldown; success resets after timeout/5xx strikes; exactly ONE strike per inbound; and malformed JSON never strikes (it is POST-success — the 200 already called noteSuccess, clearing strikes; the parse failure is handled in brain.ts, outside the breaker). These funnel into the SAME nextStrikeCount/cooldown/noteSuccess already proven in §18/§35, so the accumulation→outage→reset MATH is covered; only the wiring needs the harness.");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 37. CTA COMPLEMENT CONTRACT (Stage 3a) — model text complements the system CTA, never repeats it.
+  // ════════════════════════════════════════════════════════════════════════════════
+  // The SYSTEM owns the CTA label + link/button (attachPlatformLink). `stripDuplicateCtaWording` removes a
+  // redundant model CALL-TO-ACTION clause so the message reads once, not twice. GENERAL (link-noun + the
+  // label-style action-HEADER), never keyed on the "מהר ופשוט" phrase; service details (price/duration) are
+  // preserved; the label/URL are never the fence's concern (the caller always attaches them). Wired on the
+  // MODEL reply only (platform-turn.ts), so the system's own link-bearing bridges are never stripped.
+  section("37. CTA complement contract — strip redundant model CTA, keep service detail, never drop the link");
+  // 1. A redundant CTA-header / link-pointer lead-in is removed — GENERAL across phrasings (not phrase-specific).
+  check("redundant CTA clause removed: label-style header, link-pointer, and a DIFFERENT phrasing all stripped",
+    !stripDuplicateCtaWording("אין בעיה! לקביעת תור מהיר ופשוט").includes("לקביעת תור")
+    && !stripDuplicateCtaWording("שמחתי לעזור! אפשר לקבוע דרך הקישור.").includes("קישור")
+    && !stripDuplicateCtaWording("נהדר! להזמנת תור עכשיו בקישור.").includes("להזמנת")        // different wording, no "מהר ופשוט"
+    && stripDuplicateCtaWording("אין בעיה! לקביעת תור מהיר ופשוט").includes("אין בעיה"));
+  // 2. Service DETAILS (price / duration) are preserved even when the same reply also carried a CTA pointer.
+  check("service detail preserved: price (₪/ש\"ח) and duration (דקות) survive while the CTA clause is dropped",
+    (() => {
+      const price = stripDuplicateCtaWording('פן ועיצוב עולה 120 ש"ח. לקביעת תור מהיר ופשוט:');
+      const dur = stripDuplicateCtaWording("התספורת נמשכת 30 דקות. לקביעת תור בקישור.");
+      return price.includes("120") && price.includes('ש"ח') && !price.includes("לקביעת תור")
+        && dur.includes("30 דקות") && !dur.includes("קישור");
+    })());
+  // 3. Non-CTA replies are BYTE-IDENTICAL (untouched), incl. tricky look-alikes (לחץ=pressure, כאן=here).
+  check("non-CTA replies untouched (byte-identical): smalltalk, 'לחץ'=pressure, 'כאן'=here, plain booking warmth",
+    stripDuplicateCtaWording("אשמח לעזור! מה שלומך היום?") === "אשמח לעזור! מה שלומך היום?"
+    && stripDuplicateCtaWording("יש עליי קצת לחץ היום אבל הכל טוב 🙂") === "יש עליי קצת לחץ היום אבל הכל טוב 🙂"
+    && stripDuplicateCtaWording("אני כאן לכל שאלה שתרצה.") === "אני כאן לכל שאלה שתרצה."
+    && stripDuplicateCtaWording("בשמחה, אשמח לעזור לך עם זה.") === "בשמחה, אשמח לעזור לך עם זה.");
+  // 4. label + URL ALWAYS survive: strip-then-attach (the runtime composition) keeps the CTA + the price.
+  check("label + URL survive the fence: strip→attachPlatformLink keeps the URL, the label, and the price; model CTA gone from the stripped reply",
+    (() => {
+      const url = "https://x/book/biz";
+      const cleaned = stripDuplicateCtaWording('אחלה! פן ועיצוב עולה 120 ש"ח. לקביעת תור מהיר ופשוט:');
+      const a = attachPlatformLink(cleaned, "לקביעת תור:", url, null, "אני רוצה פן");
+      return !cleaned.includes("לקביעת תור") && cleaned.includes("120")                 // model CTA removed, price kept
+        && a.replyText.includes(url) && a.replyText.includes("120")                      // URL + price in the fallback text
+        && a.interactive?.kind === "cta_url" && a.interactive.url === url
+        && a.interactive.body.includes("לקביעת תור:") && !a.interactive.body.includes(url); // label in body, URL only in the button
+    })());
+  // 5. Over-trim guard: a reply that is ONLY a CTA clause is returned UNCHANGED (never emptied) — the caller
+  //    still attaches the label/URL, so nothing is lost and a useful answer is never destroyed.
+  check("over-trim guard: a CTA-only reply is returned unchanged (never emptied)",
+    stripDuplicateCtaWording("לקביעת תור מהיר ופשוט") === "לקביעת תור מהיר ופשוט");
+  // 6. Manage/cancel/reschedule CTA duplication is handled by the same general mechanism.
+  check("manage/cancel CTA duplication handled too (general): 'לביטול התור דרך הקישור' dropped, the answer kept",
+    (() => {
+      const out = stripDuplicateCtaWording("בטח, אפשר לבטל. לביטול התור דרך הקישור.");
+      return out.includes("אפשר לבטל") && !out.includes("קישור") && !out.includes("לביטול התור");
+    })());
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
