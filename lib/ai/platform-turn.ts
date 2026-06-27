@@ -392,6 +392,28 @@ export async function runPlatformTurn(
     return { replyText, decision, linkAttached: null, suppressReply };
   }
 
+  // ── PROMPT-INJECTION SAFETY LANE (deterministic, BEFORE any model call) ─────────
+  //    A confident injection / override / "reveal your instructions" attempt gets a short SCOPE refusal —
+  //    no Gemini, no internal disclosure, no routing/booking/manage effect. Repeated attempts DE-ESCALATE via
+  //    the shared low-signal counter (turn 1 → refusal, then quiet), so an attacker can't burn Gemini calls.
+  //    The output disclosure fence (reply-polish) stays as defense-in-depth. SKIPPED in full deterministic
+  //    mode — the menu/continuity core owns the turn and never calls Gemini anyway.
+  if (!deterministicMenu && looksLikeInjection(messageText)) {
+    const newCount = prevLowSignal + 1;
+    const plan = injectionPlan(newCount);
+    await persist(newCount, 0); // injection breaks any greeting run; shares the low-signal counter (de-escalation)
+    const decision = errorDecision("injection_refused", true);
+    await safeLog(businessId, customerId, decision);
+    console.log(
+      `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=refuse_injection` +
+      ` gemini_skipped_reason=prompt_injection low_signal=true low_signal_kind=injection` +
+      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
+      ` greeting_count_before=${prevGreeting} greeting_count_after=0` +
+      ` low_signal_action=${newCount <= 1 ? "refuse" : "quiet_mode"} reply_suppressed=${plan.suppressReply} link=-`
+    );
+    return { replyText: plan.replyText, decision, linkAttached: null, suppressReply: plan.suppressReply };
+  }
+
   // ── PRE-GEMINI QUIET-MODE GUARD (cost control, BEFORE any model call) ──────────
   // Active only once the boundary has been set (3+ consecutive low-signal turns).
   // Cheap, local classification decides — Gemini is never paid for here:
@@ -406,22 +428,22 @@ export async function runPlatformTurn(
   if (preGemini !== "proceed_to_gemini") {
     if (preGemini === "skip_gemini_gibberish") {
       const newCount = prevLowSignal + 1;
-      const plan = quietModePlan(newCount);
-      // Good-faith confusion that LOOKS like local noise (e.g. "??") is never walked into silence —
-      // it gets the short reminder instead. Genuine keysmash/noise can still go quiet (Phase 4A).
+      const plan = machineNoisePlan(newCount); // turn 1 → one short clarify, turn 2+ → quiet (faster than good-faith)
+      // Defense-in-depth: machine-noise is never good-faith (looksLikeNoise excludes "?"/words), but keep the
+      // good-faith guard so a borderline detection never silences a real confused user.
       const suppress = plan.suppressReply && !isGoodFaithLowSignal(latestFragment(messageText));
       await persist(newCount, 0); // gibberish breaks any greeting run
-      const decision = errorDecision("low_signal_quiet", true);
+      const decision = errorDecision("low_signal_machine_noise", true);
       await safeLog(businessId, customerId, decision);
       console.log(
         `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=skip_gemini_gibberish` +
-        ` gemini_skipped_reason=quiet_mode_gibberish low_signal=true low_signal_kind=gibberish` +
+        ` gemini_skipped_reason=machine_noise low_signal=true low_signal_kind=gibberish` +
         ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${newCount}` +
         ` greeting_count_before=${prevGreeting} greeting_count_after=0` +
-        ` low_signal_action=quiet_mode cooldown_short_circuit=true reply_suppressed=${suppress} link=-`
+        ` low_signal_action=${newCount <= 1 ? "clarify" : "quiet_mode"} reply_suppressed=${suppress} link=-`
       );
       return {
-        replyText: suppress ? "" : LOW_SIGNAL_QUIET_REMINDER,
+        replyText: suppress ? "" : (plan.replyText || LOW_SIGNAL_QUIET_REMINDER),
         decision, linkAttached: null, suppressReply: suppress,
       };
     }
@@ -1017,7 +1039,12 @@ export async function runPlatformTurn(
     // lone contentless `unclear` token the model tends to "interpret" as a name ("אורי" → "מה שלומך,
     // אורי?") — unless our last reply asked a direct question a one-word answer could resolve. Those get
     // the deterministic clarify (no link). See forcesDeterministicClarify.
-    if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; forcedClarify = true; }
+    // OFF-TOPIC (general out-of-scope question): a SHORT, consistent business-scope deflection from turn 1
+    // (no long warm re-intro, no CTA) — still counts toward quiet, so repeated off-topic de-escalates (quiet
+    // suppression caps the cost). A genuine business FAQ is intent=faq (productive) and never lands here.
+    const isOffTopic = decision.turn.understanding.intent === "out_of_scope";
+    if (isOffTopic && lowSignalAct !== "quiet_mode") { replyText = OFF_TOPIC_DEFLECTION; linkAttached = null; }
+    else if (forcesDeterministicClarify(kind, lowSignalAct, latest, lastContract.askedQuestion)) { replyText = LOW_SIGNAL_SHORT; linkAttached = null; forcedClarify = true; }
     else if (lowSignalAct === "short_clarify") { replyText = LOW_SIGNAL_SHORT; linkAttached = null; }
     else if (lowSignalAct === "boundary") { replyText = LOW_SIGNAL_BOUNDARY; linkAttached = null; }
     else if (lowSignalAct === "quiet_mode") {
@@ -1244,6 +1271,12 @@ export const QUIET_RESET =
 // Short, distinct sparse reminder for a DEEP repeated-greeting loop — so we never spam
 // the identical full QUIET_RESET line every turn (BUG-009).
 export const GREETING_SPARSE_REMINDER = "אני כאן 🙂";
+// Low-Value-Input Lane: a short, scope-only refusal for a prompt-injection / override / "reveal your
+// instructions" attempt — it never acknowledges or echoes the attack and reveals NOTHING internal.
+export const INJECTION_REFUSAL = "אני כאן לעזור עם תורים ושאלות על העסק 🙂";
+// Short, consistent deflection for an OFF-TOPIC (out_of_scope) general question — no general-knowledge
+// answer, no long business re-introduction; keeps the customer in business scope.
+export const OFF_TOPIC_DEFLECTION = "זה לא בתחום שלי 🙂 לגבי העסק — תורים, שירותים ושאלות — אני כאן לעזור.";
 
 // In a deep greeting loop, send a short reminder only every Nth turn (otherwise suppress).
 const GREETING_REMINDER_EVERY = 3;
@@ -1540,6 +1573,27 @@ export function quietModePlan(count: number): { isQuiet: boolean; suppressReply:
   return { isQuiet: true, suppressReply: !sendReminder };
 }
 
+// ── Low-Value-Input FAST quiet ladder (machine-noise + injection) ─────────────────
+// For CONFIDENT low-value input (deterministic machine-noise / a prompt-injection attempt) the lane is
+// faster than the good-faith ladder: turn 1 → ONE specific deterministic line, turn 2+ → quiet (mostly
+// suppressed, a sparse reminder every Nth turn so a (mis)detection never fully ghosts the customer). The
+// caller still applies the good-faith guard (isGoodFaithLowSignal) before suppressing, so a real confused
+// human is never silenced. PURE → eval-testable.
+function lowValueQuietPlan(count: number, firstLine: string): { replyText: string; suppressReply: boolean } {
+  if (count <= 1) return { replyText: firstLine, suppressReply: false };
+  const idx = count - 1; // 1, 2, 3, … into the quiet phase (quiet begins at turn 2 — faster than good-faith)
+  const sendReminder = idx % QUIET_REMINDER_EVERY === 0;
+  return sendReminder ? { replyText: LOW_SIGNAL_QUIET_REMINDER, suppressReply: false } : { replyText: "", suppressReply: true };
+}
+/** Confident machine-noise: turn 1 → one short clarify, turn 2+ → quiet (faster than good-faith). */
+export function machineNoisePlan(count: number): { replyText: string; suppressReply: boolean } {
+  return lowValueQuietPlan(count, LOW_SIGNAL_SHORT);
+}
+/** Prompt-injection attempt: turn 1 → short scope refusal, repeated → quiet de-escalation (no Gemini). */
+export function injectionPlan(count: number): { replyText: string; suppressReply: boolean } {
+  return lowValueQuietPlan(count, INJECTION_REFUSAL);
+}
+
 // ── GOOD-FAITH low-signal (Phase 4A — never walk a confused human into silence) ──────────────────
 // A confused-but-HUMAN message — a bare "what?", a string of question marks, "I didn't understand" —
 // as opposed to MACHINE NOISE (keysmash, emoji-only, consonant clusters). Consulted ONLY at the
@@ -1551,6 +1605,32 @@ export function isGoodFaithLowSignal(message: string): boolean {
   const t = (message ?? "").trim();
   if (!t || t.length > 30) return false;
   return GOODFAITH_PUNCT_RE.test(t) || META_ONLY_RE.test(t); // META_ONLY_RE: "מה?", "לא הבנתי", "מה זה", …
+}
+
+// ── PROMPT-INJECTION detector (input-side safety lane) ────────────────────────────
+// HIGH-PRECISION typed marker set (he/en) for attempts to (a) EXTRACT internals — the system/developer
+// prompt, internal rules/instructions — or (b) OVERRIDE/JAILBREAK — ignore/forget the rules, role-swap.
+// Anchored so legitimate business wording never trips: "הוראות"/"כללים"/"הנחיות" only count when bound to
+// "המערכת"/"הפנימיות" (system/internal) or to an override verb — so "הוראות הגעה" (directions) is SAFE.
+// Precision over recall (the output disclosure fence stays as defense-in-depth for anything that slips to
+// Gemini). Drives a deterministic refusal lane; never affects routing/booking/manage. PURE → eval-testable.
+const INJECTION_RE = new RegExp([
+  // (a) EXTRACTION — reveal internals:
+  "system\\s*(prompt|instructions?|message)", "developer\\s*(prompt|message|instructions?)",
+  "הפרומפט", "סיסטם\\s*פרומפט",
+  "הוראות\\s*המערכת", "הנחיות\\s*המערכת", "ה?הוראות\\s*הפנימיות", "ה?כללים\\s*הפנימיים",
+  "(מה\\s*כתוב|תראה|תגלה|תוציא|תחשוף|תדפיס|הראה)\\s*\\S{0,12}\\s*(פרומפט|הוראות\\s*המערכת|הנחיות\\s*המערכת)",
+  // (b) OVERRIDE / JAILBREAK:
+  "ignore\\s+(?:the\\s+|your\\s+|all\\s+|any\\s+|previous\\s+|above\\s+)*(instructions?|rules?|prompt)",
+  "disregard\\s+\\S{0,15}\\s*(instructions?|rules?)", "override\\s+\\S{0,15}\\s*(instructions?|rules?|system)",
+  "תתעלם\\s*מ(?:ה)?\\s*(הוראות|כללים|הנחיות)", "תשכח\\s*(?:את\\s*)?(?:ה)?(הוראות|כללים|הנחיות)",
+  "אל\\s*תתייחס\\s*ל(?:ה)?(הוראות|כללים|הנחיות)",
+  "\\bDAN\\b", "jailbreak", "אתה\\s*עכשיו\\s*לא\\s*ה?(בוט|עוזר|מערכת)",
+  "you\\s*are\\s*(?:now\\s*)?(?:a\\s*|an\\s*)?(?:dan|different|not\\s*the)", "act\\s+as\\s+(?:a|an|if)", "pretend\\s+(?:you|to\\s*be|that)",
+].join("|"), "i");
+/** True when the message is (most likely) a prompt-injection / override / internal-disclosure attempt. */
+export function looksLikeInjection(message: string): boolean {
+  return INJECTION_RE.test((message ?? "").trim());
 }
 
 /** Does this turn push toward QUIET MODE? Only truly low-content turns do —
@@ -1939,8 +2019,12 @@ export function preGeminiAction(
     }
   }
 
-  // Obvious gibberish only short-circuits once the boundary was set (quiet mode).
-  if (prevLowSignal >= 3 && looksLikeNoise(message, serviceNames)) return "skip_gemini_gibberish";
+  // Confident machine-noise (deterministic gibberish) skips Gemini from the FIRST detected turn: it carries
+  // no booking/FAQ/service signal, no "?", and isn't a greeting (all handled above), so it can never be a
+  // good-faith question — and good-faith confusion ("מה?"/"לא הבנתי") has a "?"/META shape that looksLikeNoise
+  // already excludes. This kills the gibberish→Gemini cost AND the address-loop (the model is never called on
+  // the noise turn, so it can't re-answer the prior directions topic).
+  if (looksLikeNoise(message, serviceNames)) return "skip_gemini_gibberish";
   return "proceed_to_gemini";                                 // real-looking / first greeting
 }
 
