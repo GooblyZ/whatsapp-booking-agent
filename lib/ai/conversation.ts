@@ -55,6 +55,10 @@ export interface ConversationContext {
   /** Configured window (exchanges) and recency cutoff (hours) — for observability. */
   windowTurns: number;
   maxAgeHours: number;
+  /** The durable `reason` of our MOST RECENT outbound (migration 012), or null. Lets a turn know what our
+   *  last reply WAS (e.g. an acknowledgement close) without re-matching reply text — used to break the
+   *  ack→close→ack→close loop (a repeated ack after an ack-close is suppressed). */
+  lastAssistantReason: string | null;
 }
 
 /**
@@ -243,6 +247,7 @@ const EMPTY = (windowTurns: number, maxAgeHours: number): ConversationContext =>
   turnsUsed: 0,
   windowTurns,
   maxAgeHours,
+  lastAssistantReason: null,
 });
 
 // ── AI-FACING HISTORY HYGIENE ────────────────────────────────────────────────────
@@ -346,12 +351,18 @@ export async function getConversationContext(
       .map((t) => `${t.role === "user" ? "Customer" : "Assistant (you, earlier)"}: ${t.text}`)
       .join("\n");
 
+    // The durable reason of our most recent outbound (chronologically last) — drives the terminal-ack loop
+    // break. FAIL-OPEN: null on a pre-012 DB (the select dropped `reason`) or when there is no outbound yet.
+    const lastAssistantReason =
+      ([...rows].reverse().find((r) => r.direction === "outbound")?.reason ?? null) as string | null;
+
     return {
       turns,
       transcript,
       turnsUsed: turns.length,
       windowTurns: maxTurns,
       maxAgeHours,
+      lastAssistantReason,
     };
   } catch (err) {
     console.error("[ai-memory] unexpected error:", err instanceof Error ? err.message : String(err));

@@ -662,22 +662,29 @@ export async function runPlatformTurn(
     return { replyText: "", decision: supersededDecision, linkAttached: null, suppressReply: true };
   }
 
-  // ── ACKNOWLEDGEMENT LANE (post-CTA / post-answer): a positive ack ("מעולה"/"תודה"/"מגניב"/"הבנתי") is NOT
-  //    an unclear token — it's a natural close. Answer it deterministically with a short close (no Gemini, no
-  //    CTA), and do NOT count it as low-signal (CARRY the streak — an ack neither escalates nor rescues abuse).
-  //    Excludes bare affirmations ("כן"/"סבבה") — they keep their existing pending-offer handling — and any
-  //    turn that ANSWERS a pending question. SKIPPED in deterministic mode (menu-anchored there).
+  // ── ACKNOWLEDGEMENT LANE (TERMINAL ack — post-CTA / post-answer): a positive ack ("מעולה"/"תודה"/
+  //    "מעולה תודה"/"מגניב"/"הבנתי") is NOT an unclear/off-topic token — it's a natural conversation CLOSER.
+  //    Answer it deterministically (no Gemini, no CTA) and CARRY the streak (an ack neither escalates NOR
+  //    rescues an abuse/quiet streak). TERMINAL: the FIRST ack gets one short close, but a REPEATED ack (our
+  //    last reply was itself an ack-close, via memory.lastAssistantReason) OR an ack arriving in a DEEP
+  //    low-value streak is SUPPRESSED (no outbound) — so "מעולה→בשמחה→מעולה→בשמחה…" can't loop forever and an
+  //    abuser can't farm replies. Excludes bare affirmations ("כן"/"סבבה" — pending-offer handling) and any
+  //    turn that ANSWERS a pending question. Recognized via the DURABLE ack reason, not by matching reply
+  //    text. SKIPPED in deterministic mode (menu-anchored there).
   if (!deterministicMenu && isLowValueAck(messageText) && !isBareAffirmation(messageText)
       && !hasPendingAnswerExpectedQuestion(lastContract.askedQuestion, lastAssistant ?? "")) {
+    const repeatedAck = memory.lastAssistantReason === ACK_REASON; // our last reply was already an ack-close
+    const ackSuppress = repeatedAck || prevLowSignal >= LOW_VALUE_DEEP_AT;
     await persist(prevLowSignal, 0); // neutral: carry low-signal (no escalate/rescue), break the greeting run
-    const decision = errorDecision("acknowledgement", true);
+    const decision = errorDecision(ACK_REASON, true);
     await safeLog(businessId, customerId, decision);
     console.log(
       `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=acknowledgement` +
       ` gemini_skipped_reason=acknowledgement low_signal=false low_signal_kind=ack route=NONE link=-` +
-      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${prevLowSignal} reply_suppressed=false`
+      ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${prevLowSignal}` +
+      ` repeated_ack=${repeatedAck} reply_suppressed=${ackSuppress}`
     );
-    return { replyText: ACK_CLOSE, decision, linkAttached: null };
+    return { replyText: ackSuppress ? "" : ACK_CLOSE, decision, linkAttached: null, suppressReply: ackSuppress };
   }
 
   // ── REPEATED OFF-TOPIC CAP (cost control for a SUSTAINED off-topic streak). Once the customer is already
@@ -1383,6 +1390,9 @@ export const LOW_VALUE_BOUNDARY = "אני כאן לעזור עם תורים וש
 // Post-CTA / post-answer ACKNOWLEDGEMENT close (מעולה/תודה/מגניב …) — a natural, short close, never an
 // "I didn't understand" clarify and never a CTA.
 export const ACK_CLOSE = "בשמחה 🙂";
+// Durable outbound `reason` for an acknowledgement close. Persisted via decision.branch at the chokepoint, so
+// the NEXT turn can read memory.lastAssistantReason and suppress a repeated ack (terminal-ack loop break).
+export const ACK_REASON = "acknowledgement";
 // "Deep" low-value streak threshold: at/above this, a presence ping no longer fully resets the abuse counter,
 // and a signal-less off-topic message is de-escalated WITHOUT Gemini. Below it, normal recovery applies.
 export const LOW_VALUE_DEEP_AT = 3;

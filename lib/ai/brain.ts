@@ -482,10 +482,22 @@ const ACK_TOKENS = new Set([
   "ok", "okay", "thanks", "thank you", "10x",
 ]);
 
+// Single acknowledgement WORDS — used to recognize a message composed ENTIRELY of acks even when the exact
+// COMBINATION isn't a listed token (e.g. "מעולה תודה", "תודה מעולה", "אחלה תודה רבה"). General, not a phrase
+// list: every word must be an ack word, so a real business message ("תודה אני רוצה לקבוע") is never an ack.
+// "כן" is deliberately omitted — a bare/leading "yes" is an AFFIRMATION (offer resolution), handled elsewhere.
+const ACK_WORDS = new Set([
+  "אוקי", "אוקיי", "בסדר", "סבבה", "טוב", "מעולה", "אחלה", "מגניב", "תודה", "רבה",
+  "סגור", "הבנתי", "יאללה", "בכיף", "ok", "okay", "thanks", "thank", "you", "10x",
+]);
+
 export function isLowValueAck(text: string): boolean {
   const t = text.trim().toLowerCase().replace(/[!?.,…]+$/g, "").trim();
-  if (t.length === 0 || t.length > 14) return false;
-  return ACK_TOKENS.has(t) || /^אוקי+$/.test(t) || /^סבבה+$/.test(t);
+  if (t.length === 0 || t.length > 20) return false;
+  if (ACK_TOKENS.has(t) || /^אוקי+$/.test(t) || /^סבבה+$/.test(t)) return true;
+  // Multi-word acknowledgement: 2–4 words, ALL of them ack words (a business word anywhere → not an ack).
+  const words = t.split(/\s+/);
+  return words.length >= 2 && words.length <= 4 && words.every((w) => ACK_WORDS.has(w));
 }
 
 /**

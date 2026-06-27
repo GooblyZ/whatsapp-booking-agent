@@ -44,7 +44,7 @@ import {
   shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
   hasPendingAnswerExpectedQuestion,
   runPlatformTurn, type PlatformTurnTestDeps, type PlatformTurnOutcome,
-  hasBusinessAnchor,
+  hasBusinessAnchor, ACK_REASON,
 } from "../../lib/ai/platform-turn";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
@@ -177,15 +177,19 @@ interface LaneResult { outcome: PlatformTurnOutcome; low: number | undefined; gr
 // whether the model was consulted; silences the function's verbose per-turn logging so eval output stays clean.
 async function runLane(opts: {
   message: string; prevLow: number; prevGreet?: number; model?: ModelScript; upcoming?: UpcomingRow[];
+  lastAssistantReason?: string;
 }): Promise<LaneResult> {
   const captured: Array<Record<string, unknown>> = [];
   const db = makeFakeDb(captured, opts.upcoming ?? []);
   const ctx = harnessCtx();
   let modelCalled = false;
+  const memory = {
+    turns: [], transcript: "", turnsUsed: 0, windowTurns: 5, maxAgeHours: 24,
+    lastAssistantReason: opts.lastAssistantReason ?? null,
+  } as unknown as ConversationContext;
   const testDeps: PlatformTurnTestDeps = {
     loadContext: async () => ctx,
-    loadTurnInputs: async () =>
-      [{ turns: [], transcript: "", turnsUsed: 0 } as unknown as ConversationContext, "", "", false],
+    loadTurnInputs: async () => [memory, "", "", false],
     runModel: async () => { modelCalled = true; return modelDecision(opts.model ?? { intent: "unclear" }); },
   };
   const prior: Record<string, unknown> = {
@@ -2948,6 +2952,50 @@ async function main(): Promise<void> {
       !aiText.includes("איטליה") && turns.some((t) => t.text.includes("פתוחים"))
       && allTurns.some((t) => t.text.includes("איטליה")),
       `aiText=${JSON.stringify(aiText)}`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 44. TERMINAL ACKNOWLEDGEMENT CLOSURE — multi-token acks are recognized; the FIRST ack closes, a REPEATED
+  //     ack (or an ack in a deep streak) is suppressed (no loop); acks never reset the abuse streak; business
+  //     intent after acks still recovers.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("44. Terminal acknowledgement closure — multi-token acks, no בשמחה loop, streak-safe");
+  // (1) MULTI-TOKEN acks are recognized (general: every word is an ack word) — a business word anywhere blocks it.
+  check("isLowValueAck: multi-token acks ('מעולה תודה'/'תודה מעולה'/'מעולה תודה רבה'/'אחלה תודה') are acks; a business message is not",
+    ["מעולה תודה", "תודה מעולה", "מעולה תודה רבה", "אחלה תודה"].every((a) => isLowValueAck(a) === true && isBareAffirmation(a) === false)
+    && isLowValueAck("תודה אני רוצה לקבוע") === false && isLowValueAck("אני רוצה לקבוע תור") === false);
+  // (2) FIRST ack after a useful answer → one short close, no Gemini, streak carried (not reset/escalated).
+  {
+    const r = await runLane({ message: "מעולה", prevLow: 0, lastAssistantReason: "gemini_reply" });
+    check("ack (runtime): FIRST 'מעולה' after a real answer → ACK_CLOSE, no Gemini, not suppressed, low stays 0",
+      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false && r.outcome.suppressReply !== true
+      && r.outcome.decision.branch === ACK_REASON && r.low === 0,
+      `reply=${JSON.stringify(r.outcome.replyText)} branch=${r.outcome.decision.branch} sup=${r.outcome.suppressReply} low=${r.low}`);
+  }
+  // (3) REPEATED ack after an ack-close → SUPPRESSED (no outbound), no Gemini, no בשמחה loop.
+  {
+    const r = await runLane({ message: "מעולה", prevLow: 0, lastAssistantReason: ACK_REASON });
+    check("ack (runtime): a REPEATED ack (last reply was an ack-close) is SUPPRESSED — no loop, no Gemini, low stays 0",
+      r.outcome.suppressReply === true && r.outcome.replyText === "" && r.modelCalled === false && r.low === 0,
+      `sup=${r.outcome.suppressReply} reply=${JSON.stringify(r.outcome.replyText)} model=${r.modelCalled} low=${r.low}`);
+  }
+  // (4) 'מעולה תודה' in a DEEP low-signal streak → acknowledgement (NOT off_topic_capped / not single-token),
+  //     no Gemini, streak CARRIED (not reset to 0, not incremented), suppressed (deep).
+  {
+    const r = await runLane({ message: "מעולה תודה", prevLow: 4, lastAssistantReason: "off_topic_deflection" });
+    check("ack (runtime): 'מעולה תודה' in a deep streak → branch=acknowledgement (NOT off_topic_capped), no Gemini, streak CARRIED at 4, suppressed",
+      r.outcome.decision.branch === ACK_REASON
+      && r.modelCalled === false && r.low === 4 && r.outcome.suppressReply === true,
+      `branch=${r.outcome.decision.branch} model=${r.modelCalled} low=${r.low} sup=${r.outcome.suppressReply}`);
+  }
+  // (5) Business intent AFTER acknowledgements still recovers (booking link + reset; FAQ not suppressed).
+  {
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true } });
+    const addr = await runLane({ message: "מה הכתובת?", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "faq", reply: "הכתובת…" } });
+    check("ack (runtime): clear business intent after acks recovers — booking link attached (Gemini consulted), FAQ not suppressed",
+      book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0
+      && addr.outcome.suppressReply !== true && addr.modelCalled === true && addr.low === 0,
+      `book.link=${book.outcome.linkAttached} addr.sup=${addr.outcome.suppressReply}`);
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────
