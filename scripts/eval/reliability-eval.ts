@@ -36,6 +36,7 @@ import {
   isDeterministicMenuActive, operatingModeReason, buildManageOutcome,
   resolveOperatingState, isDeterministicState, isGoodFaithLowSignal,
   attachPlatformLink, stripModelUrls, reconcileLinkWording, manageLinkFor, resolveManageOutcome,
+  shouldFenceLinkWording, stripPhantomLinkWording, mentionsPhantomLink, BOOKED_CLAIM_CORRECTION, LINK_SAFE_FALLBACK,
   forcesDeterministicClarify, LOW_SIGNAL_SHORT,
   planTransientContinuity, TRANSIENT_MICRO_ACK, fallbackTypeForLowSignal,
   shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
@@ -2496,6 +2497,55 @@ async function main(): Promise<void> {
   check("general, not phrase-specific: an unseen location+confusion message stays FAQ (keyed on the discriminator)",
     helpEscapesToManage("help", "אני בכניסה הלא נכונה ולא מבין לאן ללכת", NO_CTX, null) === false
     && isManageHelpTopic("אני בכניסה הלא נכונה ולא מבין לאן ללכת") === false);
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 39. FRAGMENT FIX — booked-claim correction is link-neutral; phantom-link fence never ships a fragment.
+  // ════════════════════════════════════════════════════════════════════════════════
+  // Live bug: the booked-claim guard replaced a false "booking happened" claim with a LINK-PROMISING line
+  // ("…בקישור — שניה ושולח לך אותו"); on a no-link turn the phantom-link fence stripped the link promise and
+  // left the dangling fragment "את התור עצמו קובעים". Fix: (a) the correction is LINK-NEUTRAL (no phantom-link
+  // wording), so the fence can't strip it; (b) a defense-in-depth fragment guard in stripPhantomLinkWording
+  // serves the safe line instead of any dangling remainder. Both general — no phrase-specific patch.
+  section("39. Fragment fix — link-neutral booked-claim correction + phantom-link fragment guard");
+  // (a) The correction carries NO phantom-link wording, so shouldFenceLinkWording stays false and the fence is
+  //     a no-op on it — it can never be stripped into a fragment (link attached or not).
+  check("booked-claim correction is link-neutral: no phantom wording; fence does not fire; strip is a no-op",
+    mentionsPhantomLink(BOOKED_CLAIM_CORRECTION) === false
+    && shouldFenceLinkWording(null, false, BOOKED_CLAIM_CORRECTION) === false
+    && stripPhantomLinkWording(BOOKED_CLAIM_CORRECTION) === BOOKED_CLAIM_CORRECTION);
+  // The correction does NOT itself claim an in-chat booking (it says booking is on the site, not in chat),
+  // and is NOT re-flagged by the booked-claim guard.
+  check("booked-claim correction is honest: not a false 'booking completed' claim; says it's on the site, not in chat",
+    claimsBookingCompleted(BOOKED_CLAIM_CORRECTION) === false
+    && /לא כאן בצ׳אט/.test(BOOKED_CLAIM_CORRECTION) && /באתר/.test(BOOKED_CLAIM_CORRECTION));
+  // (b) The OLD link-promising line — and any trailing-clause link promise — now degrades to the SAFE line,
+  //     never the dangling fragment "את התור עצמו קובעים".
+  check("phantom-link fragment guard: the old link-promising line degrades to the safe line, NOT a fragment",
+    (() => {
+      const r = stripPhantomLinkWording("את התור עצמו קובעים בקישור — שניה ושולח לך אותו 🙂");
+      return r !== "את התור עצמו קובעים" && !/בקישור/.test(r) && r === LINK_SAFE_FALLBACK;
+    })());
+  // The guard is general: a trailing "…בקישור" with no terminator degrades; an unrelated dangling case too.
+  check("fragment guard is general: any trailing link-promise with no terminator → safe line (not phrase-specific)",
+    stripPhantomLinkWording("אשמח לעזור לך עם זה דרך הקישור") === LINK_SAFE_FALLBACK);
+  // No regression: a phantom link that is an APPENDED tail after a COMPLETE sentence is still cleanly trimmed
+  //  (sentence kept, link removed) — the guard does NOT over-fire on legitimate stripping.
+  check("no over-fire: an appended '…או דרך הקישור.' after a complete sentence is trimmed to the clean sentence",
+    stripPhantomLinkWording("אפשר לבדוק את הזמינות שלך, או דרך הקישור.") === "אפשר לבדוק את הזמינות שלך.");
+  // The booked-claim guard itself is unchanged — it still BLOCKS genuine false "booking completed" claims.
+  check("booked-claim guard unchanged: genuine false claims still caught; safe recaps/offers still pass",
+    claimsBookingCompleted("מעולה! התור נקבע בהצלחה 🎉") === true
+    && claimsBookingCompleted("קבעתי לך תור מחר") === true
+    && claimsBookingCompleted("מה שכבר רשום אצלי: תספורת ביום חמישי") === false);
+  // CTA/link behavior unchanged: when a booking link IS attached this turn, the correction + label + URL all
+  //  compose normally (the URL lives in the button; the label + text-with-URL fallback survive).
+  check("CTA unchanged: correction + booking link compose normally (URL + label survive; URL in button only)",
+    (() => {
+      const url = "https://x/book/biz";
+      const a = attachPlatformLink(BOOKED_CLAIM_CORRECTION, "לקביעת תור:", url, null, "אני רוצה לקבוע תור");
+      return a.replyText.includes(url) && a.interactive?.kind === "cta_url" && a.interactive.url === url
+        && a.interactive.body.includes("לקביעת תור:") && !a.interactive.body.includes(url);
+    })());
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

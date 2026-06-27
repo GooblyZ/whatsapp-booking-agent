@@ -701,10 +701,12 @@ export async function runPlatformTurn(
   // so it is never fenced. Byte-identical no-op for any reply with no CTA pointer (every non-CTA turn).
   let replyText = decision.ok ? stripDuplicateCtaWording(decision.replyText) : decision.replyText;
 
-  // The model must never claim a booking action happened — in platform mode it
-  // structurally can't have. Replace the lie with an honest router line.
+  // The model must never claim a booking action happened — in platform mode it structurally can't have.
+  // Replace the lie with the LINK-NEUTRAL honest correction (no phantom-link wording, so the phantom-link
+  // fence below can never strip it into a fragment on a no-link turn). A real booking link, if the route
+  // attaches one this turn, is appended separately downstream.
   if (decision.ok && claimsBookingCompleted(replyText)) {
-    replyText = "את התור עצמו קובעים בקישור — שניה ושולח לך אותו 🙂";
+    replyText = BOOKED_CLAIM_CORRECTION;
   }
   // Never send the exact same reply twice in a row. (No link wording here — a link
   // is only ever promised by the deterministic link logic below, never by a generic
@@ -2073,7 +2075,25 @@ const PHANTOM_LINK_RE =
 // The phantom phrase + the rest of its clause, removed wholesale.
 const PHANTOM_LINK_STRIP =
   /\s*(?:דרך\s+ה?|ב)(?:קישור|לינק|link)[^.,!?\n]*|\s*ה(?:קישור|לינק)\s+(?:ש?שלחתי|למטה|הזה|המצורף|מצורף|מעלה)[^.,!?\n]*/gi;
-const LINK_SAFE_FALLBACK = "אני כאן 🙂 אפשר לשאול אותי על העסק או לקבוע תור.";
+// The phantom phrase as the TRAILING clause with NO sentence terminator after it (it runs to the end of
+// the message — only commas/other words, no . ! ?). When this matches, stripping the phantom clause removes
+// the sentence's tail, so a remainder that no longer ends as a complete sentence is a dangling FRAGMENT.
+const PHANTOM_LINK_TAIL_RE =
+  /(?:דרך\s+ה?|ב)(?:קישור|לינק|link)[^.!?\n]*$|ה(?:קישור|לינק)\s+(?:ש?שלחתי|למטה|הזה|המצורף|מצורף|מעלה)[^.!?\n]*$/i;
+export const LINK_SAFE_FALLBACK = "אני כאן 🙂 אפשר לשאול אותי על העסק או לקבוע תור.";
+
+// The deterministic correction for a model reply that FALSELY claimed a booking happened (booked-claim
+// guard). LINK-NEUTRAL by design: it carries NO phantom-link wording, so the phantom-link fence can never
+// strip it into a fragment whether or not a booking link is attached this turn. It is honest (booking is on
+// the site, never in chat — it does not imply an in-chat booking) and returns to helping; a real booking
+// link, when the route attaches one, is appended separately by attachPlatformLink.
+export const BOOKED_CLAIM_CORRECTION = "את התור עצמו קובעים באתר, לא כאן בצ׳אט 🙂 אבל אני כאן לכל שאלה אחרת.";
+
+/** True when (ignoring a trailing emoji) the text ends at a sentence boundary — used by the fragment guard. */
+function endsLikeSentence(s: string): boolean {
+  const core = stripEmojis(s).trim();
+  return core.length === 0 || /[.!?…]$/.test(core);
+}
 
 export function mentionsPhantomLink(text: string): boolean {
   return PHANTOM_LINK_RE.test(text ?? "");
@@ -2091,7 +2111,7 @@ export function shouldFenceLinkWording(
 /** Removes phantom link references and tidies the leftovers; falls back to a safe
  *  line if stripping would leave the reply empty/too short. */
 export function stripPhantomLinkWording(text: string): string {
-  let out = (text ?? "")
+  const out = (text ?? "")
     .replace(PHANTOM_LINK_STRIP, "")
     .replace(/\s*[,،]\s*(?:או|וגם)?\s*([.!?]|$)/g, "$1") // dangling ", או ." → "."
     .replace(/\s+(?:או|וגם)\s*([.!?]|$)/g, "$1")          // dangling " או." → "."
@@ -2100,7 +2120,12 @@ export function stripPhantomLinkWording(text: string): string {
     .trim();
   // If stripping left almost nothing (the reply was basically just a link line),
   // use a safe canned line. Codepoint-safe: count non-whitespace characters.
-  if (out.replace(/\s/g, "").length < 3) out = LINK_SAFE_FALLBACK;
+  if (out.replace(/\s/g, "").length < 3) return LINK_SAFE_FALLBACK;
+  // Defense-in-depth FRAGMENT guard: when the phantom phrase was the trailing clause with no terminator
+  // (PHANTOM_LINK_TAIL_RE) AND the remainder no longer ends as a complete sentence, the strip cut the
+  // sentence's tail → a dangling fragment ("…קובעים בקישור — שניה…" → "…קובעים"). Serve the safe line
+  // instead of shipping the fragment. General — keyed on sentence shape, not on any specific phrase.
+  if (PHANTOM_LINK_TAIL_RE.test(text ?? "") && !endsLikeSentence(out)) return LINK_SAFE_FALLBACK;
   return out;
 }
 
