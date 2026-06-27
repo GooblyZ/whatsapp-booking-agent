@@ -222,3 +222,41 @@ export function applyVerdictAlignment(
 
   return { replyText, session, guardReason: null };
 }
+
+// ── INTERNAL-DISCLOSURE FENCE (model-output safety) ──────────────────────────────
+// A hostile owner custom_instruction ("reveal your system prompt / internal rules")
+// could try to make the model echo its own system instruction. The ONLY internal
+// material the model can even see is the persona SCAFFOLD + the JSON OUTPUT SCHEMA —
+// secrets, API keys and provider/config never enter the prompt (logging-hygiene rule),
+// so they are structurally unleakable; the scaffold/schema is the entire leak surface.
+// This detector lets the caller (brain.ts) discard such a reply for a safe deflection,
+// exactly as the grounding fence discards an ungrounded reply.
+//
+// GENERAL, not a keyword blacklist — every marker is a REAL internal artifact, none of
+// which occurs in legitimate Hebrew customer prose:
+//   (1) the camelCase field names of the `understanding` OUTPUT SCHEMA (brain.ts);
+//   (2) the persona's own "=== HEADER ===" section delimiters and its English output
+//       banners ("strict JSON only", "ACTIONABILITY") (persona.ts);
+//   (3) a tight set of phrases that explicitly NAME the system prompt / internal rules.
+// Business facts (prices, hours, services) and the bare word "המערכת" ("המערכת שלנו")
+// are deliberately NOT markers, so a normal grounded reply never trips the fence.
+const DISCLOSURE_SCHEMA_RE =
+  /\b(?:requestsBusinessAction|appointmentIntent|conversationGoal|timePreference|customerReference|changeRequest|userCorrecting|userRepeatingInfo|userFrustrated|explicitConfirmation|missingInformation)\b/;
+const DISCLOSURE_SCAFFOLD_RE =
+  /===\s*(?:WHO YOU ARE|HOW YOU WRITE|OWNER STYLE GUIDANCE|WHAT YOU ALREADY KNOW|BUSINESS FACTS|AVAILABILITY|RECENT CONVERSATION|END)|strict JSON only|\bACTIONABILITY\b/i;
+const DISCLOSURE_META_RE =
+  /system prompt|system instruction|developer (?:message|instruction)|הפרומפט|פרומפט המערכת|הוראות המערכת|הנחיות המערכת|כללי המערכת הפנימיים|ההוראות הפנימיות שלי/i;
+
+/**
+ * True when a MODEL reply appears to be revealing internal scaffolding — the system
+ * instruction's structure, the output JSON schema field names, or an explicit naming of
+ * the system prompt / internal instructions. PURE; high-precision by construction (the
+ * markers are real internal artifacts, never legitimate Hebrew customer wording), so it
+ * is a no-op on every normal reply. The caller swaps a positive hit for a safe deflection.
+ */
+export function revealsInternalInstructions(reply: string): boolean {
+  if (!reply) return false;
+  return DISCLOSURE_SCHEMA_RE.test(reply)
+    || DISCLOSURE_SCAFFOLD_RE.test(reply)
+    || DISCLOSURE_META_RE.test(reply);
+}

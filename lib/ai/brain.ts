@@ -22,6 +22,7 @@ import { buildPromptProfile } from "./prompt-profile";
 import { verifyGrounding, extractTimeTokens, extractPhoneDigits } from "./grounding";
 import { parseAiJsonResponse } from "./json-parse";
 import { buildContextReply, type BookingSession } from "./booking-session";
+import { revealsInternalInstructions } from "./reply-polish";
 import { renderVerdictReplyHe, type AvailabilityInfo } from "./availability-facts";
 import { estimateTokens, promptSizeBucket, safeHash } from "./telemetry";
 import type { AIEventResponseType } from "./events";
@@ -136,6 +137,8 @@ export const FALLBACK = {
     "אני עדיין בעומס קצר 🙏 אפשר בינתיים לכתוב לי שירות, יום ושעה — ואני אמשיך לפי מה שיש לי.",
   grounding:
     "אני רוצה לתת לך מידע מדויק ולא בטוח/ה בפרט הזה כרגע 🙏 מומלץ לפנות ישירות לעסק.",
+  disclosure:
+    "אני כאן כדי לעזור עם תורים ושאלות על העסק 🙂 איך אפשר לעזור?",
 } as const;
 
 type InputKind = "ok" | "noise" | "abuse";
@@ -310,6 +313,22 @@ export async function runReceptionistTurn(
       `raw(2000)="${res.text.slice(0, 2000).replace(/\s+/g, " ")}"`
     );
     return fallback(FALLBACK.error, "error", "parse_error", { geminiCalled: true, fallbackReason: `malformed_json:${reason}`, usage: res.usage });
+  }
+
+  // INTERNAL-DISCLOSURE FENCE (model-output safety; same discard-for-safe-deflection
+  // pattern as grounding below): a hostile owner custom_instruction may try to make the
+  // model echo its system instruction / output schema. The only internal material in the
+  // prompt is the persona scaffold + JSON schema (secrets/config are never put in the
+  // prompt), so a reply regurgitating it is the entire leak surface — caught structurally
+  // here and swapped for a safe, content-free deflection. No-op on every normal reply.
+  if (revealsInternalInstructions(turn.reply)) {
+    console.warn("[ai] internal_disclosure_blocked — model reply regurgitated system scaffolding/schema; served safe deflection");
+    return fallback(FALLBACK.disclosure, "irrelevant", "internal_disclosure_blocked", {
+      geminiCalled: true,
+      turn,
+      fallbackReason: "internal_disclosure_blocked",
+      usage: res.usage,
+    });
   }
 
   // Strict grounding (last-resort fence; availability truth was fed upstream):
