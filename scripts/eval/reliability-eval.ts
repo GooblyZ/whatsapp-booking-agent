@@ -2304,6 +2304,66 @@ async function main(): Promise<void> {
   check("Invariant(d) fail-open: unreadable settings → outbound sends the text UNMODIFIED (no booking/safety behavior depends on settings)",
     (await applyOutboundSettings(throwingDb, "biz", "הקישור לקביעת תור נשלח 🙂")) === "הקישור לקביעת תור נשלח 🙂");
 
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 35. PROVIDER POLICY CONTRACT — Gemini 503 / retry / strikes / degraded / outage / recovery.
+  // ════════════════════════════════════════════════════════════════════════════════
+  // CONTRACT (the canonical reference for the provider reliability policy; this is an AI-FIRST product —
+  // deterministic mode is a SAFETY NET, not the experience). The strike math, the operating-state
+  // resolver, the transient-continuity plan and the error taxonomy are already proven in §17/§18/§26/§27;
+  // this section is the NAMED contract that asserts the not-yet-covered clauses and records the gaps.
+  //
+  //   1.  One transient overload (strike 1–2/3) KEEPS the AI experience — never full deterministic menu.
+  //   2.  A single inbound retries at most once, on OVERLOAD only (503/429/'high demand'); other errors don't retry.
+  //   3.  Outage = OVERLOAD_STRIKES (3) consecutive overloaded inbounds within STRIKE_WINDOW_MS (90s) → cooldown → deterministic.
+  //   4.  During degraded/outage an EXPLICIT booking/manage op still routes to the correct LINK; never silence.
+  //   5.  Any successful call FULLY resets strikes/window/cooldown (conservative half-open recovery, not sticky).
+  //   6.  Stale strikes EXPIRE (older than the window restarts the count) — no permanent accumulation, no flapping.
+  //   7.  Owner-disabled AI and missing config are TRUE deterministic mode (intentional; override provider health).
+  //   8.  Malformed JSON / parse errors STAY AI-first (soft fallback, no strike, no menu) — a model hiccup ≠ outage.
+  //   9.  Superseded turns never retry and never strike (no burst amplification of an incident).
+  //   10. Persistent latency/timeouts must not silently degrade forever (see the C10 gap below — Stage-2 Step-2 candidate).
+  //   11. Every provider failure + the resulting customer fallback are observable (covered by §27 telemetry helpers).
+  section("35. Provider policy contract — AI-first 503/retry/strike/outage/recovery (named)");
+  // C1+C3+C7 — strike-walk: 0/1/2 strikes stay AI-lane; 3 (with cooldown) → deterministic outage; owner-disabled overrides ALL.
+  check("C1+C3+C7 strike-walk: 0/1/2 strikes stay AI-first; 3 (cooldown) → deterministic outage; owner-disabled overrides every level",
+    (() => {
+      const aiOk = { aiEnabled: true, geminiConfigured: true };
+      const deterministicAt = (s: number, cooling: boolean) =>
+        isDeterministicState(resolveOperatingState({ ...aiOk, providerCoolingDown: cooling, providerHealth: providerHealthFromCounters(s, cooling ? 60_000 : 0) }));
+      const aiFirst = !deterministicAt(0, false) && !deterministicAt(1, false) && !deterministicAt(2, false);
+      const outage = deterministicAt(3, true);
+      const ownerWins = [0, 1, 2, 3].every((s) =>
+        resolveOperatingState({ aiEnabled: false, geminiConfigured: true, providerCoolingDown: s >= 3, providerHealth: providerHealthFromCounters(s, s >= 3 ? 60_000 : 0) }) === "owner_ai_disabled");
+      return aiFirst && outage && ownerWins;
+    })());
+  // C2 — the retry/strike TRIGGER is OVERLOAD-only. 503/'high demand' is the retried+counted class; a non-503 5xx is
+  //      classified 'server' (≠ 'overloaded'), and TODAY is neither retried nor counted (the basis of the C10 gap).
+  check("C2 retry/strike trigger is overload-only: 503/'high demand' → overloaded; non-503 5xx (500/502/504) → server (not retried/counted today)",
+    classifyGeminiError(503) === "overloaded" && classifyGeminiError(200, "high demand") === "overloaded"
+    && classifyGeminiError(500) === "server" && classifyGeminiError(502) === "server" && classifyGeminiError(504) === "server");
+  // C4 — degraded/outage still routes an EXPLICIT booking/manage operation to the right LINK; a loose service word does NOT.
+  check("C4 degraded/outage routes an explicit op to a LINK: booking→booking, cancel/reschedule→manage",
+    classifyDegradedIntent("אני רוצה לקבוע תור") === "booking"
+    && classifyDegradedIntent("אני רוצה לבטל את התור") === "manage"
+    && classifyDegradedIntent("אני רוצה לשנות את התור שלי") === "manage");
+  check("C4 the degraded path NEVER infers booking from a loose service word — only an explicit op verb (else neutral menu)",
+    classifyDegradedIntent("פן") === "menu" && classifyDegradedIntent("נראלי קצר") === "menu");
+  // C5+C6 — a success fully resets the breaker; a strike older than the 90s window restarts at 1 (no sticky outage).
+  check("C5+C6 recovery/window: a success fully resets health (healthy/0/0); a strike past the 90s window restarts at 1 (no sticky outage)",
+    (() => {
+      resetGeminiHealth();
+      const h = getGeminiHealth();
+      const T = 1_700_000_000_000;
+      return h.state === "healthy" && h.strikes === 0 && h.cooldownRemainingMs === 0
+        && nextStrikeCount(2, T, T + STRIKE_WINDOW_MS + 1) === 1 && strikesTripOutage(1) === false;
+    })());
+  // C10 — THE biggest risk, recorded honestly (not a failure): timeouts & non-503 5xx bypass the breaker today.
+  gap("C10 (biggest risk): timeouts & non-503 5xx are 'server'/'unknown' (≠ 'overloaded') → today NEITHER retried NOR counted",
+    "A persistent slow/timeout incident degrades every turn (~12s REQUEST_TIMEOUT_MS) with NO protective cooldown — the documented Stage-2 Step-2 hardening candidate (retry jitter + a gentle timeout/5xx breaker and/or a shorter timeout). The 503/overload path is unchanged and correct; this is the next runtime task, separately approved.");
+  // C8/C9 — brain/gemini branch-mapping, only assertable end-to-end.
+  gap("C8/C9 are integration-level (Phase 5 runPlatformTurn / mocked-provider harness — see §20)",
+    "C8 'malformed JSON stays AI-first (no strike, no menu)' (parse_error → ai_error soft fallback, not in the cooldown path) and C9 'superseded turns never retry/strike' (abortIfSuperseded / abort signal) are brain/gemini branch properties, not reachable through the pure seams here. Assert them in the mocked-provider integration harness.");
+
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
   console.log("(GAP lines are intentional known limitations, not failures — they scope the next reliability work.)");
