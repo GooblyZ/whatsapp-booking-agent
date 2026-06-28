@@ -55,6 +55,40 @@ const LEGACY_TONE_PROFILE: Record<string, string> = {
     "Relaxed, like texting a friendly acquaintance. Short loose sentences, light slang is fine, zero ceremony — the whole rhythm is laid-back.",
 };
 
+// ── STATIC ZONE: OUTPUT / RELEVANCE CONTRACT ─────────────────────────────────────
+// Fully static (no per-turn data) — the JSON output schema + the ACTIONABILITY rule. Extracted as a named
+// constant so the static "shell" is explicit in code (Stage 3B zone separation) and so the relevance contract
+// has ONE home to evolve (Phase 5 — business-FAQ vs out-of-scope). Spread verbatim at the END of the prompt;
+// byte-identical to the previous inline text (locked by the reliability-eval shell hash).
+const OUTPUT_CONTRACT: string[] = [
+  `OUTPUT — strict JSON only (no markdown, no code fences). Craft "reply" first, as the receptionist; the metadata afterwards is bookkeeping for the system:`,
+  `{`,
+  `  "reply": "the full message to the customer — the only thing they see",`,
+  `  "understanding": {`,
+  `    "conversationGoal": "short phrase — what the customer is trying to achieve, or null",`,
+  `    "requestsBusinessAction": true or false  (decide this FIRST — see ACTIONABILITY below),`,
+  `    "intent": "smalltalk | faq | meta | booking | cancel_request | reschedule_request | out_of_scope | unclear",`,
+  `    "appointmentIntent": "NONE | BOOK | RESCHEDULE | CANCEL | MODIFY | LIST",`,
+  `    "serviceName": "service in play, or null",`,
+  `    "dateText": "day phrase used (e.g. 'מחר', 'שבוע הבא ביום שני'), or null",`,
+  `    "time": "concrete 24h HH:MM if stated (e.g. 'בחמש' afternoon → '17:00'), or null",`,
+  `    "timePreference": "softer preference ('בערב'), or null",`,
+  `    "customerReference": "who it's for if not the sender, or null",`,
+  `    "changeRequest": "service | day | time | null — when they want a DIFFERENT value for a detail of the CURRENT draft (not an existing appointment)",`,
+  `    "userCorrecting": true if they say you misunderstood/forgot,`,
+  `    "userRepeatingInfo": true if they repeat info already given,`,
+  `    "userFrustrated": true if they sound annoyed,`,
+  `    "explicitConfirmation": true ONLY if they just clearly confirmed the final summarized NEW booking`,
+  `  }`,
+  `}`,
+  `Fill understanding from the whole conversation. Never mention intents, JSON, or the system in "reply".`,
+  ``,
+  `ACTIONABILITY — classify by ONE question, decided BEFORE the intent: "Is the customer asking the business to PERFORM AN OPERATION on an appointment — create, reschedule, cancel, or list one — or asking to receive a specific service?" Judge by what they're trying to DO, not by which words appear.`,
+  `• YES → requestsBusinessAction=true. Set appointmentIntent to that operation (BOOK = a new appointment or a service they want to receive; RESCHEDULE / CANCEL / MODIFY = one they already have; LIST = show theirs) and intent to booking / reschedule_request / cancel_request.`,
+  `• NO → requestsBusinessAction=false and appointmentIntent=NONE — this is the DEFAULT. Telling you information (a trip, plans), describing a state or feeling, making small talk, asking ABOUT you (→ meta), giving an opinion, complaining, expressing confusion, or anything you are not SURE is an operation request — all NO.`,
+  `Uncertainty is NOT an operation: if you cannot name the operation being requested, set requestsBusinessAction=false and intent=unclear. Never pick BOOK "to be safe" — defaulting to booking on an ambiguous message is the specific mistake to avoid.`,
+];
+
 /** Builds the full system instruction. */
 export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaInput): string {
   const ai = ctx.aiSettings;
@@ -107,6 +141,15 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `TOMORROW ("מחר") is יום ${dayNameHe(tomorrowISO)} (${parseInt(d2, 10)}/${parseInt(m2, 10)}). ` +
     `These are the ONLY correct today/tomorrow facts — never derive the weekday from history or assumption.`;
 
+  // ── PROMPT ZONE MAP (Stage 3B) ───────────────────────────────────────────────
+  // The emitted prompt INTERLEAVES three logical zones, in this order:
+  //   • STATIC SHELL    — identity, conversation/honesty rules, appointments/platform contract, OUTPUT_CONTRACT
+  //   • OWNER STYLE      — WHO YOU ARE / HOW YOU WRITE / avoid (sourced from the normalized PromptProfile)
+  //   • DYNAMIC PER-TURN — dateAnchor, working memory, BUSINESS FACTS, history/transcript, reply guidance
+  // The output is deliberately NOT re-ordered into contiguous zones here: reordering a tuned prompt is a
+  // model-BEHAVIOR change that can't be verified by the deterministic eval, and its only payoff (prefix
+  // caching) is out of scope for now. The output-contract zone is extracted (OUTPUT_CONTRACT) and the static
+  // shell is hash-locked by reliability-eval §47, so future zone work can proceed safely from here.
   const lines = [
     identity,
     `You are a person having a conversation, not a system running a flow. Your job is the customer's experience: listen, react, help, improvise. Booking details are things you pick up naturally along the way — never a form you administer.`,
@@ -213,32 +256,8 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
       ? `SYSTEM NOTE FOR THIS REPLY:\n${p.replyGuidance}`
       : ``,
     ``,
-    `OUTPUT — strict JSON only (no markdown, no code fences). Craft "reply" first, as the receptionist; the metadata afterwards is bookkeeping for the system:`,
-    `{`,
-    `  "reply": "the full message to the customer — the only thing they see",`,
-    `  "understanding": {`,
-    `    "conversationGoal": "short phrase — what the customer is trying to achieve, or null",`,
-    `    "requestsBusinessAction": true or false  (decide this FIRST — see ACTIONABILITY below),`,
-    `    "intent": "smalltalk | faq | meta | booking | cancel_request | reschedule_request | out_of_scope | unclear",`,
-    `    "appointmentIntent": "NONE | BOOK | RESCHEDULE | CANCEL | MODIFY | LIST",`,
-    `    "serviceName": "service in play, or null",`,
-    `    "dateText": "day phrase used (e.g. 'מחר', 'שבוע הבא ביום שני'), or null",`,
-    `    "time": "concrete 24h HH:MM if stated (e.g. 'בחמש' afternoon → '17:00'), or null",`,
-    `    "timePreference": "softer preference ('בערב'), or null",`,
-    `    "customerReference": "who it's for if not the sender, or null",`,
-    `    "changeRequest": "service | day | time | null — when they want a DIFFERENT value for a detail of the CURRENT draft (not an existing appointment)",`,
-    `    "userCorrecting": true if they say you misunderstood/forgot,`,
-    `    "userRepeatingInfo": true if they repeat info already given,`,
-    `    "userFrustrated": true if they sound annoyed,`,
-    `    "explicitConfirmation": true ONLY if they just clearly confirmed the final summarized NEW booking`,
-    `  }`,
-    `}`,
-    `Fill understanding from the whole conversation. Never mention intents, JSON, or the system in "reply".`,
-    ``,
-    `ACTIONABILITY — classify by ONE question, decided BEFORE the intent: "Is the customer asking the business to PERFORM AN OPERATION on an appointment — create, reschedule, cancel, or list one — or asking to receive a specific service?" Judge by what they're trying to DO, not by which words appear.`,
-    `• YES → requestsBusinessAction=true. Set appointmentIntent to that operation (BOOK = a new appointment or a service they want to receive; RESCHEDULE / CANCEL / MODIFY = one they already have; LIST = show theirs) and intent to booking / reschedule_request / cancel_request.`,
-    `• NO → requestsBusinessAction=false and appointmentIntent=NONE — this is the DEFAULT. Telling you information (a trip, plans), describing a state or feeling, making small talk, asking ABOUT you (→ meta), giving an opinion, complaining, expressing confusion, or anything you are not SURE is an operation request — all NO.`,
-    `Uncertainty is NOT an operation: if you cannot name the operation being requested, set requestsBusinessAction=false and intent=unclear. Never pick BOOK "to be safe" — defaulting to booking on an ambiguous message is the specific mistake to avoid.`,
+    // ── STATIC ZONE (tail): output/relevance contract — fully static, named const above. ──
+    ...OUTPUT_CONTRACT,
   ];
 
   return lines.filter((l) => l !== ``).join("\n");
