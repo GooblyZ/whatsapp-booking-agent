@@ -77,7 +77,8 @@ import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../l
 import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
 import { PERSONA_PRESETS } from "../../lib/ai/persona-presets";
 import { flagsBusinessPolicy } from "../../app/dashboard/ai-assistant/policy-lint";
-import type { AISettings, BusinessAIContext } from "../../types/database";
+import { resolveStyleProfile } from "../../lib/ai/resolve-style-profile";
+import type { AISettings, AISettingsEmojiUsage, AISettingsResponseLength, BusinessAIContext } from "../../types/database";
 import { buildReceptionistInstruction } from "../../lib/ai/persona";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
@@ -3583,6 +3584,102 @@ async function main(): Promise<void> {
     PERSONA_PRESETS.every((p) => flagsBusinessPolicy(p.text).length === 0 && flagsBusinessPolicy(p.label).length === 0));
   check("policy-lint is advisory-safe on empty/whitespace/null (no flags, never throws)",
     flagsBusinessPolicy("").length === 0 && flagsBusinessPolicy("   ").length === 0 && flagsBusinessPolicy(null).length === 0);
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 55. resolveStyleProfile (Phase B1 FOUNDATION) — pure compiler that turns AI Settings into ONE structured,
+  //     non-contradictory style profile. NOT wired into the live prompt/hash yet: this section locks the
+  //     preset vectors, the explicit-override metadata, fail-open defaults, the injected policy advisory, and
+  //     the decoupled resolved hash. §47 (shell byte-stable) elsewhere in this file proves the live prompt
+  //     is unchanged by this addition.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("55. resolveStyleProfile (Phase B1) — structured style vectors, explicit overrides, fail-open, decoupled hash");
+  {
+    const presetText = (id: string) => PERSONA_PRESETS.find((p) => p.id === id)?.text ?? "";
+    const aiset = (o: Partial<AISettings>): Partial<AISettings> => ({ emoji_usage: "low", response_length: "medium", language: "he", ...o });
+
+    // (1) Each shipped preset resolves to its expected structured vector + register + emoji default.
+    check("§55 presets → structured vectors (casual: low formality/high energy/casual; professional: high formality/calm/none)",
+      (() => {
+        const casual = resolveStyleProfile(aiset({ custom_instructions: presetText("casual"), emoji_usage: "low" }));
+        const pro = resolveStyleProfile(aiset({ custom_instructions: presetText("professional"), emoji_usage: "none" }));
+        return casual.preset === "casual" && casual.vector.formality === 2 && casual.vector.energy === 4 && casual.register === "casual" && casual.overrides.emoji === false
+          && pro.preset === "professional" && pro.vector.formality === 4 && pro.vector.energy === 2 && pro.register === "formal" && pro.emojiCap === 0;
+      })());
+    check("§55 all five shipped presets are recognized (none fall through to 'custom')",
+      PERSONA_PRESETS.every((p) => resolveStyleProfile(aiset({ custom_instructions: p.text })).preset === p.id));
+
+    // (2) Existing DB enums are supported end-to-end.
+    check("§55 existing DB enums supported (emoji none/low/medium → cap 0/1/2; length short/medium/long → brevity 5/3/1)",
+      (() => {
+        const cap = (u: AISettingsEmojiUsage) => resolveStyleProfile(aiset({ emoji_usage: u })).emojiCap;
+        const brev = (l: AISettingsResponseLength) => resolveStyleProfile(aiset({ response_length: l })).vector.brevity;
+        return cap("none") === 0 && cap("low") === 1 && cap("medium") === 2 && brev("short") === 5 && brev("medium") === 3 && brev("long") === 1;
+      })());
+
+    // (3) Fail-open to safe neutral defaults on null/invalid input.
+    check("§55 fail-open: null + invalid enums → safe neutral defaults (preset 'default', neutral vector, emoji cap 1, length medium)",
+      (() => {
+        const n = resolveStyleProfile(null);
+        const bad = resolveStyleProfile({ emoji_usage: "rainbow", response_length: "epic", custom_instructions: null } as unknown as Partial<AISettings>);
+        return n.preset === "default" && n.vector.formality === 3 && n.emojiCap === 1 && n.responseLength === "medium"
+          && bad.emojiCap === 1 && bad.responseLength === "medium";
+      })());
+
+    // (4) Explicit emoji/length choices OVERRIDE preset defaults, and the contradiction is made explicit.
+    check("§55 explicit emoji override: casual(default low) + 'none' → cap 0 + overrides.emoji + emoji_override warning",
+      (() => {
+        const r = resolveStyleProfile(aiset({ custom_instructions: presetText("casual"), emoji_usage: "none" }));
+        return r.emojiCap === 0 && r.overrides.emoji === true && r.warnings.some((w) => w.kind === "emoji_override");
+      })());
+    check("§55 explicit emoji override: professional(default none) + 'medium' → cap 2 + override flagged (differs from preset default)",
+      (() => {
+        const r = resolveStyleProfile(aiset({ custom_instructions: presetText("professional"), emoji_usage: "medium" }));
+        return r.emojiCap === 2 && r.overrides.emoji === true && r.warnings.some((w) => w.kind === "emoji_override");
+      })());
+    check("§55 explicit length override: concise(default short) + 'long' → brevity 1 + overrides.length + length_override warning",
+      (() => {
+        const r = resolveStyleProfile(aiset({ custom_instructions: presetText("concise"), response_length: "long" }));
+        return r.vector.brevity === 1 && r.overrides.length === true && r.warnings.some((w) => w.kind === "length_override");
+      })());
+
+    // (5) custom vs known: free-text style is preserved as styleNotes; a known preset carries no notes.
+    check("§55 custom text → preset 'custom' + styleNotes preserved verbatim; known preset → styleNotes null (vector carries it)",
+      (() => {
+        const custom = resolveStyleProfile(aiset({ custom_instructions: "מדבר כמו חבר ותיק, בלי רשמיות" }));
+        const known = resolveStyleProfile(aiset({ custom_instructions: presetText("warm") }));
+        return custom.preset === "custom" && custom.styleNotes === "מדבר כמו חבר ותיק, בלי רשמיות" && known.preset === "warm" && known.styleNotes === null;
+      })());
+
+    // (6) Policy-in-style advisory via the INJECTED Phase-A0 lint (resolver stays decoupled + never rewrites).
+    check("§55 policy advisory: injected lint flags business-policy in styleNotes; notes preserved verbatim (non-blocking)",
+      (() => {
+        const notes = "בלי סלנג, ואל תדבר על מחירים או על ביטול";
+        const r = resolveStyleProfile(aiset({ custom_instructions: notes }), { detectPolicy: flagsBusinessPolicy });
+        return r.preset === "custom" && r.styleNotes === notes && r.warnings.some((w) => w.kind === "policy_in_style_notes");
+      })());
+    check("§55 without an injected detector → NO policy warning (resolver is decoupled from the dashboard lint)",
+      resolveStyleProfile(aiset({ custom_instructions: "אל תיתן הנחות" })).warnings.every((w) => w.kind !== "policy_in_style_notes"));
+
+    // (7) Resolved hash: moves on a STYLE change, stable on identical input, and IGNORES non-style fields (name).
+    check("§55 resolvedHash: stable on identical input; CHANGES on a style change (emoji); STABLE on a non-style change (assistant_name)",
+      (() => {
+        const base = resolveStyleProfile(aiset({ custom_instructions: presetText("warm"), emoji_usage: "low" }));
+        const again = resolveStyleProfile(aiset({ custom_instructions: presetText("warm"), emoji_usage: "low" }));
+        const styleChanged = resolveStyleProfile(aiset({ custom_instructions: presetText("warm"), emoji_usage: "medium" }));
+        const nameChanged = resolveStyleProfile(aiset({ custom_instructions: presetText("warm"), emoji_usage: "low", assistant_name: "מיקה" }));
+        return base.resolvedHash === again.resolvedHash && base.resolvedHash !== styleChanged.resolvedHash && base.resolvedHash === nameChanged.resolvedHash;
+      })());
+    check("§55 resolvedHash is DECOUPLED from the live promptProfileHash (separate mechanisms, not the runtime hash)",
+      (() => {
+        const settings = aiset({ custom_instructions: presetText("warm") });
+        return resolveStyleProfile(settings).resolvedHash !== buildPromptProfile(settings, "biz").promptProfileHash;
+      })());
+
+    // (8) Determinism/purity: identical input → byte-identical resolved profile (no side effects, no throw).
+    check("§55 resolver is deterministic + pure (same input → identical resolved profile incl. warnings)",
+      JSON.stringify(resolveStyleProfile(aiset({ custom_instructions: presetText("premium"), emoji_usage: "none" })))
+        === JSON.stringify(resolveStyleProfile(aiset({ custom_instructions: presetText("premium"), emoji_usage: "none" }))));
+  }
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
