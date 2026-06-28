@@ -76,6 +76,7 @@ import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, cou
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
 import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
 import { PERSONA_PRESETS } from "../../lib/ai/persona-presets";
+import { flagsBusinessPolicy } from "../../app/dashboard/ai-assistant/policy-lint";
 import type { AISettings, BusinessAIContext } from "../../types/database";
 import { buildReceptionistInstruction } from "../../lib/ai/persona";
 import { verifyGrounding } from "../../lib/ai/grounding";
@@ -3563,6 +3564,25 @@ async function main(): Promise<void> {
   }
   gap("§53 live limit: the harness proves the persona REACHES the model and is structurally distinct + safe — NOT that Gemini realizes the tone",
     "Whether 'צעיר וקליל' actually reads more casual than 'מקצועי ורגוע' in the live reply is model-judged and belongs to a small optional live probe (set two presets, send the same FAQ, compare warmth). The deterministic gate locks: persona reaches the prompt/profile, hashes differ, fences differ, and routing/links/booking-manage/out-of-scope/hostile behavior stay invariant.");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 54. AI-Settings POLICY-LINT (Phase A0, UI advisory) — flags free-text STYLE fields that read like a
+  //     business RULE/FACT (prices/appointments/cancellation) so the dashboard can nudge the owner toward
+  //     the Knowledge Base. PURE + advisory: never blocks save, never edits text, NOT used by the runtime
+  //     or the Gemini prompt. This locks the heuristic and proves it never false-positives on the shipped presets.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("54. AI-Settings policy-lint (UI advisory) — flags business-rule text in style fields; never the shipped presets");
+  check("policy-lint FLAGS business-policy phrasing (prices / appointments / accepting clients / cancellation)",
+    flagsBusinessPolicy("אל תבטיח תורים ואל תיתן הנחות").length > 0
+    && flagsBusinessPolicy("לא לדבר על מחיר").length > 0
+    && flagsBusinessPolicy("לא לקבל לקוחות חדשים").length > 0
+    && flagsBusinessPolicy("אסור לדבר על ביטול").length > 0);
+  check("policy-lint does NOT flag clean STYLE guidance (wording/tone-only avoidances)",
+    flagsBusinessPolicy("בלי סלנג, לא להיות מכירתי מדי, לא להאריך מדי").length === 0);
+  check("policy-lint does NOT flag any shipped persona preset (built-ins are style-only — no false positive on selection)",
+    PERSONA_PRESETS.every((p) => flagsBusinessPolicy(p.text).length === 0 && flagsBusinessPolicy(p.label).length === 0));
+  check("policy-lint is advisory-safe on empty/whitespace/null (no flags, never throws)",
+    flagsBusinessPolicy("").length === 0 && flagsBusinessPolicy("   ").length === 0 && flagsBusinessPolicy(null).length === 0);
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

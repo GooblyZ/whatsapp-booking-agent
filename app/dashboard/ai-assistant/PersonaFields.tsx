@@ -17,6 +17,7 @@
 import { useState, useTransition } from "react";
 import type { AISettings } from "@/types/database";
 import { PERSONA_PRESETS } from "@/lib/ai/persona-presets";
+import { flagsBusinessPolicy } from "./policy-lint";
 import { enhancePersonaAction } from "./actions";
 
 type Gender = "neutral" | "female" | "male";
@@ -51,6 +52,12 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
   const [enhanceMsg, setEnhanceMsg] = useState<string | null>(null);
   const [enhanceOk, setEnhanceOk] = useState(false);
   const [pending, startTransition] = useTransition();
+  // Controlled so the policy-lint advisory can run live. Initial value = the saved text
+  // verbatim (Phase A0 never edits or remaps existing settings).
+  const [avoid, setAvoid] = useState(initial?.things_to_avoid ?? "");
+  // Advisory (non-blocking): does the free-text read like a business RULE/FACT rather than style?
+  const personalityPolicyHits = flagsBusinessPolicy(personality);
+  const avoidPolicyHits = flagsBusinessPolicy(avoid);
 
   // Seed the personality textarea from a preset. OVERWRITE SAFETY: an empty box fills
   // directly; a box that already has text is never silently replaced — the owner must
@@ -137,7 +144,9 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
         {/* PRESET CHOOSER (Slice 1) — seeds the textarea below with a ready voice paragraph.
             Voice only; the owner edits before saving. Overwrite-safe via applyPreset. */}
         <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-          <span style={hint}>אפשר להתחיל מתבנית מוכנה ולערוך אותה:</span>
+          <span style={hint}>
+            אפשר להתחיל מתבנית מוכנה ולערוך אותה. התבנית קובעת כיוון סגנון כללי; השדות בהמשך (אורך תשובות, אימוג׳י, הנחיות ניסוח) הם כוונון ידני נוסף מעל הכיוון הזה.
+          </span>
           <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
             {PERSONA_PRESETS.map((preset) => (
               <button
@@ -159,7 +168,7 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
           <textarea
             name="custom_instructions" value={personality}
             onChange={(e) => setPersonality(e.target.value)} rows={5} maxLength={2000}
-            placeholder="לדוגמה: ידידותי/ת ומקצועי/ת, עם קורטוב של הומור. אף פעם לא נשמע/ת כמו רובוט. גורם/ת ללקוחות להרגיש רצויים ומטופלים."
+            placeholder="לדוגמה: הסגנון צריך להיות חם, אישי ומקצועי, עם נגיעה של הומור — אנושי וזורם, אף פעם לא רובוטי."
             style={{ ...inputStyle, resize: "vertical" }}
           />
           <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
@@ -181,13 +190,14 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
           {enhanceMsg && (
             <span style={{ ...hint, color: enhanceOk ? "#0070f3" : "#9a3412" }}>{enhanceMsg}</span>
           )}
+          <PolicyHint hits={personalityPolicyHits} />
         </label>
       </fieldset>
 
       {/* WRITING STYLE — format; independent of personality. */}
       <fieldset style={fieldset}>
         <legend style={legend}>סגנון כתיבה</legend>
-        <p style={{ ...hint, margin: 0 }}>פורמט בלבד — לא תלוי באישיות. גם דמות רצינית וגם דמות מצחיקה יכולות לכתוב קצר.</p>
+        <p style={{ ...hint, margin: 0 }}>פורמט בלבד — כוונון ידני מעל כיוון התבנית, לא תלוי באישיות. גם דמות רצינית וגם דמות מצחיקה יכולות לכתוב קצר.</p>
         <label style={fieldWrap}>
           <span style={fieldLabel}>אורך תשובות</span>
           <select name="response_length" defaultValue={initial?.response_length ?? "medium"} style={inputStyle}>
@@ -220,17 +230,40 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
         <label style={fieldWrap}>
           <span style={fieldLabel}>דברים שכדאי לעוזר להימנע מהם בניסוח</span>
           <textarea
-            name="things_to_avoid" defaultValue={initial?.things_to_avoid ?? ""}
-            rows={3} maxLength={1000}
-            placeholder="לדוגמה: אל תדבר על רווחי העסק; אל תבטיח תורים; אל תיתן הנחות."
+            name="things_to_avoid" value={avoid}
+            onChange={(e) => setAvoid(e.target.value)} rows={3} maxLength={1000}
+            placeholder="לדוגמה: בלי סלנג; לא להיות מכירתי מדי; לא להאריך מדי."
             style={{ ...inputStyle, resize: "vertical" }}
           />
           <span style={hint}>
-            הנחיות כתיבה לעוזר — משפיעות על אופן הניסוח. זו אינה רשימת מילים אסורות, והיא אינה גוברת על כללי קביעת התור, האמת או הבטיחות של המערכת.
+            הנחיות ניסוח/טון בלבד. <b>מתאים כאן:</b> &quot;בלי סלנג&quot;, &quot;לא להיות מכירתי מדי&quot;, &quot;לא להאריך מדי&quot;.{" "}
+            <b>לא מתאים כאן:</b> מחירים, מי מתקבל כלקוח, כללי תורים, שירותים או מדיניות ביטול — אלה עובדות/כללים שמקומם ב
+            <a href="/dashboard/knowledge-base" style={{ color: "#0070f3" }}>בסיס הידע</a>, והגדרות כאן לא משנות אותם.
           </span>
+          <PolicyHint hits={avoidPolicyHits} />
         </label>
       </fieldset>
     </div>
+  );
+}
+
+// Non-blocking advisory: shown when a STYLE field contains text that reads like a business
+// rule/fact. It NEVER blocks saving and NEVER edits the text — it only nudges the owner toward
+// the Knowledge Base. Renders nothing when there are no flagged terms.
+function PolicyHint({ hits }: { hits: string[] }) {
+  if (hits.length === 0) return null;
+  return (
+    <span
+      role="note"
+      style={{
+        fontSize: "12px", lineHeight: 1.4, color: "#9a3412",
+        background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "6px", padding: "8px 10px",
+      }}
+    >
+      חלק מהטקסט נשמע כמו כלל עסקי או מידע (למשל מחירים, תורים או מדיניות) ולא כמו הנחיית סגנון.
+      הגדרות כאן משפיעות רק על סגנון הדיבור ולא משנות עובדות או כללים — מידע כזה עדיף להגדיר ב
+      <a href="/dashboard/knowledge-base" style={{ color: "#9a3412", fontWeight: 600 }}>בסיס הידע</a>.
+    </span>
   );
 }
 
