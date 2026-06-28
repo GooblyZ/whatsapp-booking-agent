@@ -3536,6 +3536,30 @@ async function main(): Promise<void> {
         r.modelCalled === false && r.outcome.decision.branch === "off_topic_capped",
         `model=${r.modelCalled} branch=${r.outcome.decision.branch}`);
     }
+
+    // ── GROUP D — VOICE-COMMITMENT ANCHOR (Slice 2): present ONLY with a persona, style-scoped + anti-
+    //    over-styling, never weakens the hard blocks, and leaves the default shell (§47 hash) unchanged. ──
+    const ANCHOR_MARK = "shapes HOW your replies feel";
+    const pAnchor = personaPrompt({ custom_instructions: casualText });
+    check("§53.D anchor present WHEN custom instructions exist; ABSENT in the default shell (so the §47 hash is unchanged)",
+      pAnchor.includes(ANCHOR_MARK) && !personaPrompt({}).includes(ANCHOR_MARK));
+    check("§53.D anchor sits inside WHO YOU ARE, BEFORE the style-only fence and the APPOINTMENTS platform block",
+      pAnchor.indexOf("=== WHO YOU ARE") < pAnchor.indexOf(ANCHOR_MARK)
+      && pAnchor.indexOf(ANCHOR_MARK) < pAnchor.indexOf(STYLE_FENCE)
+      && pAnchor.indexOf(STYLE_FENCE) < pAnchor.indexOf("APPOINTMENTS:"));
+    check("§53.D anchor is STYLE-SCOPED + anti-over-styling: caps openings/sign-offs/length, defers operational replies, never touches facts/links/routing/booking",
+      pAnchor.includes("do NOT add openings or greetings that aren't needed")
+      && pAnchor.includes("do NOT tack on a sign-off unless one is genuinely natural")
+      && pAnchor.includes("never make a reply longer just to show personality")
+      && pAnchor.includes("Operational and booking replies stay concise and factual")
+      && pAnchor.includes("never the facts, the links, the routing, the booking rules"));
+    check("§53.D anchor coexists with the hard blocks under a HOSTILE persona (booking-in-chat ban + booked-claim fence + style fence intact, above APPOINTMENTS)",
+      (() => {
+        const p = personaPrompt({ custom_instructions: HOSTILE_53 });
+        return p.includes(ANCHOR_MARK) && p.includes(STYLE_FENCE)
+          && /never inside this chat/.test(p) && /Never claim a booking/.test(p)
+          && p.indexOf(ANCHOR_MARK) < p.indexOf("APPOINTMENTS:");
+      })());
   }
   gap("§53 live limit: the harness proves the persona REACHES the model and is structurally distinct + safe — NOT that Gemini realizes the tone",
     "Whether 'צעיר וקליל' actually reads more casual than 'מקצועי ורגוע' in the live reply is model-judged and belongs to a small optional live probe (set two presets, send the same FAQ, compare warmth). The deterministic gate locks: persona reaches the prompt/profile, hashes differ, fences differ, and routing/links/booking-manage/out-of-scope/hostile behavior stay invariant.");

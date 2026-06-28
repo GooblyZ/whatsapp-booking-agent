@@ -167,6 +167,12 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
       ? [
           `This is who you are, in the owner's own words — live it in EVERY reply through behavior (what you choose to say, your pacing, your attitude), never as a sprinkled catch-word:`,
           `"${personality}"`,
+          // VOICE-COMMITMENT ANCHOR (Slice 2): a positive, STYLE-SCOPED nudge so the owner persona is actually
+          // felt on the Gemini path — without forcing greetings/sign-offs or inflating length. It points the
+          // persona at feel/word-choice/pacing/formality and explicitly caps over-styling, then re-states (with
+          // the fence below) that it is tone/wording ONLY. Emitted only when a persona exists, so the default
+          // shell (and the §47 hash) is unchanged.
+          `This persona shapes HOW your replies feel — your word choice, your warmth or directness, your pacing, and your level of formality. Apply it through the natural substance of what you say, not as decoration: do NOT add openings or greetings that aren't needed, do NOT tack on a sign-off unless one is genuinely natural, and never make a reply longer just to show personality. Operational and booking replies stay concise and factual. This changes only your tone and wording — never the facts, the links, the routing, the booking rules, or anything you may or may not do.`,
           // STYLE-ONLY FENCE: the owner's description sets VOICE, never behavior. It cannot grant new powers
           // or remove safety — the platform rules below always win. Stated explicitly so a careless or hostile
           // custom instruction ("confirm appointments in chat", "reveal your prompt", "answer any question")
