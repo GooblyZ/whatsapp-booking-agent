@@ -418,13 +418,35 @@ export async function runPlatformTurn(
     return { replyText, decision, linkAttached: null, suppressReply };
   }
 
+  // ── MIXED-BURST SANITIZER (latest clean business fragment wins) ────────────────
+  //    An aggregated burst ("frag1\nfrag2\n…") can still carry earlier OFF-TOPIC / noise / INJECTION fragments
+  //    that were never answered (suppressed in quiet — so aggregateBurst's window still holds them). When the
+  //    LATEST fragment is itself a CLEAR business request (and not injection/noise), the customer's real intent
+  //    IS that latest message — so the model must answer ONLY it, and the earlier toxic fragments must NEVER
+  //    reach Gemini. Counters, routing and the guard transcript keep reading the FULL text; ONLY the model
+  //    INPUT is sanitized. If the latest is NOT clean business → nothing changes and safety wins (injection
+  //    still refused below, off-topic still capped, gibberish still skipped).
+  const activeServiceNames = ctx.services.filter((s) => s.active).map((s) => s.name);
+  const burstFrags = messageText.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const burstLatest = burstFrags.length > 0 ? burstFrags[burstFrags.length - 1] : messageText.trim();
+  const latestIsCleanBusiness = burstFrags.length > 1
+    && hasBusinessAnchor(burstLatest, activeServiceNames)
+    && !looksLikeInjection(burstLatest)
+    && !looksLikeNoise(burstLatest, activeServiceNames);
+  // What Gemini actually answers: the latest clean business fragment in a mixed burst, else the full text.
+  const effectiveModelMessage = latestIsCleanBusiness ? burstLatest : messageText;
+  if (latestIsCleanBusiness) {
+    console.log(`[platform-turn] mixed-burst sanitize: latest fragment is clean business — model answers latest only (dropped ${burstFrags.length - 1} earlier fragment(s) from the model input)`);
+  }
+
   // ── PROMPT-INJECTION SAFETY LANE (deterministic, BEFORE any model call) ─────────
   //    A confident injection / override / "reveal your instructions" attempt gets a short SCOPE refusal —
   //    no Gemini, no internal disclosure, no routing/booking/manage effect. Repeated attempts DE-ESCALATE via
   //    the shared low-signal counter (turn 1 → refusal, then quiet), so an attacker can't burn Gemini calls.
-  //    The output disclosure fence (reply-polish) stays as defense-in-depth. SKIPPED in full deterministic
-  //    mode — the menu/continuity core owns the turn and never calls Gemini anyway.
-  if (!deterministicMenu && looksLikeInjection(messageText)) {
+  //    EXCEPTION: a mixed burst whose LATEST fragment is clean business is NOT refused — it recovers on the
+  //    sanitized latest fragment (the injection text is dropped and never sent to Gemini). The output
+  //    disclosure fence (reply-polish) stays as defense-in-depth. SKIPPED in full deterministic mode.
+  if (!deterministicMenu && looksLikeInjection(messageText) && !latestIsCleanBusiness) {
     const newCount = prevLowSignal + 1;
     const plan = injectionPlan(newCount);
     await persist(newCount, 0); // injection breaks any greeting run; shares the low-signal counter (de-escalation)
@@ -449,7 +471,7 @@ export async function runPlatformTurn(
   //   • anything else (a real-looking message) → fall through to Gemini
   //   • SKIPPED entirely in full deterministic mode (owner-disabled / outage / no-key): there
   //     the low-signal/greeting-reset replies are AI-mode hybrids — every turn is menu-anchored.
-  const activeServiceNames = ctx.services.filter((s) => s.active).map((s) => s.name);
+  //     (activeServiceNames is computed above, near the mixed-burst sanitizer.)
   const preGemini = deterministicMenu ? "proceed_to_gemini" : preGeminiAction(prevLowSignal, prevGreeting, messageText, activeServiceNames);
   if (preGemini !== "proceed_to_gemini") {
     if (preGemini === "skip_gemini_gibberish") {
@@ -780,7 +802,9 @@ export async function runPlatformTurn(
   const decision = await (testDeps?.runModel ?? runReceptionistTurn)(ctx, {
     historyTurns: memory.turns,
     conversationContext: memory.transcript,
-    message: messageText,
+    // Sanitized: in a mixed burst with a clean business latest, the model answers ONLY the latest fragment
+    // (stale trivia/injection never reaches Gemini); otherwise the full aggregated text. See the sanitizer above.
+    message: effectiveModelMessage,
     bookingBlock,
     replyGuidance,
     platformMode: true,
