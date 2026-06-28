@@ -16,6 +16,7 @@
 
 import { useState, useTransition } from "react";
 import type { AISettings } from "@/types/database";
+import { PERSONA_PRESETS } from "@/lib/ai/persona-presets";
 import { enhancePersonaAction } from "./actions";
 
 type Gender = "neutral" | "female" | "male";
@@ -50,6 +51,18 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
   const [enhanceMsg, setEnhanceMsg] = useState<string | null>(null);
   const [enhanceOk, setEnhanceOk] = useState(false);
   const [pending, startTransition] = useTransition();
+
+  // Seed the personality textarea from a preset. OVERWRITE SAFETY: an empty box fills
+  // directly; a box that already has text is never silently replaced — the owner must
+  // confirm a deliberate replace first (clear Hebrew copy). Presets are a starting point,
+  // not a lock: the seeded text is fully editable before saving.
+  function applyPreset(text: string) {
+    const hasText = personality.trim().length > 0;
+    if (hasText && !window.confirm("יש כבר תיאור אישיות. להחליף אותו בתבנית שנבחרה?")) return;
+    setPersonality(text);
+    setEnhanceMsg(null);
+    setEnhanceOk(false);
+  }
 
   function handleEnhance() {
     setEnhanceMsg(null);
@@ -121,6 +134,27 @@ export function PersonaFields({ initial }: { initial: AISettings | null }) {
         <p style={{ ...hint, margin: 0 }}>
           תאר/י את הקבלן/ית כמו שהיית מתאר/ת עובד/ת אמיתי/ת. במשפט-שניים — איך מדבר/ת, איך מתייחס/ת ללקוחות, מה האופי.
         </p>
+        {/* PRESET CHOOSER (Slice 1) — seeds the textarea below with a ready voice paragraph.
+            Voice only; the owner edits before saving. Overwrite-safe via applyPreset. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          <span style={hint}>אפשר להתחיל מתבנית מוכנה ולערוך אותה:</span>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+            {PERSONA_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => applyPreset(preset.text)}
+                style={{
+                  padding: "6px 12px", borderRadius: "999px", fontSize: "13px",
+                  border: "1px solid #cbd5e1", background: "#fff", color: "#334155",
+                  cursor: "pointer", fontWeight: 500,
+                }}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        </div>
         <label style={fieldWrap}>
           <textarea
             name="custom_instructions" value={personality}
