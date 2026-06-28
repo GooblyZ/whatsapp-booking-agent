@@ -85,7 +85,7 @@ import { saveOutboundMessage, buildOutboundRow, isMissingColumnError } from "../
 import { buildHistoryTurns, DEFLECTED_REASONS, OFF_TOPIC_REASON, type ConversationContext } from "../../lib/ai/conversation";
 import { FALLBACK, isLowValueAck, type ReceptionistTurn, type ReceptionistDecision } from "../../lib/ai/brain";
 import type { DB } from "../../lib/booking/helpers";
-import { buildFacts, formatFacts, type FactIndex, type BusinessFacts, type Capabilities } from "../../lib/ai/facts";
+import { buildFacts, formatFacts, scopeKnowledge, type FactIndex, type BusinessFacts, type Capabilities } from "../../lib/ai/facts";
 
 // ── tiny harness ────────────────────────────────────────────────────────────────
 let pass = 0;
@@ -3164,6 +3164,77 @@ async function main(): Promise<void> {
     const shellChars = personaPrompt({}).length;
     console.log(`  [baseline] static_shell_chars≈${shellChars} sample_facts_chars=${factsBlock.length} ` +
       `(facts grow with KB; Phase 3 scopes the KB line — full-KB fallback. estTokens shell≈${estimateTokens(shellChars)} facts≈${estimateTokens(factsBlock.length)})`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 48. CONSERVATIVE KB SCOPING (Stage 3B Phase 3) — drop only non-matching specific-category KB on a clear
+  //     single-topic question; ALWAYS keep about/faq + structured facts; full-KB fallback on any doubt. Goal:
+  //     cut the heaviest prompt line WITHOUT ever turning a real FAQ into a false "I don't know".
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("48. Conservative KB scoping — scope-when-safe, full-KB fallback");
+  // Large mixed KB fixture (each item's content is padded so the total exceeds the scope threshold).
+  const pad = (s: string) => `${s} `.repeat(40);
+  const KB = [
+    { active: true, category: "parking", title: "חניה", content: pad("חניון_בניין יש חניה בקומה תחתונה") },
+    { active: true, category: "policy", title: "ביטול", content: pad("ביטול_48 ביטול עד 48 שעות מראש") },
+    { active: true, category: "pricing", title: "מחירון", content: pad("מחיר_מיוחד יש הנחות לסטודנטים") },
+    { active: true, category: "contact", title: "יצירת קשר", content: pad("טלפון_נוסף אפשר גם בוואטסאפ") },
+    { active: true, category: "about", title: "עלינו", content: pad("אודות_העסק ותק של 10 שנים") },
+    { active: true, category: "faq", title: "שאלה", content: pad("שאלה_כללית מקבלים אשראי") },
+  ];
+  const kbScopeCtx = (over: Partial<{ kb: typeof KB }> = {}) => ({
+    business: { id: "biz", name: "עסק", slug: "biz", phone: "03-1", timezone: "Asia/Jerusalem", created_at: "", updated_at: "" },
+    businessSettings: { address: "הרצל 1", city: "תל אביב", booking_enabled: true },
+    aiSettings: { ai_enabled: true, emoji_usage: "none" },
+    services: SERVICES.map((name, i) => ({ id: `s${i}`, name, active: true, duration_minutes: 30, price: 80, description: null })),
+    knowledgeBaseItems: over.kb ?? KB,
+    businessHours: [0, 1, 2, 3, 4].map((d) => ({ day_of_week: d, is_closed: false, opens_at: "09:00", closes_at: "18:00" })),
+  } as unknown as BusinessAIContext);
+  // (1) A clear single-category question (parking) keeps about/faq + parking, drops OTHER specific categories.
+  check("scopeKnowledge: 'יש חנייה?' keeps parking+about+faq, drops policy/pricing/contact (scoped=true)",
+    (() => {
+      const r = scopeKnowledge(KB, "יש חנייה?");
+      const cats = r.kept.map((k) => k.category);
+      return r.scoped === true && cats.includes("parking") && cats.includes("about") && cats.includes("faq")
+        && !cats.includes("policy") && !cats.includes("pricing") && !cats.includes("contact");
+    })());
+  check("scopeKnowledge: 'מה מדיניות הביטול?' keeps policy+about+faq, drops parking (scoped=true)",
+    (() => {
+      const r = scopeKnowledge(KB, "מה מדיניות הביטול?");
+      const cats = r.kept.map((k) => k.category);
+      return r.scoped === true && cats.includes("policy") && cats.includes("about") && cats.includes("faq") && !cats.includes("parking");
+    })());
+  // (2) Structured-only topics (hours/prices/location), services, booking, and ambiguous → FULL KB (safe).
+  check("scopeKnowledge: hours/prices/location/services/booking/ambiguous → FULL KB (scoped=false)",
+    ["מתי פתוחים?", "כמה עולה תספורת?", "מה הכתובת?", "איזה שירותים יש?", "אני רוצה לקבוע תור", "מעולה"]
+      .every((m) => scopeKnowledge(KB, m).scoped === false && scopeKnowledge(KB, m).kept.length === KB.length));
+  // (3) Small KB → never scoped (no gain, no risk); about/faq always kept; kept never empty.
+  check("scopeKnowledge: a small KB is never scoped; about/faq always survive; kept never empty",
+    scopeKnowledge(KB.slice(0, 1), "יש חנייה?").scoped === false
+    && scopeKnowledge(KB, "יש חנייה?").kept.length > 0
+    && scopeKnowledge(KB, "יש חנייה?").kept.some((k) => k.category === "about" || k.category === "faq"));
+  // (4) buildFacts on the AI path (message) drops the non-matching content; the menu path (no message) keeps all.
+  check("buildFacts: parking question drops the policy KB content but keeps the parking KB content (AI path)",
+    (() => {
+      const block = formatFacts(buildFacts(kbScopeCtx(), { message: "יש חנייה?" }));
+      return block.includes("חניון_בניין") && !block.includes("ביטול_48");
+    })());
+  check("buildFacts: NO message (deterministic-menu path) keeps the FULL KB (parking AND policy present)",
+    (() => {
+      const block = formatFacts(buildFacts(kbScopeCtx()));
+      return block.includes("חניון_בניין") && block.includes("ביטול_48");
+    })());
+  // (5) FAQ-safety: structured answers (address/hours/price/services) are ALWAYS present even when scoping fires.
+  check("buildFacts: address/hours/price/services always present (structured) even on a scoped parking turn",
+    (() => {
+      const block = formatFacts(buildFacts(kbScopeCtx(), { message: "יש חנייה?" }));
+      return block.includes("הרצל 1") && block.includes("09:00-18:00") && block.includes("₪80") && block.includes(SERVICES[0]);
+    })());
+  // (6) before/after size instrumentation (info).
+  {
+    const full = formatFacts(buildFacts(kbScopeCtx())).length;
+    const scoped = formatFacts(buildFacts(kbScopeCtx(), { message: "יש חנייה?" })).length;
+    console.log(`  [kb-scope] parking turn: facts ${full}→${scoped} chars (−${full - scoped}); structured facts always kept; full-KB fallback otherwise`);
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────

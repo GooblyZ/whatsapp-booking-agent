@@ -214,7 +214,9 @@ export async function runReceptionistTurn(
   if (guard === "abuse") return fallback(FALLBACK.abuse, "abuse", "guard_abuse", { skipReason: "abuse" });
   if (guard === "noise") return fallback(FALLBACK.noise, "noise", "guard_noise", { skipReason: "noise" });
 
-  const facts = buildFacts(ctx);
+  // KB is conservatively scoped to THIS message's topic on the AI path (full KB on any doubt — see
+  // scopeKnowledge). Structured facts (name/services/hours/location) are always included.
+  const facts = buildFacts(ctx, { message: input.message });
   const caps: Capabilities = {
     canAnswer: faqEnabled,
     canStartBooking: intentEnabled && facts.bookingEnabled,
@@ -265,8 +267,11 @@ export async function runReceptionistTurn(
     // Whole-call estimate (system instruction + native-history turns + the user message) → tokens + bucket,
     // so a FAILED call (no API usage metadata) can still be analyzed by size. ~4 chars/token heuristic.
     const promptTokensEst = estimateTokens(instruction.length + historyChars + messageChars);
+    // KB scoping observability (Stage 3B Phase 3): how many active KB items were sent vs available.
+    const kbActive = ctx.knowledgeBaseItems.filter((k) => k.active).length;
+    const kbScoped = facts.knowledge.length < kbActive;
     console.log(
-      `[gemini-prompt] turn=${turnId} business=${ctx.business.id} mode=full chars: instruction=${instruction.length}` +
+      `[gemini-prompt] turn=${turnId} business=${ctx.business.id} mode=full kb=${facts.knowledge.length}/${kbActive} kb_scoped=${kbScoped} chars: instruction=${instruction.length}` +
       ` (persona_base≈${Math.max(0, instruction.length - injected)}` +
       ` facts=${sz(factsBlock)} availability=${sz(input.availabilityBlock)}` +
       ` booking=${sz(input.bookingBlock)} guidance=${sz(input.replyGuidance)}` +

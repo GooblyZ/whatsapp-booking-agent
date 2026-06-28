@@ -12,10 +12,40 @@
 
 import type { BusinessAIContext } from "@/types/database";
 import { DAY_NAMES } from "@/lib/services/business-hours";
+import { detectInfoTopic, type InfoTopic } from "./continuity-menu"; // type-only there → no runtime cycle
 
 const MAX_KB_ITEM_CHARS = 400;
 const MAX_KB_ITEMS = 25;
 const MAX_FACTS_CHARS = 6000;
+
+// ── CONSERVATIVE KB SCOPING (Stage 3B Phase 3) ───────────────────────────────────
+// The heaviest dynamic prompt line is the KB. When the customer asks about ONE clearly-recognized
+// info topic whose answer lives in ONE specific KB category (parking/policy/contact/about — the same
+// mapping resolveInfoAnswer uses; hours/prices/location come from STRUCTURED facts, never scoped here),
+// we may drop KB items in OTHER specific categories. SAFE BY CONSTRUCTION: the generic buckets where
+// answers usually live (`about`, `faq`) are ALWAYS kept, and ANY doubt → full KB. So a real FAQ is never
+// turned into a false "I don't know". Reuses the tested `detectInfoTopic`; not a RAG engine.
+const ALWAYS_KEEP_KB_CATEGORIES = new Set(["about", "faq"]);
+const TOPIC_KB_CATEGORY: Partial<Record<InfoTopic, string>> = {
+  parking: "parking", policy: "policy", contact: "contact", about: "about",
+};
+// Below this total KB size there is no point scoping (and nothing to gain) — keep everything.
+const SCOPE_MIN_KB_CHARS = 1500;
+
+/** Picks the KB items worth sending for THIS message. Returns ALL items unless the message maps to a
+ *  single specific KB category AND the KB is large enough to bother — and even then keeps about/faq + the
+ *  matching category. Any doubt (no topic, structured-only topic, small KB, no real shrink) → all items. */
+export function scopeKnowledge<T extends { category: string; content: string }>(
+  items: T[], message: string
+): { kept: T[]; scoped: boolean } {
+  const topic = detectInfoTopic(message ?? "");
+  const cat = topic ? TOPIC_KB_CATEGORY[topic] : undefined;
+  const totalChars = items.reduce((n, k) => n + (k.content?.length ?? 0), 0);
+  if (!cat || totalChars <= SCOPE_MIN_KB_CHARS) return { kept: items, scoped: false }; // no clear single-category topic / small KB → full
+  const kept = items.filter((k) => ALWAYS_KEEP_KB_CATEGORIES.has(k.category) || k.category === cat);
+  if (kept.length === 0 || kept.length === items.length) return { kept: items, scoped: false }; // no real shrink → full
+  return { kept, scoped: true };
+}
 
 export interface BusinessFacts {
   businessName: string;
@@ -35,8 +65,11 @@ export interface Capabilities {
   canReschedule: boolean;   // Phase 1: always false
 }
 
-/** Builds the structured facts snapshot from the business context. */
-export function buildFacts(ctx: BusinessAIContext): BusinessFacts {
+/** Builds the structured facts snapshot from the business context. When `opts.message` is given (the AI
+ *  prompt path), the KB is conservatively scoped to the message's topic (see scopeKnowledge); without it
+ *  (the deterministic-menu path) the FULL KB is used. Structured facts (name/services/hours/location) are
+ *  ALWAYS included regardless. */
+export function buildFacts(ctx: BusinessAIContext, opts: { message?: string } = {}): BusinessFacts {
   const b = ctx.business;
   const settings = ctx.businessSettings;
 
@@ -58,8 +91,10 @@ export function buildFacts(ctx: BusinessAIContext): BusinessFacts {
       description: s.description?.trim() || null,
     }));
 
-  const knowledge = ctx.knowledgeBaseItems
-    .filter((k) => k.active)
+  const activeKb = ctx.knowledgeBaseItems.filter((k) => k.active);
+  // Scope only on the AI path (opts.message present); the deterministic menu passes no message → full KB.
+  const scopedKb = opts.message ? scopeKnowledge(activeKb, opts.message).kept : activeKb;
+  const knowledge = scopedKb
     .sort((a, z) => (a.category === "about" ? -1 : 0) - (z.category === "about" ? -1 : 0))
     .slice(0, MAX_KB_ITEMS)
     .map((k) => ({
