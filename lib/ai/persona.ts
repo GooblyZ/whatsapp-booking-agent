@@ -83,6 +83,8 @@ const OUTPUT_CONTRACT: string[] = [
   `}`,
   `Fill understanding from the whole conversation. Never mention intents, JSON, or the system in "reply".`,
   ``,
+  `RELEVANCE — "faq" means a question about THIS business ONLY: its prices, hours, location, parking, services, policies, or what it offers — answered from the BUSINESS FACTS. General knowledge, trivia, current events, or anything not about this business is "out_of_scope", even when phrased as a question. Examples — faq: "מה המחירים שלכם?", "מתי אתם פתוחים?"; out_of_scope: "מי המציא את הכיסא?", "כמה אנשים יש באיטליה?". For out_of_scope, reply with ONE short, warm line that you're here for this business and what you can help with — never answer it as a general assistant, and never be rude or preachy.`,
+  ``,
   `ACTIONABILITY — classify by ONE question, decided BEFORE the intent: "Is the customer asking the business to PERFORM AN OPERATION on an appointment — create, reschedule, cancel, or list one — or asking to receive a specific service?" Judge by what they're trying to DO, not by which words appear.`,
   `• YES → requestsBusinessAction=true. Set appointmentIntent to that operation (BOOK = a new appointment or a service they want to receive; RESCHEDULE / CANCEL / MODIFY = one they already have; LIST = show theirs) and intent to booking / reschedule_request / cancel_request.`,
   `• NO → requestsBusinessAction=false and appointmentIntent=NONE — this is the DEFAULT. Telling you information (a trip, plans), describing a state or feeling, making small talk, asking ABOUT you (→ meta), giving an opinion, complaining, expressing confusion, or anything you are not SURE is an operation request — all NO.`,

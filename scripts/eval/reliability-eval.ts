@@ -3128,7 +3128,7 @@ async function main(): Promise<void> {
   section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
   // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
   // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
-  const SHELL_BASELINE_HASH = "4268d225a2"; // date-anchor-excluded safeHash of personaPrompt({}) — Stage 3B Phase 1 baseline
+  const SHELL_BASELINE_HASH = "da19d1cf33"; // date-anchor-excluded safeHash of personaPrompt({}); updated in Phase 5 (RELEVANCE faq-vs-out_of_scope wording — intended)
   {
     const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
     const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
@@ -3272,6 +3272,29 @@ async function main(): Promise<void> {
           && p.indexOf(h) < p.indexOf("APPOINTMENTS:");   // owner text stays in WHO YOU ARE, above the platform rules
       });
     })());
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 50. FAQ-vs-OUT-OF-SCOPE CONTRACT (Stage 3B Phase 5) — the persona now DEFINES faq as business-only and
+  //     general trivia as out_of_scope, with examples + a non-hostile boundary instruction. DETERMINISTIC LIMIT:
+  //     these assert the prompt WORDING (composition); they cannot verify the live model's classification —
+  //     that needs the model-in-the-loop smoke list documented below.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("50. FAQ-vs-out-of-scope contract — prompt wording (composition only; live smoke separate)");
+  {
+    const p = personaPrompt({});
+    check("relevance contract: persona defines faq as THIS-business-only and trivia as out_of_scope (with examples)",
+      p.includes("RELEVANCE") && /faq.*THIS business ONLY/.test(p) && p.includes("out_of_scope")
+      && p.includes("מי המציא את הכיסא?") && p.includes("כמה אנשים יש באיטליה?"));
+    check("relevance contract: out_of_scope guidance is a SHORT warm boundary, never hostile, never a general answer",
+      /ONE short, warm line/.test(p) && /never answer it as a general assistant/.test(p) && /never be rude/.test(p));
+    check("relevance contract: business-agnostic — the faq examples carry no vertical/service term",
+      (() => {
+        const m = p.match(/Examples — faq:[^;]*/)?.[0] ?? "";
+        return m.length > 0 && !/מספרה|שיער|תספורת|סלון|hair|salon|barber/i.test(m);
+      })());
+  }
+  gap("Phase 5 live limit: deterministic evals lock the faq/out_of_scope WORDING, not the model's live labels",
+    "Whether the model actually tags 'מי המציא את הכיסא?' as out_of_scope (→ existing out-of-domain counting) can only be confirmed live. SMOKE LIST after rebuild+restart: faq → 'מה המחירים?', 'מתי פתוחים?', 'יש חנייה?', 'איזה שירותים יש?' (answered from facts, NOT deflected); out_of_scope → 'מי המציא את הכיסא?', 'כמה אנשים יש באיטליה?', 'מי המציא את הגיטרה החשמלית?' (short warm boundary, intent=out_of_scope so it counts). No deterministic no-anchor gate was added — real FAQ is never suppressed.");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
