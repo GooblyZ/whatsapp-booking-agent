@@ -436,7 +436,7 @@ export async function runPlatformTurn(
   // What Gemini actually answers: the latest clean business fragment in a mixed burst, else the full text.
   const effectiveModelMessage = latestIsCleanBusiness ? burstLatest : messageText;
   if (latestIsCleanBusiness) {
-    console.log(`[platform-turn] mixed-burst sanitize: latest fragment is clean business — model answers latest only (dropped ${burstFrags.length - 1} earlier fragment(s) from the model input)`);
+    console.log(`[platform-turn] mixed-burst sanitize: latest fragment is clean business — model answers latest only (dropped ${burstFrags.length - 1} earlier fragment(s); model-facing history + transcript + guidance cleaned)`);
   }
 
   // ── PROMPT-INJECTION SAFETY LANE (deterministic, BEFORE any model call) ─────────
@@ -799,14 +799,20 @@ export async function runPlatformTurn(
     return { replyText, decision, linkAttached: null, suppressReply };
   }
 
+  // MIXED-BURST RECOVERY FRAME: when the latest fragment is clean business, the ENTIRE model-facing context is
+  // cleaned — not just `message`. The suppressed earlier fragments live in the saved history with NO tagged
+  // outbound (they were quiet-suppressed), so they would otherwise leak through `historyTurns`/transcript and
+  // make the model say "I don't know about Italy". We therefore drop model-facing history + transcript and
+  // replace guidance with a focused recovery note. GUARD-facing memory + counters + routing keep the full text;
+  // bookingBlock (existing-appointment facts) is business-relevant and kept for booking/manage continuity.
   const decision = await (testDeps?.runModel ?? runReceptionistTurn)(ctx, {
-    historyTurns: memory.turns,
-    conversationContext: memory.transcript,
+    historyTurns: latestIsCleanBusiness ? [] : memory.turns,
+    conversationContext: latestIsCleanBusiness ? "" : memory.transcript,
     // Sanitized: in a mixed burst with a clean business latest, the model answers ONLY the latest fragment
     // (stale trivia/injection never reaches Gemini); otherwise the full aggregated text. See the sanitizer above.
     message: effectiveModelMessage,
     bookingBlock,
-    replyGuidance,
+    replyGuidance: latestIsCleanBusiness ? BURST_RECOVERY_GUIDANCE : replyGuidance,
     platformMode: true,
     customerPhone,
     // Single-flight: a newer turn for this conversation CANCELS this in-flight Gemini call
@@ -1397,6 +1403,13 @@ function lastAssistantLine(transcript: string): string | null {
 // Driven entirely by the model/router classification + a per-session counter — no
 // hardcoded message lists.
 export type LowSignalAction = "none" | "normal_clarify" | "short_clarify" | "boundary" | "quiet_mode";
+
+// Model-facing guidance for a MIXED-BURST RECOVERY (latestIsCleanBusiness). The model frame is reset to a
+// clean, self-contained business turn (no stale history/guidance from the suppressed earlier fragments), and
+// this note tells the model to answer ONLY the latest message — so the reply can never reference the
+// earlier trivia/noise/injection. English (like every other replyGuidance note); never customer-visible.
+export const BURST_RECOVERY_GUIDANCE =
+  "The customer has just asked a clear business question. Answer ONLY this latest message, using the BUSINESS FACTS. Earlier messages were unrelated/noise and are intentionally omitted — do NOT mention, acknowledge, or apologize for them (no 'I don't know about X').";
 
 export const LOW_SIGNAL_SHORT =
   "לא הצלחתי להבין 🙂 רוצה לקבוע תור, או לשאול משהו על העסק?";
