@@ -85,7 +85,7 @@ import { saveOutboundMessage, buildOutboundRow, isMissingColumnError } from "../
 import { buildHistoryTurns, DEFLECTED_REASONS, OFF_TOPIC_REASON, type ConversationContext } from "../../lib/ai/conversation";
 import { FALLBACK, isLowValueAck, type ReceptionistTurn, type ReceptionistDecision } from "../../lib/ai/brain";
 import type { DB } from "../../lib/booking/helpers";
-import type { FactIndex, BusinessFacts, Capabilities } from "../../lib/ai/facts";
+import { buildFacts, formatFacts, type FactIndex, type BusinessFacts, type Capabilities } from "../../lib/ai/facts";
 
 // ── tiny harness ────────────────────────────────────────────────────────────────
 let pass = 0;
@@ -3117,6 +3117,53 @@ async function main(): Promise<void> {
     check("soft-affirm (runtime): business intent after a 'סבבה' closure still recovers (booking link, Gemini)",
       book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0,
       `link=${book.outcome.linkAttached} low=${book.low}`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 47. PROMPT COMPOSITION BASELINE (Stage 3B Phase 1 — instrument & lock before any cut). Locks the static
+  //     persona shell (date-anchor-excluded hash), the hard-block spine, block ordering, and the CURRENT
+  //     "formatFacts includes ALL active KB" behavior — so Phase 2's restructure proves no-op (or a documented
+  //     hash update) and Phase 3's KB scoping is a deliberate, eval-visible change. Pure: no network/DB/Gemini.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
+  // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
+  // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
+  const SHELL_BASELINE_HASH = "4268d225a2"; // date-anchor-excluded safeHash of personaPrompt({}) — Stage 3B Phase 1 baseline
+  {
+    const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
+    const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
+    const shellHash = safeHash(shellStable);
+    check("baseline: static persona shell is byte-stable (date-anchor-excluded hash lock)",
+      shellHash === SHELL_BASELINE_HASH, `actual=${shellHash} (update SHELL_BASELINE_HASH only for an intended persona change)`);
+    // The hard-block spine Stage 3B must preserve (identity/honesty/appointments/output/actionability/safety).
+    const blocks = [
+      "WHO YOU ARE", "HOW YOU WRITE", "WORKING MEMORY", "FACTS & HONESTY:", "APPOINTMENTS:",
+      "never inside this chat", "Never claim a booking", "comes ONLY from the facts below",
+      "OUTPUT — strict JSON", "ACTIONABILITY", "out_of_scope", "ONLY correct today/tomorrow",
+    ];
+    check("baseline: all hard prompt blocks present (identity/honesty/appointments/output/actionability/safety)",
+      blocks.every((b) => shell.includes(b)), `missing: ${blocks.filter((b) => !shell.includes(b)).join(" | ")}`);
+    check("baseline: block ordering is WHO YOU ARE → BUSINESS FACTS → OUTPUT schema (markers, not the identity mention)",
+      shell.indexOf("=== WHO YOU ARE") < shell.indexOf("=== BUSINESS FACTS")
+      && shell.indexOf("=== BUSINESS FACTS") < shell.indexOf("OUTPUT — strict JSON"));
+  }
+  // Facts-size instrumentation + the pre-Phase-3 "all KB included" lock. Fixture: services + hours + KB items.
+  {
+    const kbTitles = ["חניה", "מדיניות ביטול", "אודות", "תשלום", "נגישות", "שאלה נפוצה"];
+    const sampleFactsCtx = {
+      business: { id: "biz", name: "עסק לדוגמה", slug: "biz", phone: "03-1234567", timezone: "Asia/Jerusalem", created_at: "", updated_at: "" },
+      businessSettings: { address: "הרצל 1", city: "תל אביב", booking_enabled: true },
+      aiSettings: { ai_enabled: true, emoji_usage: "none" },
+      services: SERVICES.map((name, i) => ({ id: `s${i}`, name, active: true, duration_minutes: 30, price: 80, description: null })),
+      knowledgeBaseItems: kbTitles.map((t, i) => ({ active: true, category: i === 2 ? "about" : "faq", title: t, content: `תוכן עבור ${t} `.repeat(20) })),
+      businessHours: [0, 1, 2, 3, 4].map((d) => ({ day_of_week: d, is_closed: false, opens_at: "09:00", closes_at: "18:00" })),
+    } as unknown as BusinessAIContext;
+    const factsBlock = formatFacts(buildFacts(sampleFactsCtx));
+    check("baseline: formatFacts currently includes ALL active KB items (locks pre-Phase-3 behavior)",
+      kbTitles.every((t) => factsBlock.includes(t)), `missing KB: ${kbTitles.filter((t) => !factsBlock.includes(t)).join(" | ")}`);
+    const shellChars = personaPrompt({}).length;
+    console.log(`  [baseline] static_shell_chars≈${shellChars} sample_facts_chars=${factsBlock.length} ` +
+      `(facts grow with KB; Phase 3 scopes the KB line — full-KB fallback. estTokens shell≈${estimateTokens(shellChars)} facts≈${estimateTokens(factsBlock.length)})`);
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────
