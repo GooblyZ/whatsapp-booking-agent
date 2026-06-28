@@ -3296,6 +3296,38 @@ async function main(): Promise<void> {
   gap("Phase 5 live limit: deterministic evals lock the faq/out_of_scope WORDING, not the model's live labels",
     "Whether the model actually tags 'מי המציא את הכיסא?' as out_of_scope (→ existing out-of-domain counting) can only be confirmed live. SMOKE LIST after rebuild+restart: faq → 'מה המחירים?', 'מתי פתוחים?', 'יש חנייה?', 'איזה שירותים יש?' (answered from facts, NOT deflected); out_of_scope → 'מי המציא את הכיסא?', 'כמה אנשים יש באיטליה?', 'מי המציא את הגיטרה החשמלית?' (short warm boundary, intent=out_of_scope so it counts). No deterministic no-anchor gate was added — real FAQ is never suppressed.");
 
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 51. AI-FACING HISTORY HYGIENE EXTENSION (Stage 3B Phase 6) — deterministic non-answer turns (closure /
+  //     machine-noise / emoji / presence-boundary / injection / off-topic) drop from the MODEL history but
+  //     stay in the guard transcript; a NORMAL business turn is always kept. lastAssistantReason (loop
+  //     detection) is computed separately, so closures stay interpretable.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("51. AI-facing history hygiene — deterministic non-answers excluded from model history");
+  check("DEFLECTED_REASONS covers closure/noise/emoji/presence/injection (+ existing single-token/off-topic)",
+    ["low_signal_single_token", "off_topic_deflection", "acknowledgement", "low_signal_machine_noise",
+     "low_signal_emoji", "presence_boundary", "injection_refused", "low_signal_reset"].every((r) => DEFLECTED_REASONS.has(r)));
+  {
+    // A closure ("יופי"→ack) and a machine-noise user turn must NOT enter model history; the real FAQ + its
+    // answer (reason "gemini_reply") MUST stay; all rows remain in the guard transcript (allTurns).
+    const rows = [
+      { direction: "inbound", body: "יופי", reason: null },
+      { direction: "outbound", body: "בשמחה", reason: "acknowledgement" },
+      { direction: "inbound", body: "אגכדלמ", reason: null },
+      { direction: "outbound", body: "אני כאן לעזור עם תורים ושאלות על העסק", reason: "low_signal_machine_noise" },
+      { direction: "inbound", body: "מה הכתובת שלכם?", reason: null },
+      { direction: "outbound", body: "הכתובת שלנו היא הרצל 1", reason: "gemini_reply" },
+    ];
+    const { turns, allTurns } = buildHistoryTurns(rows, 400, 10);
+    const ai = turns.map((t) => t.text).join(" | ");
+    const guard = allTurns.map((t) => t.text).join(" | ");
+    check("history hygiene: closure 'יופי' + gibberish drop from MODEL history; real FAQ turn + answer kept",
+      !ai.includes("יופי") && !ai.includes("אגכדלמ")
+      && ai.includes("מה הכתובת") && ai.includes("הרצל 1"),
+      `ai=${JSON.stringify(ai)}`);
+    check("history hygiene: the GUARD transcript still keeps everything (closure + gibberish present)",
+      guard.includes("יופי") && guard.includes("אגכדלמ") && guard.includes("מה הכתובת"));
+  }
+
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
   console.log("(GAP lines are intentional known limitations, not failures — they scope the next reliability work.)");

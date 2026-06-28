@@ -266,7 +266,15 @@ const EMPTY = (windowTurns: number, maxAgeHours: number): ConversationContext =>
 // `reason` at the chokepoint. NOTE: only VISIBLE deflections carry an outbound to tag; a deep-SUPPRESSED
 // off-topic turn has no outbound row, so its orphan user-token is a documented residual (Stage 3B tiering).
 export const OFF_TOPIC_REASON = "off_topic_deflection";
-export const DEFLECTED_REASONS = new Set<string>(["low_signal_single_token", OFF_TOPIC_REASON]);
+// Reasons our DETERMINISTIC non-answer lanes stamp on the outbound (clarify / closure / boundary / quiet /
+// off-topic / injection / presence). A user turn we answered with one of these added NO business content to
+// the conversation — so it is dropped from the AI-FACING history to avoid contaminating a later real turn
+// (the guard transcript / lastAssistantReason keep the full record). Mirrors platform-turn's
+// DETERMINISTIC_NONANSWER_REASONS (both are stable reason tokens — keep in sync by hand).
+export const DEFLECTED_REASONS = new Set<string>([
+  "low_signal_single_token", OFF_TOPIC_REASON, "off_topic_capped", "acknowledgement", "presence_boundary",
+  "low_signal_machine_noise", "low_signal_emoji", "injection_refused", "low_signal_reset",
+]);
 
 export interface HistoryRow { direction: string; body: string | null; reason?: string | null }
 
