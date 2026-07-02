@@ -3732,6 +3732,115 @@ async function main(): Promise<void> {
         === JSON.stringify(resolveStyleProfile(aiset({ custom_instructions: presetText("premium"), emoji_usage: "none" }))));
   }
 
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 56. MID-CONVERSATION PERSONA SWITCH — the owner re-tunes AI Settings DURING an in-flight chat with an
+  //     existing customer (not after a reset). This closes the last unverified claim from the AI-Settings RFC:
+  //     that a settings change takes effect on the very NEXT turn of the SAME conversation, is STYLE-ONLY, and
+  //     touches nothing about routing / booking / manage / reliability / facts. §53 proved the persona delta
+  //     across two SEPARATE fresh lanes; §56's delta is that it reuses the SAME historyTurns (one ongoing
+  //     conversation) byte-identically across both calls, so the only thing that moves between turns is the
+  //     owner's live settings row. Deterministic + no live Gemini (the harness stubs the one model call).
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("56. Mid-conversation persona switch — same in-flight chat, settings A→B: style hashes move, routing/booking/reliability/facts invariant");
+  {
+    const byId56 = (id: string) => PERSONA_PRESETS.find((p) => p.id === id)?.text ?? "";
+    const warmText = byId56("warm");        // חמים ומזמין (preset emoji default: low)
+    const premiumText = byId56("premium");  // יוקרתי ומוקפד (preset emoji default: none)
+    // Two owner snapshots that differ in BOTH the persona text AND the explicit emoji control — the realistic
+    // shape of an owner re-tuning the assistant partway through a conversation.
+    const settingsA: Partial<AISettings> = { custom_instructions: warmText, emoji_usage: "low" };
+    const settingsB: Partial<AISettings> = { custom_instructions: premiumText, emoji_usage: "none" };
+    // One IN-FLIGHT conversation, reused byte-identically for every call below: the switch is proven to take
+    // effect on the NEXT turn of an EXISTING chat, not only after a fresh conversation reset.
+    const history56: { role: "user" | "model"; text: string }[] = [
+      { role: "user", text: "היי, יש לי כמה שאלות" },
+      { role: "model", text: "בטח, אני כאן. מה תרצו לדעת?" },
+      { role: "user", text: "מה שעות הפעילות?" },
+      { role: "model", text: "אפשר לראות את השעות ולקבוע דרך המערכת." },
+    ];
+
+    check("§56 preflight: warm & premium presets are distinct, non-empty style identities (the switch is a real delta)",
+      warmText.length > 0 && premiumText.length > 0 && warmText !== premiumText);
+
+    // ── (1) HASH-CHANGE PROOF (pure, no I/O): the live promptProfileHash AND the Phase-B1 resolved styleHash
+    //    both MOVE across the switch, and both are STABLE on an identical re-save (no drift from recompute). ──
+    const profA = buildPromptProfile(mkSettings(settingsA), "biz").promptProfileHash;
+    const profB = buildPromptProfile(mkSettings(settingsB), "biz").promptProfileHash;
+    const styleA = resolveStyleProfile(mkSettings(settingsA)).resolvedHash;
+    const styleB = resolveStyleProfile(mkSettings(settingsB)).resolvedHash;
+    check("§56.1 profileHash CHANGES across the switch AND is STABLE on identical re-save (deterministic recompute)",
+      profA !== profB && profA === buildPromptProfile(mkSettings(settingsA), "biz").promptProfileHash,
+      `A=${profA} B=${profB}`);
+    check("§56.1 styleHash (resolveStyleProfile) CHANGES across the switch AND is STABLE on identical re-save",
+      styleA !== styleB && styleA === resolveStyleProfile(mkSettings(settingsA)).resolvedHash,
+      `A=${styleA} B=${styleB}`);
+
+    // ── (2) INTEGRATION PROOF (real runPlatformTurn via runLane, IDENTICAL historyTurns on both calls): the
+    //    model boundary receives whichever persona is LIVE for that turn — never a value cached earlier in the
+    //    same conversation. Same FAQ message + same history; only the settings row differs. ──
+    process.env.GEMINI_API_KEY = process.env.GEMINI_API_KEY || "eval-harness-key"; // isGeminiConfigured() → AI lane
+    const faq56 = "כמה עולה השירות?";
+    const faqModel = { intent: "faq" as U["intent"], reply: "המחירים מפורטים כאן." };
+    const rA = await runLane({ message: faq56, prevLow: 0, historyTurns: history56, aiSettings: settingsA, model: faqModel });
+    const rB = await runLane({ message: faq56, prevLow: 0, historyTurns: history56, aiSettings: settingsB, model: faqModel });
+    check("§56.2 mid-conversation switch reaches the model: same history + same message, but each turn's model receives ITS live persona (A≠B)",
+      rA.modelCalled && rB.modelCalled
+      && rA.modelAiSettings?.custom_instructions === warmText
+      && rB.modelAiSettings?.custom_instructions === premiumText
+      && rA.modelAiSettings?.custom_instructions !== rB.modelAiSettings?.custom_instructions
+      && rA.modelMessage === faq56 && rB.modelMessage === faq56,
+      `A=${JSON.stringify(rA.modelAiSettings?.custom_instructions)?.slice(0, 16)} B=${JSON.stringify(rB.modelAiSettings?.custom_instructions)?.slice(0, 16)}`);
+
+    // ── (3) FAQ ROUTING/LINK INVARIANT: an FAQ turn attaches no link, consults the model, and is not
+    //    suppressed — under BOTH personas. The switch is a no-op on routing. ──
+    check("§56.3 FAQ invariant across the switch: no link attached + model consulted + not suppressed under BOTH personas",
+      rA.outcome.linkAttached === null && rA.outcome.suppressReply !== true
+      && rB.outcome.linkAttached === null && rB.outcome.suppressReply !== true,
+      `A.link=${rA.outcome.linkAttached} B.link=${rB.outcome.linkAttached}`);
+
+    // ── (4) BOOKING ROUTING INVARIANT: a booking request attaches the deterministic booking LINK and no
+    //    in-chat "booked" claim survives — even when the stubbed model "confirms" — under BOTH personas. ──
+    for (const [name, s] of [["warm", settingsA], ["premium", settingsB]] as const) {
+      const r = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, historyTurns: history56, aiSettings: s,
+        model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה, קבעתי לך תור!" } });
+      check(`§56.4 booking invariant mid-conversation under '${name}': booking LINK attaches; no in-chat 'booked' claim survives`,
+        r.outcome.linkAttached === "booking" && !claimsBookingCompleted(r.outcome.replyText),
+        `link=${r.outcome.linkAttached} reply=${JSON.stringify(r.outcome.replyText).slice(0, 40)}`);
+    }
+
+    // ── (5) MANAGE/CANCEL ROUTING INVARIANT: a cancel request with an upcoming appointment routes to the
+    //    MANAGE link (the page performs it; chat never mutates) — under BOTH personas. ──
+    const future56 = new Date(Date.now() + 86_400_000).toISOString();
+    for (const [name, s] of [["warm", settingsA], ["premium", settingsB]] as const) {
+      const r = await runLane({ message: "אני רוצה לבטל את התור", prevLow: 0, historyTurns: history56, aiSettings: s,
+        model: { intent: "cancel_request", appt: "CANCEL", action: true, reply: "ביטלתי לך את התור!" },
+        upcoming: [{ id: "a1", start_time: future56, status: "confirmed", services: { name: "תספורת" } }] });
+      check(`§56.5 manage invariant mid-conversation under '${name}': cancel routes to the MANAGE link (page performs it; chat never mutates)`,
+        r.outcome.linkAttached === "manage" && r.modelCalled === true,
+        `link=${r.outcome.linkAttached}`);
+    }
+
+    // ── (6) SPAM / LOW-SIGNAL / RELIABILITY INVARIANT: a deep off-topic streak (prevLow: 3) still caps
+    //    deterministically WITHOUT a Gemini call under BOTH personas — a mid-conversation persona switch can
+    //    never reopen a capped, no-model lane (the cap reads the persisted streak + the current message, never
+    //    the persona or the conversation history). ──
+    for (const [name, s] of [["warm", settingsA], ["premium", settingsB]] as const) {
+      const r = await runLane({ message: "מי הכי גבוה בעולם?", prevLow: 3, historyTurns: history56, aiSettings: s, model: { intent: "out_of_scope", reply: "x" } });
+      check(`§56.6 reliability invariant under '${name}': deep off-topic streak still caps (no Gemini, off_topic_capped) — the switch can't unlock a capped lane`,
+        r.modelCalled === false && r.outcome.decision.branch === "off_topic_capped",
+        `model=${r.modelCalled} branch=${r.outcome.decision.branch}`);
+    }
+
+    // ── (7) FACTS/GROUNDING STABILITY: business facts are byte-identical across the switch (buildFacts reads
+    //    business/services/hours/KB, never aiSettings). Grounding itself (verifyGrounding) is style-independent
+    //    by construction — its signature takes reply/index/allowedTimes/allowedPhones and never aiSettings — so
+    //    no runtime check can even express a persona dependency; noted here rather than asserted redundantly. ──
+    check("§56.7 facts are byte-identical across the switch: buildFacts ignores aiSettings (style never moves a fact)",
+      JSON.stringify(buildFacts(harnessCtx(settingsA))) === JSON.stringify(buildFacts(harnessCtx(settingsB))));
+  }
+  gap("§56 live limit: the harness proves a mid-conversation switch REACHES the model, moves the style hashes, and leaves routing/booking/manage/reliability/facts invariant — NOT that Gemini's live wording shifts warmth mid-chat",
+    "Whether the very next live reply actually reads warmer/cooler after the switch is model-judged and belongs to the same small optional live probe as §53 (same conversation, flip the preset between turns, compare tone). The deterministic gate locks everything the system controls.");
+
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
   console.log("(GAP lines are intentional known limitations, not failures — they scope the next reliability work.)");
