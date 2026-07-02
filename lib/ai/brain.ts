@@ -17,7 +17,7 @@ import type { BusinessAIContext } from "@/types/database";
 import type { GeminiTurn, GeminiUsage } from "./gemini";
 import { geminiGenerateConversation } from "./gemini";
 import { buildFacts, formatFacts, buildFactIndex, type BusinessFacts, type Capabilities } from "./facts";
-import { buildReceptionistInstruction } from "./persona";
+import { buildReceptionistInstruction, resolveStyleForSettings } from "./persona";
 import { buildPromptProfile } from "./prompt-profile";
 import { verifyGrounding, extractTimeTokens, extractPhoneDigits } from "./grounding";
 import { parseAiJsonResponse } from "./json-parse";
@@ -230,10 +230,15 @@ export async function runReceptionistTurn(
   // prompt sources identity/style from the same PromptProfile the outbound fences use. Its hash +
   // version are logged below for turn traceability ("this reply used this settings profile").
   const profile = buildPromptProfile(ctx.aiSettings, ctx.business.id);
+  // Phase B2: the resolved presentation-style profile — resolved ONCE via the persona's own legacy
+  // chain (so the styleHash always describes the character text the prompt renders) and passed in.
+  // styleHash is ADDITIVE observability: profileHash keeps its exact meaning and consumers.
+  const styleProfile = resolveStyleForSettings(ctx.aiSettings);
   const instruction = buildReceptionistInstruction(ctx, {
     factsBlock,
     caps,
     profile,
+    styleProfile,
     // With native history, the transcript block is redundant — the turns speak
     // for themselves (and far more naturally).
     conversationContext: useNativeHistory ? "" : input.conversationContext,
@@ -280,8 +285,10 @@ export async function runReceptionistTurn(
       ` + history_turns=${input.historyTurns?.length ?? 0} (${historyChars} chars)` +
       ` + message=${messageChars}` +
       ` | promptTokensEst=${promptTokensEst} bucket=${promptSizeBucket(promptTokensEst)} instrHash=${safeHash(instruction)}` +
-      // Settings traceability (safe metadata only — no prompt, message, phone, or custom-instruction text):
-      ` | profileHash=${profile.promptProfileHash} settingsVersion=${profile.settingsVersion ?? "-"}`
+      // Settings traceability (safe metadata only — no prompt, message, phone, or custom-instruction text).
+      // styleHash (Phase B2) = the RESOLVED presentation style only (ignores name; collapses
+      // semantically identical styles) — additive next to the full profileHash, never replacing it.
+      ` | profileHash=${profile.promptProfileHash} settingsVersion=${profile.settingsVersion ?? "-"} styleHash=${styleProfile.resolvedHash}`
     );
   }
 

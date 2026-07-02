@@ -3148,7 +3148,7 @@ async function main(): Promise<void> {
   section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
   // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
   // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
-  const SHELL_BASELINE_HASH = "da19d1cf33"; // date-anchor-excluded safeHash of personaPrompt({}); updated in Phase 5 (RELEVANCE faq-vs-out_of_scope wording — intended)
+  const SHELL_BASELINE_HASH = "e8dceaf56d"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-06-28 in Phase B2 (consolidated the WHO-YOU-ARE/HOW-YOU-WRITE/OWNER-STYLE-GUIDANCE zones into ONE resolved STYLE block — intended; shell shrank 10336→10128 chars). Prior: da19d1cf33 (Phase 5 RELEVANCE wording).
   {
     const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
     const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
@@ -3453,8 +3453,13 @@ async function main(): Promise<void> {
     const pPro = personaPrompt({ custom_instructions: proText });
     check("§53.A persona contrast: each preset's text lands in its own prompt; the two prompts differ",
       pCasual.includes(casualText) && pPro.includes(proText) && pCasual !== pPro);
-    check("§53.A persona is the ONLY delta: blanking each persona text yields IDENTICAL prompts (facts/message/shell unchanged)",
-      pCasual.split(casualText).join("⟦P⟧") === pPro.split(proText).join("⟦P⟧"));
+    // B2 update (intended): a recognized preset now ALSO renders its derived "Voice targets:" line, so the
+    // legitimate style delta = the persona text + that derived line. Blanking both must yield IDENTICAL
+    // prompts — facts/message/shell still can't differ across personas.
+    const blankStyle = (p: string, text: string) =>
+      p.split(text).join("⟦P⟧").replace(/Voice targets: [^\n]*/g, "⟦V⟧");
+    check("§53.A persona is the ONLY delta: blanking each persona text + its derived Voice-targets line yields IDENTICAL prompts",
+      blankStyle(pCasual, casualText) === blankStyle(pPro, proText));
     const hCasual = buildPromptProfile(mkSettings({ custom_instructions: casualText }), "biz").promptProfileHash;
     const hPro = buildPromptProfile(mkSettings({ custom_instructions: proText }), "biz").promptProfileHash;
     check("§53.A profileHash CHANGES across contrasting personas; STABLE on rebuild of the same persona",
@@ -3561,6 +3566,52 @@ async function main(): Promise<void> {
         return p.includes(ANCHOR_MARK) && p.includes(STYLE_FENCE)
           && /never inside this chat/.test(p) && /Never claim a booking/.test(p)
           && p.indexOf(ANCHOR_MARK) < p.indexOf("APPOINTMENTS:");
+      })());
+
+    // ── GROUP E — Phase B2 STYLE-BLOCK CONSOLIDATION: ONE style zone, structured Voice targets,
+    //    prompt/fence agreement, contradiction-resolved-once, and the disclosure fence still detects
+    //    the merged header. The §47 baseline elsewhere locks the deliberate shell-hash update.
+    const B2_HEADER = "=== WHO YOU ARE & HOW YOU WRITE (owner style — presentation ONLY; every rule below outranks it) ===";
+    check("§53.E ONE style zone: merged header appears exactly once; old standalone HOW-YOU-WRITE / OWNER-STYLE-GUIDANCE headers are gone",
+      (() => {
+        const p = personaPrompt({ custom_instructions: casualText, things_to_avoid: "בלי סלנג" });
+        return p.split(B2_HEADER).length === 2
+          && !p.includes("=== HOW YOU WRITE (") && !p.includes("=== OWNER STYLE GUIDANCE (");
+      })());
+    check("§53.E structured Voice targets: a recognized preset renders ITS vector; an edited/custom text renders NO derived line",
+      (() => {
+        const known = personaPrompt({ custom_instructions: casualText });
+        const edited = personaPrompt({ custom_instructions: casualText + " ובנוסף עם קצת הומור" });
+        return known.includes("Voice targets: formality 2/5 · warmth 4/5 · energy 4/5 · register: casual.")
+          && !edited.includes("Voice targets:");
+      })());
+    check("§53.E prompt/fence agreement: the Format line renders the PERSISTED emoji/length values — the same values buildPromptProfile feeds the outbound fences",
+      (() => {
+        const cases: Array<[AISettingsEmojiUsage, AISettingsResponseLength, string, string]> = [
+          ["none", "short", "ZERO emojis", "ONE short sentence"],
+          ["low", "medium", "At most one emoji", "1-3 short sentences"],
+          ["medium", "long", "1-2 fitting emojis", "3-5 sentences"],
+        ];
+        return cases.every(([emoji, len, emojiMark, lenMark]) => {
+          const over = { custom_instructions: casualText, emoji_usage: emoji, response_length: len };
+          const p = personaPrompt(over);
+          const prof = buildPromptProfile(mkSettings(over), "biz");
+          return p.includes(emojiMark) && p.includes(lenMark)
+            && prof.emojiUsage === emoji && prof.responseLength === len; // prompt hints == fence inputs
+        });
+      })());
+    check("§53.E contradiction resolves ONCE: casual preset + emoji 'none' → the ZERO-emoji instruction only (no competing emoji hint anywhere)",
+      (() => {
+        const p = personaPrompt({ custom_instructions: casualText, emoji_usage: "none" });
+        return p.includes("ZERO emojis") && !p.includes("At most one emoji") && !p.includes("1-2 fitting emojis");
+      })());
+    check("§53.E disclosure fence detects the NEW merged header (a model echoing the style zone is still caught)",
+      revealsInternalInstructions(`${B2_HEADER} ואז אני אמור לדבר בחום`) === true);
+    check("§53.E avoid-only config now carries the header subordination (presentation ONLY) — guidance labeled, long fence still persona-only",
+      (() => {
+        const p = personaPrompt({ things_to_avoid: "בלי סלנג" });
+        return p.includes(B2_HEADER) && /OWNER STYLE GUIDANCE/.test(p) && /NEVER overrides/.test(p)
+          && !p.includes(STYLE_FENCE);
       })());
   }
   gap("§53 live limit: the harness proves the persona REACHES the model and is structurally distinct + safe — NOT that Gemini realizes the tone",
