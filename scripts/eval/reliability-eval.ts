@@ -68,6 +68,10 @@ import {
 } from "../../lib/booking/notifications";
 import { isAutoCompletable, completePastAppointments, enqueueDueReminders, processPendingEvents, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
 import { matchWaitlistForSlot, withinWindow } from "../../lib/booking/waitlist";
+import {
+  shouldSuppressStaleInbound, STALE_INBOUND_SUPPRESS_AFTER_MS, OUT_OF_ORDER_MIN_AGE_MS,
+  type StaleInboundInput, type StaleInboundDecision,
+} from "../../lib/booking/inbound-staleness";
 import { authorizeJobRequest } from "../../lib/jobs/auth";
 import {
   isActiveAppointment, isHistoryAppointment, filterAppointmentsForView, ACTIVE_GRACE_MS,
@@ -4029,6 +4033,89 @@ async function main(): Promise<void> {
   }
   gap("§57 scope: proves the SYSTEM's lifecycle DECISIONS (reminder 24h window + idempotency, waitlist window containment, inert/target-less events → no send). The actual SEND (sendOutbound → WhatsApp), the SERVICE-scope match (SQL `.or`), and the still-unimplemented abandoned_booking / customer_inactive automations are outside this deterministic slice.",
     "Documented follow-ups (NOT built this sprint — each needs schema and/or a new emitter): (1) a DB unique constraint on events(appointment_id, type) to harden reminder idempotency against a concurrent double-run; (2) a send-level idempotency key so a re-processed event can never double-send; (3) enforce waitlist expires_at so stale entries aren't matched; (4) emit + communicate abandoned_booking (booking-session staleness) and customer_inactive (inactivity scan).");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 58. INBOUND STALENESS / OUT-OF-ORDER GUARD — a delayed Meta webhook must NOT trigger a fresh AI reply
+  //     hours after the customer actually sent the message. The 2026-07-02 incident: authored 16:44:53 IL,
+  //     delivered 23:00:58 IL (~6h16m late); the handler replied on receipt, so the bot looked like it
+  //     messaged spontaneously. shouldSuppressStaleInbound is a PURE decision (no DB / Gemini / routing):
+  //     the inbound is always SAVED for audit first and wamid-dedup runs earlier; this only decides whether
+  //     to RUN the turn. A suppress in the handler short-circuits BEFORE Gemini / outbound / link / counters.
+  //     Conservative + fail-open: duplicates and missing timestamps are never suppressed, and a live burst
+  //     (age below the out-of-order floor) is untouched so fresh behavior is byte-for-byte unchanged.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("58. Inbound staleness / out-of-order guard — delayed Meta webhooks don't trigger fresh AI replies (2026-07-02 incident fix)");
+  {
+    const SEC = 1000, MIN = 60 * SEC, HOUR = 60 * MIN;
+    const base = Date.parse("2026-07-02T13:44:53.000Z"); // the incident's author time (16:44:53 IL)
+    // Build a decision with incident-shaped defaults; each test overrides only what it exercises.
+    const dec = (o: Partial<StaleInboundInput>): StaleInboundDecision =>
+      shouldSuppressStaleInbound({
+        isDuplicate: false, authorTimestampMs: base, receiptTimeMs: base + 5 * SEC,
+        latestPriorInboundMs: null, maxAgeMs: STALE_INBOUND_SUPPRESS_AFTER_MS,
+        outOfOrderMinAgeMs: OUT_OF_ORDER_MIN_AGE_MS, ...o,
+      });
+
+    check("§58 constants: absolute stale-age = 60 min, out-of-order floor = 5 min (conservative, tunable)",
+      STALE_INBOUND_SUPPRESS_AFTER_MS === 60 * 60 * 1000 && OUT_OF_ORDER_MIN_AGE_MS === 5 * 60 * 1000);
+
+    // (1) Fresh inbound proceeds unchanged (the common case — no behavior change).
+    const fresh = dec({ receiptTimeMs: base + 5 * SEC, latestPriorInboundMs: null });
+    check("§58.1 fresh inbound (age 5s, no newer) → PROCEED, no reason",
+      fresh.suppress === false && fresh.reason === null && fresh.ageMs === 5 * SEC);
+
+    // (2) Duplicate defers to the wamid dedup — never suppressed or re-labeled here, even if ancient.
+    const dup = dec({ isDuplicate: true, receiptTimeMs: base + 10 * HOUR, latestPriorInboundMs: base + 8 * HOUR });
+    check("§58.2 duplicate → PROCEED here (dedup owns it): the guard never suppresses or relabels a duplicate",
+      dup.suppress === false && dup.reason === null);
+
+    // (3) OUT-OF-ORDER — the incident shape: authored 16:44, a newer inbound (21:39) already handled, the
+    //     16:44 webhook finally received at 23:00 (~6h16m late). Reason + ageMs are observable.
+    const receipt = Date.parse("2026-07-02T20:00:58.000Z");
+    const incident = dec({ authorTimestampMs: base, receiptTimeMs: receipt, latestPriorInboundMs: Date.parse("2026-07-02T18:39:28.000Z") });
+    check("§58.3 out-of-order (incident): newer inbound exists + age far above floor → SUPPRESS reason=out_of_order, ageMs=receipt−author",
+      incident.suppress === true && incident.reason === "out_of_order" && incident.ageMs === receipt - base);
+
+    // (4) OUT-OF-ORDER moderate: a 10-min-late superseded message (still UNDER the 60-min absolute bound) —
+    //     caught by the out-of-order branch, which the absolute-age backstop alone would miss.
+    const ooModerate = dec({ receiptTimeMs: base + 10 * MIN, latestPriorInboundMs: base + 8 * MIN });
+    check("§58.4 out-of-order (10 min late, under the absolute bound) → SUPPRESS reason=out_of_order",
+      ooModerate.suppress === true && ooModerate.reason === "out_of_order");
+
+    // (5) FRESH BURST PROTECTED: a newer fragment exists but this one is only seconds old (below the 5-min
+    //     floor) → NOT suppressed, so the existing debounce/aggregation burst behavior is unchanged.
+    const burst = dec({ receiptTimeMs: base + 10 * SEC, latestPriorInboundMs: base + 2 * SEC });
+    check("§58.5 fresh burst protected: newer fragment exists but age 10s < floor → PROCEED (existing burst behavior unchanged)",
+      burst.suppress === false && burst.reason === null);
+
+    // (6) TOO-OLD backstop: 2h late with NO newer message at all → absolute-age guard.
+    const tooOld = dec({ receiptTimeMs: base + 2 * HOUR, latestPriorInboundMs: null });
+    check("§58.6 too-old (2h late, no newer message) → SUPPRESS reason=too_old",
+      tooOld.suppress === true && tooOld.reason === "too_old");
+
+    // (7) Absolute-age boundary is strict (> maxAge): exactly 60 min proceeds; 60 min + 1 ms suppresses.
+    const atBound = dec({ receiptTimeMs: base + STALE_INBOUND_SUPPRESS_AFTER_MS, latestPriorInboundMs: null });
+    const overBound = dec({ receiptTimeMs: base + STALE_INBOUND_SUPPRESS_AFTER_MS + 1, latestPriorInboundMs: null });
+    check("§58.7 absolute-age boundary is strict: exactly 60 min → PROCEED, 60 min + 1 ms → SUPPRESS too_old",
+      atBound.suppress === false && overBound.suppress === true && overBound.reason === "too_old");
+
+    // (8) Missing author timestamp → PROCEED (fail-open), ageMs null (never suppress on missing data).
+    const noTs = dec({ authorTimestampMs: null, receiptTimeMs: base + 10 * HOUR, latestPriorInboundMs: base + 8 * HOUR });
+    check("§58.8 missing wa_timestamp → PROCEED (fail-open), ageMs null (never suppress on missing data)",
+      noTs.suppress === false && noTs.reason === null && noTs.ageMs === null);
+
+    // (9) Clock skew (author slightly in the future) → negative age → PROCEED (no spurious suppression).
+    const future = dec({ receiptTimeMs: base - 10 * SEC, latestPriorInboundMs: null });
+    check("§58.9 clock-skew (author 10s ahead) → negative age → PROCEED (no spurious suppression)",
+      future.suppress === false && future.reason === null && future.ageMs === -10 * SEC);
+
+    // (10) Out-of-order needs a STRICTLY newer prior inbound: an equal author time (same second) does not fire it.
+    const equalPrior = dec({ receiptTimeMs: base + 10 * MIN, latestPriorInboundMs: base });
+    check("§58.10 out-of-order needs a STRICTLY newer prior inbound: an equal (same-second) author time does not trigger it",
+      equalPrior.reason !== "out_of_order" && equalPrior.suppress === false);
+  }
+  gap("§58 scope: shouldSuppressStaleInbound is unit-locked here (pure decision incl. the incident's exact timestamps). The handler WIRING (lib/message-handler.ts) — save-for-audit before the guard, the latest-prior-inbound lookup, and the early return that skips Gemini/outbound/link/counters — is a thin integration verified by inspection, matching how §22/§23 scope their route/DB edges.",
+    "Follow-ups (not this sprint): make the out-of-order lookup index-backed if inbound volume per customer grows; consider a WhatsApp template 're-open' path for genuinely-late messages the owner still wants answered; expose suppression counts on the dashboard for auditability.");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
