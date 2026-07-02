@@ -101,6 +101,14 @@ export function SaveBanner({ saved, error }: Props) {
     );
   }
 
+  if (error === "ai_settings_save_failed") {
+    return (
+      <div style={errorStyle} role="alert">
+        <strong>⚠️ שמירת ההגדרות נכשלה. נסה שוב.</strong>
+      </div>
+    );
+  }
+
   if (saved === "1") {
     return (
       <div style={successStyle} role="status">

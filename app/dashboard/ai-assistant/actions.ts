@@ -32,23 +32,36 @@ function cleanText(raw: unknown, max: number): string | null {
 export async function saveAISettingsAction(formData: FormData) {
   const businessId = getDefaultBusinessId();
 
-  const { fullyPersisted } = await updateAISettings(businessId, {
-    // IDENTITY
-    assistant_name:      (formData.get("assistant_name") as string)?.trim() || "עוזר",
-    assistant_gender:    safeGender(formData.get("assistant_gender")),
-    // WRITING STYLE (format)
-    response_length:     (formData.get("response_length") as AISettingsResponseLength)   || "medium",
-    emoji_usage:         (formData.get("emoji_usage")     as AISettingsEmojiUsage)       || "low",
-    language:            safeLanguage(formData.get("language")),
-    // PERSONALITY — the single natural-language voice authority.
-    custom_instructions: cleanText(formData.get("custom_instructions"), 2000),
-    // HARD RULES
-    things_to_avoid:     cleanText(formData.get("things_to_avoid"), 1000),
-    // Unchecked checkboxes are absent from FormData → treated as false.
-    ai_enabled:               formData.get("ai_enabled") === "on",
-    faq_enabled:              formData.get("faq_enabled") === "on",
-    intent_detection_enabled: formData.get("intent_detection_enabled") === "on",
-  });
+  // Presentation-only save feedback: a genuine persistence failure should surface a graceful
+  // Hebrew banner, not an unhandled 500. redirect() throws NEXT_REDIRECT internally, so it MUST
+  // stay OUTSIDE the try — otherwise the success redirect would be swallowed by the catch.
+  let fullyPersisted = true;
+  let saveFailed = false;
+  try {
+    ({ fullyPersisted } = await updateAISettings(businessId, {
+      // IDENTITY
+      assistant_name:      (formData.get("assistant_name") as string)?.trim() || "עוזר",
+      assistant_gender:    safeGender(formData.get("assistant_gender")),
+      // WRITING STYLE (format)
+      response_length:     (formData.get("response_length") as AISettingsResponseLength)   || "medium",
+      emoji_usage:         (formData.get("emoji_usage")     as AISettingsEmojiUsage)       || "low",
+      language:            safeLanguage(formData.get("language")),
+      // PERSONALITY — the single natural-language voice authority.
+      custom_instructions: cleanText(formData.get("custom_instructions"), 2000),
+      // HARD RULES
+      things_to_avoid:     cleanText(formData.get("things_to_avoid"), 1000),
+      // Unchecked checkboxes are absent from FormData → treated as false.
+      ai_enabled:               formData.get("ai_enabled") === "on",
+      faq_enabled:              formData.get("faq_enabled") === "on",
+      intent_detection_enabled: formData.get("intent_detection_enabled") === "on",
+    }));
+  } catch {
+    saveFailed = true;
+  }
+
+  if (saveFailed) {
+    redirect("/dashboard/ai-assistant?error=ai_settings_save_failed");
+  }
 
   // Surface when a column couldn't persist (a pending migration, e.g. 010 gender).
   redirect(`/dashboard/ai-assistant?saved=1${fullyPersisted ? "" : "&persona=deferred"}`);

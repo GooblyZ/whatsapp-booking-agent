@@ -5,11 +5,7 @@ import { getAISettings } from "@/lib/services/ai-settings";
 import { saveAISettingsAction } from "./actions";
 import { PersonaFields } from "./PersonaFields";
 import { SaveBanner } from "@/app/dashboard/_components/SaveBanner";
-
-const btnPrimary: React.CSSProperties = {
-  padding: "10px 20px", background: "#0070f3", color: "#fff", border: "none",
-  borderRadius: "4px", cursor: "pointer", fontSize: "14px", fontWeight: 600,
-};
+import { SaveButton } from "./SaveButton";
 
 // Read-only clarity panel (AI Settings Phase 2B): owner settings shape PRESENTATION only — they never
 // change booking/routing/truth/reliability/deterministic behavior. Business-agnostic wording.
@@ -45,10 +41,19 @@ function SettingsScopeNote() {
 export default async function AIAssistantPage({
   searchParams,
 }: {
-  searchParams: Promise<{ saved?: string; persona?: string }>;
+  searchParams: Promise<{ saved?: string; persona?: string; error?: string }>;
 }) {
   const businessId = getDefaultBusinessId();
   const [aiSettings, params] = await Promise.all([getAISettings(businessId), searchParams]);
+
+  // Persistent "last saved" line (presentation only): reuses the existing ai_settings.updated_at —
+  // no new DB field. Formatted in the server timezone (business-tz conversion is out of scope here).
+  const lastSavedLabel =
+    params.saved === "1"
+      ? "עודכן עכשיו"
+      : aiSettings?.updated_at
+        ? `נשמר לאחרונה ב-${new Intl.DateTimeFormat("he-IL", { hour: "2-digit", minute: "2-digit" }).format(new Date(aiSettings.updated_at))}`
+        : null;
 
   return (
     <div>
@@ -61,7 +66,7 @@ export default async function AIAssistantPage({
 
       <SettingsScopeNote />
 
-      <SaveBanner saved={params.saved} />
+      <SaveBanner saved={params.saved} error={params.error} />
 
       {params.persona === "deferred" && (
         <div style={{
@@ -75,10 +80,12 @@ export default async function AIAssistantPage({
 
       <form action={saveAISettingsAction} style={{ maxWidth: "520px" }}>
         <PersonaFields initial={aiSettings} />
-        <button type="submit" style={{ ...btnPrimary, marginTop: "18px" }}>
-          שמור הגדרות
-        </button>
+        <SaveButton />
       </form>
+
+      {lastSavedLabel && (
+        <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: "10px" }}>{lastSavedLabel}</p>
+      )}
     </div>
   );
 }
