@@ -89,6 +89,12 @@ export async function enqueueDueReminders(db: DB, now: Date): Promise<number> {
       });
       enqueued++;
     }
+    // Observability: make the idempotency guard auditable — how many due appts were newly enqueued vs.
+    // already had a reminder_due event (skipped). Log-only; never changes what gets enqueued.
+    const skippedExisting = appts.length - enqueued;
+    if (enqueued > 0 || skippedExisting > 0) {
+      console.log(`[events] reminders: window=${REMINDER_LEAD_HOURS}h scanned=${appts.length} enqueued=${enqueued} skipped_existing=${skippedExisting}`);
+    }
     return enqueued;
   } catch (err) {
     console.error("[events] enqueueDueReminders error:", err instanceof Error ? err.message : String(err));
@@ -138,6 +144,18 @@ export async function completePastAppointments(db: DB, now: Date): Promise<numbe
   }
 }
 
+/** One compact, auditable line per runner invocation — every job run leaves a trace of what it decided
+ *  (completed / reminders enqueued / events scanned·processed·skipped, by type). Observability only:
+ *  it reads the already-computed summary and never changes any decision or send. */
+function logProcessSummary(s: ProcessSummary): void {
+  const byType = Object.entries(s.byType).map(([t, n]) => `${t}=${n}`).join(",") || "none";
+  console.log(
+    `[events] run summary completed=${s.appointmentsCompleted} remindersEnqueued=${s.remindersEnqueued}` +
+    ` scanned=${s.scanned} processed=${s.processed} skipped=${s.skipped} byType={${byType}}` +
+    (s.note ? ` note="${s.note}"` : "")
+  );
+}
+
 /** Processes all pending events. Fail-soft; returns a summary for the runner. */
 export async function processPendingEvents(db: DB, now: Date = new Date()): Promise<ProcessSummary> {
   const summary: ProcessSummary = { remindersEnqueued: 0, appointmentsCompleted: 0, scanned: 0, processed: 0, skipped: 0, byType: {} };
@@ -156,6 +174,7 @@ export async function processPendingEvents(db: DB, now: Date = new Date()): Prom
 
   if (error) {
     summary.note = `events table unavailable: ${error.message}`;
+    logProcessSummary(summary);
     return summary;
   }
 
@@ -178,6 +197,7 @@ export async function processPendingEvents(db: DB, now: Date = new Date()): Prom
       summary.skipped++;
     }
   }
+  logProcessSummary(summary);
   return summary;
 }
 
