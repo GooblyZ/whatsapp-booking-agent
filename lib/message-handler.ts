@@ -13,6 +13,11 @@ import { supabaseServer } from "@/lib/supabase/server";
 import { handleBookingFlow, hasNewerInbound } from "@/lib/booking/flow";
 import { getWhatsAppHealth, attemptWhatsAppRecovery } from "@/lib/integration-health";
 import { getAggregationDebounceMs } from "@/lib/config";
+import {
+  shouldSuppressStaleInbound,
+  STALE_INBOUND_SUPPRESS_AFTER_MS,
+  OUT_OF_ORDER_MIN_AGE_MS,
+} from "@/lib/booking/inbound-staleness";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -73,11 +78,16 @@ export async function handleIncomingMessage(msg: IncomingWhatsAppMessage): Promi
     return;
   }
 
-  // 3. Convert WhatsApp Unix timestamp to ISO if present.
+  // 3. Convert WhatsApp Unix timestamp to ISO if present. authorMs (the customer's real send time, in ms)
+  //    also feeds the stale/out-of-order guard below.
   let waTimestampISO: string | null = null;
+  let authorMs: number | null = null;
   if (msg.waTimestamp) {
     const ts = parseInt(msg.waTimestamp, 10);
-    if (!isNaN(ts)) waTimestampISO = new Date(ts * 1000).toISOString();
+    if (!isNaN(ts)) {
+      authorMs = ts * 1000;
+      waTimestampISO = new Date(authorMs).toISOString();
+    }
   }
 
   // 4. Save inbound message (returning created_at for burst aggregation).
@@ -105,6 +115,36 @@ export async function handleIncomingMessage(msg: IncomingWhatsAppMessage): Promi
   console.log(
     `[message-handler] inbound message saved — phone=${maskedPhone} wamid=${msg.waMessageId}`
   );
+
+  // 4a. STALE / OUT-OF-ORDER INBOUND GUARD. A Meta webhook can arrive long after the customer actually
+  //     sent the message — Meta retries a failed delivery on backoff (the 2026-07-02 incident: authored
+  //     16:44, delivered 23:00, ~6h16m late). Replying then reads as a "spontaneous" bot message in the
+  //     customer's chat. The inbound is already SAVED above (audit preserved) and wamid-dedup already ran;
+  //     here we only decide whether to RUN the turn — a suppress short-circuits BEFORE Gemini, outbound,
+  //     link attachment, and conversation-counter mutation (all downstream of handleBookingFlow), and
+  //     never touches the recovery probe below. Fail-open: no usable author timestamp → proceed as before.
+  if (authorMs !== null) {
+    const receivedAtMs = Date.now();
+    const latestPriorInboundMs = await latestPriorInboundAuthorMs(db, msg.businessId, customer.id, savedMsg.id as string);
+    const staleness = shouldSuppressStaleInbound({
+      isDuplicate: false, // wamid dedup already ran above; a duplicate never reaches this point
+      authorTimestampMs: authorMs,
+      receiptTimeMs: receivedAtMs,
+      latestPriorInboundMs,
+      maxAgeMs: STALE_INBOUND_SUPPRESS_AFTER_MS,
+      outOfOrderMinAgeMs: OUT_OF_ORDER_MIN_AGE_MS,
+    });
+    if (staleness.suppress) {
+      console.warn(
+        `[message-handler] stale inbound suppressed — reason=${staleness.reason}` +
+        ` business=${msg.businessId.slice(-6)} phone=${maskedPhone} wamid=${msg.waMessageId}` +
+        ` authoredAt=${waTimestampISO} receivedAt=${new Date(receivedAtMs).toISOString()} ageMs=${staleness.ageMs}` +
+        (latestPriorInboundMs !== null ? ` latestPriorInboundAt=${new Date(latestPriorInboundMs).toISOString()}` : "") +
+        ` — SAVED for audit, Gemini + reply SKIPPED`
+      );
+      return;
+    }
+  }
 
   // 4b. DEGRADED MODE GATE. When Meta auth is broken, NO reply can be delivered
   //     (AI or rule-based alike) — so don't burn Gemini tokens. The inbound is
@@ -210,6 +250,40 @@ export async function aggregateBurst(
   } catch (err) {
     console.error("[message-handler] burst aggregation failed:", err instanceof Error ? err.message : String(err));
     return fallbackText;
+  }
+}
+
+/**
+ * Newest AUTHOR timestamp (ms) among OTHER inbound messages for this business+customer — the
+ * "have we already moved past this?" signal for the out-of-order guard. Excludes the current row and any
+ * inbound with no wa_timestamp. Fail-open: any error → null, so the guard never suppresses because of a
+ * failed lookup. Read-only.
+ */
+async function latestPriorInboundAuthorMs(
+  db: ReturnType<typeof supabaseServer>,
+  businessId: string,
+  customerId: string,
+  currentMessageId: string
+): Promise<number | null> {
+  try {
+    const { data } = await db
+      .from("messages")
+      .select("wa_timestamp")
+      .eq("business_id", businessId)
+      .eq("customer_id", customerId)
+      .eq("direction", "inbound")
+      .neq("id", currentMessageId)
+      .not("wa_timestamp", "is", null)
+      .order("wa_timestamp", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const ts = data?.wa_timestamp as string | null | undefined;
+    if (!ts) return null;
+    const ms = new Date(ts).getTime();
+    return isNaN(ms) ? null : ms;
+  } catch (err) {
+    console.error("[message-handler] latestPriorInboundAuthorMs failed:", err instanceof Error ? err.message : String(err));
+    return null;
   }
 }
 
