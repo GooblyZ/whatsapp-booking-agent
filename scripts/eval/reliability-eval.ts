@@ -66,7 +66,8 @@ import { extractInboundMessage, capInteractiveBody, INTERACTIVE_BODY_MAX } from 
 import {
   buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate, confirmationCta,
 } from "../../lib/booking/notifications";
-import { isAutoCompletable, completePastAppointments, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
+import { isAutoCompletable, completePastAppointments, enqueueDueReminders, processPendingEvents, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
+import { matchWaitlistForSlot, withinWindow } from "../../lib/booking/waitlist";
 import { authorizeJobRequest } from "../../lib/jobs/auth";
 import {
   isActiveAppointment, isHistoryAppointment, filterAppointmentsForView, ACTIVE_GRACE_MS,
@@ -78,7 +79,7 @@ import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/a
 import { PERSONA_PRESETS } from "../../lib/ai/persona-presets";
 import { flagsBusinessPolicy } from "../../app/dashboard/ai-assistant/policy-lint";
 import { resolveStyleProfile } from "../../lib/ai/resolve-style-profile";
-import type { AISettings, AISettingsEmojiUsage, AISettingsResponseLength, BusinessAIContext } from "../../types/database";
+import type { AISettings, AISettingsEmojiUsage, AISettingsResponseLength, BusinessAIContext, PlatformEvent, WaitlistEntry } from "../../types/database";
 import { buildReceptionistInstruction } from "../../lib/ai/persona";
 import { verifyGrounding } from "../../lib/ai/grounding";
 import { buildBookingLink, buildAppointmentLink } from "../../lib/config";
@@ -3840,6 +3841,194 @@ async function main(): Promise<void> {
   }
   gap("§56 live limit: the harness proves a mid-conversation switch REACHES the model, moves the style hashes, and leaves routing/booking/manage/reliability/facts invariant — NOT that Gemini's live wording shifts warmth mid-chat",
     "Whether the very next live reply actually reads warmer/cooler after the switch is model-judged and belongs to the same small optional live probe as §53 (same conversation, flip the preset between turns, compare tone). The deterministic gate locks everything the system controls.");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 57. CUSTOMER-LIFECYCLE AUTOMATIONS — the SYSTEM's DECISION layer (reminders / waitlist / event
+  //     processing). "The system decides; the AI communicates." These checks lock the decision half
+  //     deterministically with fake in-memory DBs — NO real WhatsApp send, NO network, NO live DB, NO Gemini.
+  //     They prove the guarantees an SMB owner depends on: reminders don't double-fire, the reminder window is
+  //     exactly 24h, the waitlist never pings an out-of-window customer, and the not-yet-communicated lifecycle
+  //     event types (booked / inactive / abandoned) — plus any target-less communicated event — stay INERT
+  //     (marked 'skipped', ZERO sends) so a mid-rollout event can never spam a customer. Complements §22
+  //     (auto-complete) / §23 (job auth), which already cover their own slices.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("57. Lifecycle automations — reminder window & idempotency, waitlist window, inert/target-less events (no duplicate / no irrelevant / no accidental sends)");
+  {
+    // ── (A) WAITLIST WINDOW CONTAINMENT (pure `withinWindow`) — the guard that keeps a freed-slot ping from
+    //    reaching a customer whose requested date/time window does NOT contain the slot. Inclusive bounds; a
+    //    null bound = "no constraint". This is the core "don't message irrelevant customers" predicate. ──
+    const slot57 = { dateISO: "2026-07-10", time: "14:00", serviceId: "svc1" as string | null };
+    const win57 = (o: Partial<Pick<WaitlistEntry, "date_from" | "date_to" | "time_from" | "time_to">>):
+      Pick<WaitlistEntry, "date_from" | "date_to" | "time_from" | "time_to"> =>
+      ({ date_from: null, date_to: null, time_from: null, time_to: null, ...o });
+    check("§57.A withinWindow: a fully-unbounded entry (all null) matches any slot",
+      withinWindow(slot57, win57({})) === true);
+    check("§57.A withinWindow: DATE bounds are inclusive — on-boundary IN, a day outside OUT (both ends)",
+      withinWindow({ ...slot57, dateISO: "2026-07-01" }, win57({ date_from: "2026-07-01", date_to: "2026-07-31" })) === true
+      && withinWindow({ ...slot57, dateISO: "2026-07-31" }, win57({ date_from: "2026-07-01", date_to: "2026-07-31" })) === true
+      && withinWindow({ ...slot57, dateISO: "2026-06-30" }, win57({ date_from: "2026-07-01", date_to: "2026-07-31" })) === false
+      && withinWindow({ ...slot57, dateISO: "2026-08-01" }, win57({ date_from: "2026-07-01", date_to: "2026-07-31" })) === false);
+    check("§57.A withinWindow: TIME bounds are inclusive — edge times IN, outside OUT (both ends)",
+      withinWindow({ ...slot57, time: "09:00" }, win57({ time_from: "09:00", time_to: "18:00" })) === true
+      && withinWindow({ ...slot57, time: "18:00" }, win57({ time_from: "09:00", time_to: "18:00" })) === true
+      && withinWindow({ ...slot57, time: "08:59" }, win57({ time_from: "09:00", time_to: "18:00" })) === false
+      && withinWindow({ ...slot57, time: "18:01" }, win57({ time_from: "09:00", time_to: "18:00" })) === false);
+    check("§57.A withinWindow: date AND time must BOTH hold (a time miss inside the date window still excludes)",
+      withinWindow({ ...slot57, dateISO: "2026-07-10", time: "14:00" }, win57({ date_from: "2026-07-10", date_to: "2026-07-10", time_from: "14:00", time_to: "14:00" })) === true
+      && withinWindow({ ...slot57, dateISO: "2026-07-10", time: "14:01" }, win57({ date_from: "2026-07-10", date_to: "2026-07-10", time_from: "14:00", time_to: "14:00" })) === false);
+
+    // ── (B) REMINDER ENQUEUE (real `enqueueDueReminders` over a fake DB): the 24h window is exact, one event
+    //    is emitted per un-reminded appointment, an appointment that ALREADY has a reminder_due event is NOT
+    //    re-enqueued (the anti-duplicate guard), and a DB error fails soft to 0. No send happens here — the
+    //    function only EMITS events; the send is a later, separately-guarded step. ──
+    const now57 = new Date("2026-07-02T09:00:00.000Z");
+    const apptA57 = { id: "apptA", business_id: "biz", customer_id: "cA", start_time: "2026-07-02T20:00:00.000Z" };
+    const apptB57 = { id: "apptB", business_id: "biz", customer_id: "cB", start_time: "2026-07-03T08:00:00.000Z" };
+    const reminderDb57 = (opts: {
+      appts: Array<Record<string, unknown>>; apptError?: unknown;
+      existing: Array<{ appointment_id: string }>; captured: Array<Record<string, unknown>>;
+      bounds?: { gte?: string; lte?: string };
+    }): DB => ({
+      from: (table: string) => {
+        if (table === "appointments") {
+          const c: Record<string, unknown> = {};
+          Object.assign(c, {
+            select: () => c, in: () => c,
+            gte: (...a: unknown[]) => { if (opts.bounds) opts.bounds.gte = a[1] as string; return c; },
+            lte: (...a: unknown[]) => { if (opts.bounds) opts.bounds.lte = a[1] as string; return c; },
+            limit: async () => ({ data: opts.apptError ? null : opts.appts, error: opts.apptError ?? null }),
+          });
+          return c;
+        }
+        const c: Record<string, unknown> = {};
+        Object.assign(c, {
+          select: () => c, eq: () => c,
+          in: async () => ({ data: opts.existing, error: null }),
+          insert: async (row: Record<string, unknown>) => { opts.captured.push(row); return { data: null, error: null }; },
+        });
+        return c;
+      },
+    } as unknown as DB);
+
+    const bounds1: { gte?: string; lte?: string } = {};
+    const cap1: Array<Record<string, unknown>> = [];
+    const enq1 = await enqueueDueReminders(reminderDb57({ appts: [apptA57, apptB57], existing: [], captured: cap1, bounds: bounds1 }), now57);
+    check("§57.B reminder window is EXACTLY 24h: query lower bound = now, upper bound = now + 24h",
+      bounds1.gte === now57.toISOString()
+      && !!bounds1.lte && (new Date(bounds1.lte).getTime() - new Date(bounds1.gte as string).getTime()) === 24 * 3600_000,
+      `gte=${bounds1.gte} lte=${bounds1.lte}`);
+    check("§57.B emits one reminder_due per un-reminded appointment (2 due, 0 existing → 2 emitted; correct ids + pending status)",
+      enq1 === 2 && cap1.length === 2
+      && cap1.every((r) => r.type === "reminder_due" && r.status === "pending")
+      && cap1.map((r) => r.appointment_id as string).sort().join(",") === "apptA,apptB");
+
+    const cap2: Array<Record<string, unknown>> = [];
+    const enq2 = await enqueueDueReminders(reminderDb57({ appts: [apptA57, apptB57], existing: [{ appointment_id: "apptA" }], captured: cap2 }), now57);
+    check("§57.B IDEMPOTENCY (no duplicate reminder): an appt that already has a reminder_due event is skipped — only the un-reminded one is emitted",
+      enq2 === 1 && cap2.length === 1 && cap2[0].appointment_id === "apptB",
+      `enqueued=${enq2} captured=${cap2.map((r) => r.appointment_id as string).join(",")}`);
+
+    const cap3: Array<Record<string, unknown>> = [];
+    const enq3 = await enqueueDueReminders(reminderDb57({ appts: [], apptError: { message: 'relation "appointments" missing' }, existing: [], captured: cap3 }), now57);
+    check("§57.B fail-soft: a DB error while scanning → 0 enqueued, nothing emitted, never throws",
+      enq3 === 0 && cap3.length === 0);
+
+    // ── (C) WAITLIST MATCH (real `matchWaitlistForSlot` over a fake DB): only ACTIVE entries whose window
+    //    contains the freed slot come back; out-of-window entries are dropped (never messaged), and a missing
+    //    table fails soft to []. (Service-scope filtering lives in the SQL `.or(...)`, so it needs a real DB —
+    //    see the GAP below; here the JS-side window filter is what is asserted.) ──
+    const wlEntry57 = (id: string, o: Partial<WaitlistEntry> = {}): WaitlistEntry => ({
+      id, business_id: "biz", customer_id: `c-${id}`, service_id: null,
+      date_from: null, date_to: null, time_from: null, time_to: null,
+      status: "active", notified_at: null, expires_at: null,
+      created_at: "2026-07-01T00:00:00.000Z", updated_at: "2026-07-01T00:00:00.000Z", ...o,
+    });
+    const waitlistDb57 = (rows: WaitlistEntry[] | null, error: unknown = null): DB => ({
+      from: () => {
+        const c: Record<string, unknown> = {};
+        Object.assign(c, {
+          select: () => c, eq: () => c, order: () => c, or: () => c,
+          then: (resolve: (v: { data: unknown; error: unknown }) => unknown) => resolve({ data: rows, error }),
+        });
+        return c;
+      },
+    } as unknown as DB);
+
+    const wlRows57 = [
+      wlEntry57("in-unbounded"),                                                                       // matches: no window
+      wlEntry57("in-window", { date_from: "2026-07-01", date_to: "2026-07-31", time_from: "09:00", time_to: "18:00" }),
+      wlEntry57("out-date", { date_from: "2026-07-11", date_to: "2026-07-31" }),                       // slot 07-10 is before the window
+      wlEntry57("out-time", { time_from: "09:00", time_to: "13:00" }),                                 // slot 14:00 is after the window
+    ];
+    const wlMatched57 = await matchWaitlistForSlot(waitlistDb57(wlRows57), "biz", { dateISO: "2026-07-10", time: "14:00", serviceId: "svc1" });
+    check("§57.C waitlist match returns ONLY in-window active entries; out-of-window entries are dropped (never messaged)",
+      wlMatched57.map((e) => e.id).sort().join(",") === "in-unbounded,in-window",
+      `matched=${wlMatched57.map((e) => e.id).join(",")}`);
+    const wlErr57 = await matchWaitlistForSlot(waitlistDb57(null, { code: "42P01", message: 'relation "waitlist_entries" does not exist' }), "biz", { dateISO: "2026-07-10", time: "14:00" });
+    check("§57.C fail-soft: a missing/broken waitlist table → [] (no matches, never throws)",
+      Array.isArray(wlErr57) && wlErr57.length === 0);
+
+    // ── (D) EVENT PROCESSING (real `processPendingEvents` over a fake DB): un-communicated event types
+    //    (booked / inactive / abandoned) AND communicated types whose required target is ABSENT are ALL marked
+    //    'skipped' with ZERO sends — every event below short-circuits inside dispatch BEFORE the outbound layer,
+    //    so no sendOutbound is reachable. The batch is fail-soft (a missing events table → a noted summary,
+    //    never a throw), and every scanned event is written back exactly once (auditable + won't re-run). ──
+    const ev57 = (id: string, type: PlatformEvent["type"], o: Partial<PlatformEvent> = {}): PlatformEvent => ({
+      id, business_id: "biz", customer_id: "c1", appointment_id: "a1",
+      type, payload: {}, status: "pending", created_at: "2026-07-02T00:00:00.000Z", processed_at: null, ...o,
+    });
+    const pendingEvents57 = [
+      ev57("e1", "appointment_booked"),                          // no communicator → skipped
+      ev57("e2", "customer_inactive"),                           // no communicator → skipped
+      ev57("e3", "abandoned_booking"),                           // no communicator → skipped
+      ev57("e4", "reminder_due", { appointment_id: null }),      // communicator has no target → skipped (no send)
+      ev57("e5", "waitlist_opportunity", { customer_id: null }), // communicator has no target → skipped (no send)
+      ev57("e6", "appointment_cancelled", { payload: {} }),      // no freed-slot in payload → skipped (no send)
+    ];
+    const lifecycleDb57 = (opts: { pending: PlatformEvent[]; pendingError?: unknown; updates: Array<Record<string, unknown>> }): DB => ({
+      from: (table: string) => {
+        if (table === "appointments") {
+          const c: Record<string, unknown> = {};
+          Object.assign(c, {
+            select: () => c, update: () => c, in: () => c, eq: () => c, gte: () => c, lte: () => c, lt: () => c, order: () => c,
+            limit: async () => ({ data: [], error: null }),                                                        // enqueue scan → none due
+            then: (resolve: (v: { data: unknown; error: unknown }) => unknown) => resolve({ data: [], error: null }), // completePastAppointments → 0
+          });
+          return c;
+        }
+        const c: Record<string, unknown> & { __row?: Record<string, unknown>; __id?: string } = {};
+        Object.assign(c, {
+          select: () => c, order: () => c, in: () => c,
+          eq: (col: string, val: string) => { if (col === "id") c.__id = val; return c; },
+          update: (row: Record<string, unknown>) => { c.__row = row; return c; },
+          limit: async () => ({ data: opts.pendingError ? null : opts.pending, error: opts.pendingError ?? null }),
+          then: (resolve: (v: { data: unknown; error: unknown }) => unknown) => {
+            if (c.__row) opts.updates.push({ id: c.__id, ...c.__row });
+            resolve({ data: null, error: null });
+          },
+        });
+        return c;
+      },
+    } as unknown as DB);
+
+    const evUpdates57: Array<Record<string, unknown>> = [];
+    const procSummary57 = await processPendingEvents(lifecycleDb57({ pending: pendingEvents57, updates: evUpdates57 }), now57);
+    check("§57.D un-communicated & target-less events are ALL marked 'skipped' (0 processed) — nothing sends",
+      procSummary57.scanned === 6 && procSummary57.processed === 0 && procSummary57.skipped === 6
+      && procSummary57.remindersEnqueued === 0 && procSummary57.appointmentsCompleted === 0,
+      `scanned=${procSummary57.scanned} processed=${procSummary57.processed} skipped=${procSummary57.skipped}`);
+    check("§57.D every scanned event is counted by type AND written back once as status='skipped' (auditable, idempotent)",
+      procSummary57.byType.appointment_booked === 1 && procSummary57.byType.customer_inactive === 1 && procSummary57.byType.abandoned_booking === 1
+      && procSummary57.byType.reminder_due === 1 && procSummary57.byType.waitlist_opportunity === 1 && procSummary57.byType.appointment_cancelled === 1
+      && evUpdates57.length === 6 && evUpdates57.every((u) => u.status === "skipped"),
+      `updates=${evUpdates57.length} statuses=${[...new Set(evUpdates57.map((u) => u.status as string))].join(",")}`);
+    const procSummaryErr57 = await processPendingEvents(lifecycleDb57({ pending: [], pendingError: { message: 'relation "events" does not exist' }, updates: [] }), now57);
+    check("§57.D fail-soft: a missing events table → a noted summary, 0 scanned/processed, never throws",
+      procSummaryErr57.scanned === 0 && procSummaryErr57.processed === 0
+      && typeof procSummaryErr57.note === "string" && procSummaryErr57.note.includes("events table unavailable"));
+  }
+  gap("§57 scope: proves the SYSTEM's lifecycle DECISIONS (reminder 24h window + idempotency, waitlist window containment, inert/target-less events → no send). The actual SEND (sendOutbound → WhatsApp), the SERVICE-scope match (SQL `.or`), and the still-unimplemented abandoned_booking / customer_inactive automations are outside this deterministic slice.",
+    "Documented follow-ups (NOT built this sprint — each needs schema and/or a new emitter): (1) a DB unique constraint on events(appointment_id, type) to harden reminder idempotency against a concurrent double-run; (2) a send-level idempotency key so a re-processed event can never double-send; (3) enforce waitlist expires_at so stale entries aren't matched; (4) emit + communicate abandoned_booking (booking-session staleness) and customer_inactive (inactivity scan).");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
