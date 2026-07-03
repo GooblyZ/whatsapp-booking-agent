@@ -1,7 +1,7 @@
 "use server";
 
 import { getDefaultBusinessId } from "@/lib/config";
-import { updateAISettings } from "@/lib/services/ai-settings";
+import { updateAISettings, type UpdateAISettingsInput } from "@/lib/services/ai-settings";
 import { enhancePersonaDescription } from "@/lib/ai/persona-enhance";
 import type {
   AISettingsResponseLength,
@@ -32,29 +32,35 @@ function cleanText(raw: unknown, max: number): string | null {
 export async function saveAISettingsAction(formData: FormData) {
   const businessId = getDefaultBusinessId();
 
+  // AI Settings v1: PRESENT-FIELDS-ONLY partial payload. When the assistant is OFF the style
+  // controls are rendered `disabled`, and disabled fields are ABSENT from FormData — so a field
+  // is written only when it was actually submitted. A save-while-off therefore persists ONLY the
+  // master switch and can never wipe the owner's style columns (updateAISettings' upsert touches
+  // only the keys it receives). ai_enabled is the ONE field always written: the switch is always
+  // enabled, and an unchecked checkbox is legitimately absent → false.
+  const data: UpdateAISettingsInput = { ai_enabled: formData.get("ai_enabled") === "on" };
+  // IDENTITY
+  if (formData.has("assistant_name"))   data.assistant_name   = (formData.get("assistant_name") as string)?.trim() || "עוזר";
+  if (formData.has("assistant_gender")) data.assistant_gender = safeGender(formData.get("assistant_gender"));
+  // WRITING STYLE (format)
+  if (formData.has("response_length")) data.response_length = (formData.get("response_length") as AISettingsResponseLength) || "medium";
+  if (formData.has("emoji_usage"))     data.emoji_usage     = (formData.get("emoji_usage")     as AISettingsEmojiUsage)     || "low";
+  if (formData.has("language"))        data.language        = safeLanguage(formData.get("language"));
+  // PERSONALITY — the single natural-language voice authority.
+  if (formData.has("custom_instructions")) data.custom_instructions = cleanText(formData.get("custom_instructions"), 2000);
+  // HARD RULES
+  if (formData.has("things_to_avoid")) data.things_to_avoid = cleanText(formData.get("things_to_avoid"), 1000);
+  // faq_enabled / intent_detection_enabled are NO LONGER owner-facing (core behavior whenever the
+  // assistant is on) and are deliberately NOT written — existing DB values are preserved verbatim
+  // (Option A in the AI Settings v1 plan; backend reads in brain.ts/facts.ts are unchanged).
+
   // Presentation-only save feedback: a genuine persistence failure should surface a graceful
   // Hebrew banner, not an unhandled 500. redirect() throws NEXT_REDIRECT internally, so it MUST
   // stay OUTSIDE the try — otherwise the success redirect would be swallowed by the catch.
   let fullyPersisted = true;
   let saveFailed = false;
   try {
-    ({ fullyPersisted } = await updateAISettings(businessId, {
-      // IDENTITY
-      assistant_name:      (formData.get("assistant_name") as string)?.trim() || "עוזר",
-      assistant_gender:    safeGender(formData.get("assistant_gender")),
-      // WRITING STYLE (format)
-      response_length:     (formData.get("response_length") as AISettingsResponseLength)   || "medium",
-      emoji_usage:         (formData.get("emoji_usage")     as AISettingsEmojiUsage)       || "low",
-      language:            safeLanguage(formData.get("language")),
-      // PERSONALITY — the single natural-language voice authority.
-      custom_instructions: cleanText(formData.get("custom_instructions"), 2000),
-      // HARD RULES
-      things_to_avoid:     cleanText(formData.get("things_to_avoid"), 1000),
-      // Unchecked checkboxes are absent from FormData → treated as false.
-      ai_enabled:               formData.get("ai_enabled") === "on",
-      faq_enabled:              formData.get("faq_enabled") === "on",
-      intent_detection_enabled: formData.get("intent_detection_enabled") === "on",
-    }));
+    ({ fullyPersisted } = await updateAISettings(businessId, data));
   } catch {
     saveFailed = true;
   }

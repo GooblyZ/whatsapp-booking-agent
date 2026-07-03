@@ -1,10 +1,13 @@
 // lib/ai/persona-enhance.ts
 // Server-side only.
 //
-// "✨ Enhance" — an OWNER-INITIATED, settings-time helper that rewrites a rough
-// personality description into a clearer, richer one. The owner reviews and edits
-// the result before saving, so this never silently becomes the behavior authority:
-// the description in the textbox is always the source of truth.
+// "✨ Enhance" — an OWNER-INITIATED, settings-time helper that NORMALIZES a rough
+// personality description into clean STYLE-INSTRUCTION language (the same register as
+// the shipped presets: "הסגנון צריך להיות…"), preserving the owner's meaning and any
+// wording they explicitly asked for. It is a normalizer, not a biographer: never a
+// third-person character sketch ("היא תמיד נעימה…"), never invented traits. The owner
+// reviews and edits the result before saving, so this never silently becomes the
+// behavior authority: the description in the textbox is always the source of truth.
 //
 // This is NOT part of the customer messaging path — `lib/ai/brain.ts` remains the
 // only per-turn Gemini call site. This runs only when the owner clicks the button
@@ -24,18 +27,25 @@ export type EnhanceResult =
   | { ok: false; reason: "empty" | "not_configured" | "unavailable" };
 
 const INSTRUCTION = [
-  "You help a small-business owner describe their WhatsApp receptionist's PERSONALITY.",
-  "Rewrite the owner's rough description into a clear, vivid, natural one that an AI can act on.",
+  "You NORMALIZE a small-business owner's rough description of their WhatsApp assistant's PERSONALITY",
+  "into clean STYLE-INSTRUCTION language an AI can follow. You are a normalizer, not a writer:",
+  "preserve the owner's meaning and requested wording — only make it clearer, tighter, and prompt-ready.",
+  "",
+  "OUTPUT REGISTER — write like a style guide, never a biography. Use instruction forms such as:",
+  '"הסגנון צריך להיות…", "התשובות צריכות להרגיש…", "הטון…", "להשתמש ב…", "להימנע מ…", "כדאי לשמור על…".',
   "",
   "Rules:",
-  "- Write in Hebrew, 2–4 short sentences, in the owner's voice describing the receptionist.",
-  "- Describe ONLY character, voice, attitude and how it treats customers.",
+  "- Hebrew, 2–4 short sentences, style-instruction phrasing ONLY.",
+  '- NEVER a third-person character sketch ("היא תמיד…", "הוא תמיד…") and NEVER first-person ("אני…") —',
+  "  the assistant's gender is a SEPARATE setting; describe the STYLE, not a person.",
+  '- NEVER slash-gender forms ("חם/ה", "תרצה/י").',
+  "- PRESERVE the owner's intent and any specific words/phrases they asked the assistant to use —",
+  "  keep those verbatim. Do NOT invent traits, moods, or habits the owner didn't request.",
+  "- Describe ONLY character, voice, attitude and how replies should feel to customers.",
   "- Do NOT mention message length, emojis, language, opening hours, prices, services, or any business facts.",
-  "- Do NOT add prohibitions or rules (those live elsewhere).",
-  "- Keep the owner's original intent; enrich and clarify it, don't replace it.",
-  "- Gender-neutral toward the customer (e.g. \"מתאים לך\"), unless the owner specified otherwise.",
+  '- Do NOT add prohibitions the owner didn\'t ask for; a style avoidance the OWNER requested may stay, phrased as "להימנע מ…".',
   "",
-  'Output STRICT JSON only: {"description": "<the improved description>"}',
+  'Output STRICT JSON only: {"description": "<the normalized style instructions>"}',
 ].join("\n");
 
 /**
