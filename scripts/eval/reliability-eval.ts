@@ -82,6 +82,7 @@ import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../l
 import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
 import { PERSONA_PRESETS } from "../../lib/ai/persona-presets";
 import { flagsBusinessPolicy } from "../../app/dashboard/ai-assistant/policy-lint";
+import { buildVoicePreview, PRESET_CARD_META, type PreviewPresetId } from "../../app/dashboard/ai-assistant/voice-preview";
 import { resolveStyleProfile } from "../../lib/ai/resolve-style-profile";
 import type { AISettings, AISettingsEmojiUsage, AISettingsResponseLength, BusinessAIContext, PlatformEvent, WaitlistEntry } from "../../types/database";
 import { buildReceptionistInstruction } from "../../lib/ai/persona";
@@ -4116,6 +4117,79 @@ async function main(): Promise<void> {
   }
   gap("§58 scope: shouldSuppressStaleInbound is unit-locked here (pure decision incl. the incident's exact timestamps). The handler WIRING (lib/message-handler.ts) — save-for-audit before the guard, the latest-prior-inbound lookup, and the early return that skips Gemini/outbound/link/counters — is a thin integration verified by inspection, matching how §22/§23 scope their route/DB edges.",
     "Follow-ups (not this sprint): make the out-of-order lookup index-backed if inbound volume per customer grows; consider a WhatsApp template 're-open' path for genuinely-late messages the owner still wants answered; expose suppression counts on the dashboard for auditability.");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 59. STATIC VOICE PREVIEW (AI Settings UI v2) — the dashboard's deterministic, non-Gemini example
+  //     reply. UI-ONLY: buildVoicePreview never touches the runtime prompt or the resolved style; these
+  //     checks lock that it is deterministic, style-only (no URLs / booked-claims / industry vocabulary /
+  //     price digits), length- and emoji-faithful, and that its one deliberate duplication (the client-
+  //     safe emoji-cap map, since emojiCapFor lives in a server-only module) can never drift from the
+  //     runtime. Card copy (PRESET_CARD_META) is held to the same authoring rules as the presets.
+  // ════════════════════════════════════════════════════════════════════════════════
+  section("59. Static voice preview (dashboard UI) — deterministic, style-only, cap-locked to the runtime");
+  {
+    const PRESET_IDS_59 = ["warm", "professional", "casual", "premium", "concise"] as const;
+    const ALL_IDS_59: PreviewPresetId[] = [...PRESET_IDS_59, "custom", "default"];
+    const pv = (
+      presetId: PreviewPresetId,
+      emojiUsage: AISettingsEmojiUsage = "low",
+      responseLength: AISettingsResponseLength = "medium"
+    ): string => buildVoicePreview({ presetId, emojiUsage, responseLength });
+    const emojiCount = (s: string): number => (s.match(/\p{Extended_Pictographic}/gu) ?? []).length;
+    const sentenceCount = (s: string): number => (s.match(/[.!?]/g) ?? []).length;
+
+    // (1) Deterministic + pure: same input → byte-identical output, every voice.
+    check("§59 deterministic: same input → byte-identical preview (all 5 presets + custom + default)",
+      ALL_IDS_59.every((id) => pv(id) === pv(id) && pv(id).trim().length > 0));
+
+    // (2) The chooser is a real comparison: every preset's preview reads differently.
+    check("§59 contrast: all five preset previews are pairwise distinct",
+      new Set(PRESET_IDS_59.map((id) => pv(id))).size === PRESET_IDS_59.length);
+
+    // (3–5) Emoji faithfulness + the cap-map drift lock against the runtime's emojiCapFor.
+    check("§59 emoji 'none' → zero emojis in every voice (stripEmojis is a no-op)",
+      ALL_IDS_59.every((id) => { const p = pv(id, "none"); return stripEmojis(p) === p && emojiCount(p) === 0; }));
+    check("§59 emoji low/medium → exactly 1 / 2 appended; low output differs from none output",
+      emojiCount(pv("warm", "low")) === 1 && emojiCount(pv("warm", "medium")) === 2
+      && pv("warm", "low") !== pv("warm", "none"));
+    check("§59 cap map LOCKED to the runtime: appended count per usage === emojiCapFor(usage) (deliberate client-safe duplication cannot drift)",
+      (["none", "low", "medium"] as AISettingsEmojiUsage[]).every((u) => emojiCount(pv("warm", u)) === emojiCapFor(u)));
+
+    // (6) Length faithfulness: short < medium < long sentences, for every voice.
+    check("§59 length monotonic: sentence count short < medium < long (every voice incl. custom/default)",
+      ALL_IDS_59.every((id) =>
+        sentenceCount(pv(id, "none", "short")) < sentenceCount(pv(id, "none", "medium"))
+        && sentenceCount(pv(id, "none", "medium")) < sentenceCount(pv(id, "none", "long"))));
+
+    // (7) Style-only boundary: a preview is an EXAMPLE reply — it may mention that one can ask about
+    //     prices or move on to booking, but it must never carry a URL, a booked-claim, a concrete
+    //     price/digit, or industry vocabulary (vertical-neutral like everything customer-facing).
+    const INDUSTRY_59 = /מספרה|שיער|תספורת|סלון|טיפול|hair|salon|barber|stylist/i;
+    const lengths59: AISettingsResponseLength[] = ["short", "medium", "long"];
+    check("§59 style-only boundary: no URL / booked-claim / industry vocab / digits in ANY preview (all voices × lengths, emoji medium)",
+      ALL_IDS_59.every((id) => lengths59.every((len) => {
+        const p = pv(id, "medium", len);
+        return !/https?:\/\//.test(p) && !claimsBookingCompleted(p) && !INDUSTRY_59.test(p) && !/\d/.test(p);
+      })));
+
+    // (8) Card copy is held to the preset authoring rules: exactly the 5 shipped ids, non-empty,
+    //     style-only (0 policy-lint hits), no slash-gender forms.
+    const SLASH_GENDER_59 = /[א-ת]\/[א-ת]/;
+    check("§59 PRESET_CARD_META: exactly the 5 shipped preset ids; descriptions/samples non-empty, policy-clean, no slash-gender",
+      PERSONA_PRESETS.every((p) => p.id in PRESET_CARD_META)
+      && Object.keys(PRESET_CARD_META).length === PERSONA_PRESETS.length
+      && Object.values(PRESET_CARD_META).every((m) =>
+        m.description.trim().length > 0 && m.sample.trim().length > 0
+        && flagsBusinessPolicy(m.description).length === 0 && flagsBusinessPolicy(m.sample).length === 0
+        && !SLASH_GENDER_59.test(m.description) && !SLASH_GENDER_59.test(m.sample)));
+
+    // (9) Fail-open shape: an edited ("custom") or empty ("default") personality gets the neutral
+    //     generic preview — non-empty and identical (custom text is never interpreted client-side).
+    check("§59 custom/default → the neutral bank (non-empty; custom === default; never interprets free text)",
+      pv("custom").length > 0 && pv("custom") === pv("default"));
+  }
+  gap("§59 scope: locks the STATIC preview helper (pure string composition). It intentionally does NOT claim the live Gemini voice sounds like the preview — that remains the §53/§56 live-probe limitation. The dashboard wiring (cards → applyPreset seeding, controlled selects, StylePanel rendering) is thin client markup verified by the manual dashboard checklist.",
+    "Deferred (documented in the sprint plan): live Gemini preview (API cost), per-language preview text (preview renders Hebrew with a note when language ≠ he), 'לפי הסגנון' inherit enum + provenance columns (DB), Phase C business-rules separation.");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
