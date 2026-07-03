@@ -233,9 +233,10 @@ export function getGeminiModel(): string {
  */
 export async function geminiGenerateJSON(
   systemInstruction: string,
-  userMessage: string
+  userMessage: string,
+  opts: GeminiCallOptions = {}
 ): Promise<GeminiResult> {
-  return callGemini(systemInstruction, [{ role: "user", parts: [{ text: userMessage }] }]);
+  return callGemini(systemInstruction, [{ role: "user", parts: [{ text: userMessage }] }], opts);
 }
 
 /**
@@ -254,6 +255,12 @@ export interface GeminiCallOptions {
   /** LOG-ONLY correlation id (e.g. a phone-safe hash from brain.ts) tying this call's `[gemini-attempt]`
    *  / `[gemini-usage]` / `[gemini-health]` lines to its `[gemini-prompt]` line. Never the raw phone. */
   turnId?: string;
+  /** SETTINGS-TIME calls (e.g. the dashboard ✨ persona-enhance) must not touch the process-global
+   *  provider breaker in EITHER direction: no strike on failure (a dashboard click must never push
+   *  customer conversations toward cooldown/deterministic fallback) and no reset on success (must
+   *  not clear strikes the runtime is legitimately tracking). Default false — every customer-facing
+   *  caller is byte-identical. */
+  healthNeutral?: boolean;
 }
 
 export async function geminiGenerateConversation(
@@ -315,7 +322,7 @@ async function callGemini(
   // simulation suite to validate degraded mode end to end).
   if (process.env.GEMINI_SIMULATE_OVERLOAD === "1") {
     console.warn("[gemini] SIMULATED overload (GEMINI_SIMULATE_OVERLOAD=1)");
-    noteProviderStrike(model, "overload");
+    if (!opts.healthNeutral) noteProviderStrike(model, "overload");
     return { ok: false, code: "overloaded", error: "Simulated 503 (high demand)" };
   }
 
@@ -327,7 +334,9 @@ async function callGemini(
     contents.reduce((n, c) => n + c.parts.reduce((m, p) => m + p.text.length, 0), 0);
   const promptTokensEst = estimateTokens(promptChars);
   const promptBucket = promptSizeBucket(promptTokensEst);
-  const recoveryProbe = overloadStrikes > 0;
+  // A health-neutral call is never a recovery probe: its outcome must not decide (or log) any
+  // breaker transition — probe semantics belong to customer-facing calls only.
+  const recoveryProbe = !opts.healthNeutral && overloadStrikes > 0;
   const providerStateBefore = getGeminiHealth().state;
 
   // HALF-OPEN recovery probe: if we're still carrying overload strikes (the cooldown just
@@ -390,10 +399,13 @@ async function callGemini(
           await sleep(retryDelayMs());           // one retry, bounded jitter (overload OR transient 5xx)
           continue;
         }
-        // Both attempts failed transiently → ONE provider strike (shared breaker).
-        const healthBefore = getGeminiHealth();
-        noteProviderStrike(model, overloaded ? "overload" : "server");
-        logHealthTransition(turnId, healthBefore, overloaded ? "overloaded" : "server_error", recoveryProbe);
+        // Both attempts failed transiently → ONE provider strike (shared breaker) — unless this is
+        // a health-neutral (settings-time) call, which must never move customer-facing state.
+        if (!opts.healthNeutral) {
+          const healthBefore = getGeminiHealth();
+          noteProviderStrike(model, overloaded ? "overload" : "server");
+          logHealthTransition(turnId, healthBefore, overloaded ? "overloaded" : "server_error", recoveryProbe);
+        }
         return overloaded
           ? { ok: false, code: "overloaded", error: `Gemini overloaded (${res.status})` }
           : { ok: false, code: "api_error", error: `Gemini API error (${res.status})` };
@@ -403,11 +415,15 @@ async function callGemini(
       return { ok: false, code: "api_error", error: `Gemini API error (${res.status})` };
     }
 
-    // Any successful HTTP round trip means the model is reachable again.
+    // Any successful HTTP round trip means the model is reachable again — but only a
+    // customer-facing call may RESET the breaker (healthNeutral: a settings-time success must
+    // not clear strikes the runtime is tracking).
     const latencyMs = Date.now() - attemptStartedAt;
-    const healthBefore = getGeminiHealth();
-    noteSuccess();
-    logHealthTransition(turnId, healthBefore, "success", recoveryProbe);
+    if (!opts.healthNeutral) {
+      const healthBefore = getGeminiHealth();
+      noteSuccess();
+      logHealthTransition(turnId, healthBefore, "success", recoveryProbe);
+    }
     console.log(geminiAttemptLine({
       turnId, attempt, model, status: "success", latencyMs,
       recoveryProbe, providerStateBefore, promptTokensEst, promptBucket,
@@ -463,9 +479,12 @@ async function callGemini(
     // failure → ONE strike on the shared breaker, so repeated timeouts/network errors close together
     // eventually protect the system (3-in-window → cooldown → deterministic). Deliberately NOT retried: a
     // 2nd up-to-12s wait would blow the WhatsApp latency budget, so a single one stays AI-first (soft fallback).
-    const healthBefore = getGeminiHealth();
-    noteProviderStrike(model, aborted ? "timeout" : "network");
-    logHealthTransition(turnId, healthBefore, aborted ? "timeout" : "network_error", recoveryProbe);
+    // healthNeutral (settings-time) calls never strike — a dashboard click must not degrade customers.
+    if (!opts.healthNeutral) {
+      const healthBefore = getGeminiHealth();
+      noteProviderStrike(model, aborted ? "timeout" : "network");
+      logHealthTransition(turnId, healthBefore, aborted ? "timeout" : "network_error", recoveryProbe);
+    }
     return { ok: false, code: "network", error: aborted ? "Gemini request timed out" : "Gemini request failed" };
   } finally {
     clearTimeout(timer);

@@ -86,11 +86,15 @@ export type EnhanceState =
 export async function enhancePersonaAction(current: string): Promise<EnhanceState> {
   const res = await enhancePersonaDescription(current ?? "");
   if (res.ok) return { status: "done", text: res.text };
+  // Three DISTINCT failure classes, three distinct honest messages: empty input is a validation
+  // nudge, a missing key is a real configuration state, and everything else is a TEMPORARY
+  // provider condition (already retried once inside enhancePersonaDescription). In every case the
+  // owner's text is untouched and can be saved as-is.
   const message =
     res.reason === "empty"
-      ? "כתוב/י תיאור קצר קודם, ואז אפשר לשפר אותו."
+      ? "כתבו תיאור קצר קודם — אחר כך אפשר לשפר אותו."
       : res.reason === "not_configured"
-        ? "שירות ה-AI לא מוגדר כרגע — התיאור נשמר כפי שהוא."
-        : "השיפור לא זמין כרגע — נסה/י שוב מאוחר יותר. התיאור שלך נשמר כפי שהוא.";
+        ? "שירות ה-AI לא מוגדר במערכת, ולכן שיפור הטקסט אינו זמין — אפשר לשמור את הטקסט כמו שהוא."
+        : "שיפור הטקסט לא זמין כרגע. אפשר לנסות שוב בעוד רגע או לשמור את הטקסט כמו שהוא.";
   return { status: "error", message };
 }

@@ -48,22 +48,52 @@ const INSTRUCTION = [
   'Output STRICT JSON only: {"description": "<the normalized style instructions>"}',
 ].join("\n");
 
+/** Settings-time retry backoff. The transport (callGemini) deliberately does NOT retry
+ *  timeouts/network errors — that protects the WhatsApp latency budget, which doesn't apply to an
+ *  owner clicking a dashboard button. One extra attempt here also gives double-503 spikes and a
+ *  one-off unparseable response a second chance. */
+const RETRY_DELAY_MS = 1200;
+
 /**
  * Rewrites a personality description. Never throws. Returns the improved text on
  * success, or a typed reason the caller can surface (then keep the original).
+ * One settings-time retry on any transient failure (provider error, timeout, or an
+ * unparseable response); "not_configured" is permanent and returns immediately.
+ * Logs a `[persona-enhance]` line per failure — failure class + char counts ONLY
+ * (never the owner's text, never a key).
  */
 export async function enhancePersonaDescription(raw: string): Promise<EnhanceResult> {
   const input = (raw ?? "").trim();
   if (!input) return { ok: false, reason: "empty" };
-  if (!isGeminiConfigured()) return { ok: false, reason: "not_configured" };
+  if (!isGeminiConfigured()) {
+    console.warn("[persona-enhance] skipped — GEMINI_API_KEY not configured");
+    return { ok: false, reason: "not_configured" };
+  }
 
-  const res = await geminiGenerateJSON(INSTRUCTION, input.slice(0, MAX_INPUT));
-  if (!res.ok) return { ok: false, reason: "unavailable" };
-
-  const description = parseDescription(res.text);
-  if (!description) return { ok: false, reason: "unavailable" };
-
-  return { ok: true, text: description.slice(0, MAX_OUTPUT) };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    // healthNeutral: a SETTINGS-TIME call must never move the process-global provider breaker —
+    // an owner's enhance click (or its retry) can neither push customer conversations toward
+    // cooldown/deterministic fallback nor prematurely reset strikes the runtime is tracking.
+    const res = await geminiGenerateJSON(INSTRUCTION, input.slice(0, MAX_INPUT), {
+      healthNeutral: true, turnId: "persona-enhance",
+    });
+    if (res.ok) {
+      const description = parseDescription(res.text);
+      if (description) {
+        if (attempt > 1) console.log("[persona-enhance] succeeded on retry (attempt=2)");
+        return { ok: true, text: description.slice(0, MAX_OUTPUT) };
+      }
+      console.warn(
+        `[persona-enhance] unparseable response — attempt=${attempt} inputChars=${input.length} outputChars=${res.text.length}`
+      );
+    } else {
+      console.warn(`[persona-enhance] provider failure — attempt=${attempt} code=${res.code} inputChars=${input.length}`);
+      // A missing key can't heal by retrying (and the transport never struck the breaker for it).
+      if (res.code === "not_configured") return { ok: false, reason: "not_configured" };
+    }
+    if (attempt === 1) await new Promise<void>((r) => setTimeout(r, RETRY_DELAY_MS));
+  }
+  return { ok: false, reason: "unavailable" };
 }
 
 function parseDescription(text: string): string | null {
