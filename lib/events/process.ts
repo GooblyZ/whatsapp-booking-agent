@@ -13,7 +13,12 @@
 
 import type { DB } from "@/lib/booking/helpers";
 import { emitEvent } from "./emit";
-import { sendOutbound } from "@/lib/booking/outbound";
+import { sendOutboundInteractive } from "@/lib/booking/outbound";
+import { confirmationCta } from "@/lib/booking/notifications";
+import {
+  buildReminderMessage, buildWaitlistFreedSlotMessage, buildWaitlistOpportunityMessage,
+} from "@/lib/messaging/templates";
+import { sendWindowDecision, SEND_WINDOW_START_HOUR, SEND_WINDOW_END_HOUR } from "@/lib/messaging/send-window";
 import { getAppointmentView } from "@/lib/booking/platform";
 import { matchWaitlistForSlot, markWaitlistNotified, type FreedSlot } from "@/lib/booking/waitlist";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
@@ -35,6 +40,8 @@ export interface ProcessSummary {
   scanned: number;
   processed: number;
   skipped: number;
+  /** Quiet-hours deferrals: the event stayed 'pending' and will send on the first in-window run. */
+  deferred: number;
   byType: Record<string, number>;
   note?: string;
 }
@@ -48,9 +55,28 @@ async function getCustomerContact(db: DB, customerId: string | null): Promise<Co
   return phone ? { phone, name: (data?.name as string | null) ?? null } : null;
 }
 
-function ddmm(dateISO: string): string {
-  const [, mo, d] = dateISO.split("-");
-  return `${parseInt(d, 10)}/${parseInt(mo, 10)}`;
+/** Business timezone for job-driven sends (slug is needed for booking links anyway — one query). */
+async function getBusinessSendContext(db: DB, businessId: string): Promise<{ slug: string | null; timezone: string | null }> {
+  const { data } = await db.from("businesses").select("slug, timezone").eq("id", businessId).maybeSingle();
+  return { slug: (data?.slug as string | null) ?? null, timezone: (data?.timezone as string | null) ?? null };
+}
+
+/** Quiet-hours gate for PROACTIVE (job-driven) sends. Returns true when the send must be
+ *  DEFERRED (outside the business-local window). Logs every defer + any tz_error (fail-open). */
+function shouldDeferProactiveSend(ev: PlatformEvent, timezone: string | null, now: Date): boolean {
+  const d = sendWindowDecision(now, timezone);
+  if (d.reason === "tz_error") {
+    console.warn(`[events] send-window tz_error (business=${ev.business_id}) — failing open (sending)`);
+    return false;
+  }
+  if (!d.allow) {
+    console.log(
+      `[events] defer type=${ev.type} id=${ev.id} reason=${d.reason} localHour=${d.localHour}` +
+      ` window=${SEND_WINDOW_START_HOUR}-${SEND_WINDOW_END_HOUR}`
+    );
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -151,14 +177,14 @@ function logProcessSummary(s: ProcessSummary): void {
   const byType = Object.entries(s.byType).map(([t, n]) => `${t}=${n}`).join(",") || "none";
   console.log(
     `[events] run summary completed=${s.appointmentsCompleted} remindersEnqueued=${s.remindersEnqueued}` +
-    ` scanned=${s.scanned} processed=${s.processed} skipped=${s.skipped} byType={${byType}}` +
+    ` scanned=${s.scanned} processed=${s.processed} skipped=${s.skipped} deferred=${s.deferred} byType={${byType}}` +
     (s.note ? ` note="${s.note}"` : "")
   );
 }
 
 /** Processes all pending events. Fail-soft; returns a summary for the runner. */
 export async function processPendingEvents(db: DB, now: Date = new Date()): Promise<ProcessSummary> {
-  const summary: ProcessSummary = { remindersEnqueued: 0, appointmentsCompleted: 0, scanned: 0, processed: 0, skipped: 0, byType: {} };
+  const summary: ProcessSummary = { remindersEnqueued: 0, appointmentsCompleted: 0, scanned: 0, processed: 0, skipped: 0, deferred: 0, byType: {} };
 
   // Lifecycle hygiene: flip finished confirmed appointments to 'completed' so the dashboard no longer
   // shows them as active/approved (the chatbot already ignores past appointments). Fail-soft + idempotent.
@@ -184,7 +210,13 @@ export async function processPendingEvents(db: DB, now: Date = new Date()): Prom
   for (const ev of events) {
     summary.byType[ev.type] = (summary.byType[ev.type] ?? 0) + 1;
     try {
-      const outcome = await dispatch(db, ev);
+      const outcome = await dispatch(db, ev, now);
+      if (outcome === "deferred") {
+        // Quiet hours: DEFER, never drop — no status write, the event stays 'pending' and
+        // is re-scanned on the next run (delivered on the first in-window run).
+        summary.deferred++;
+        continue;
+      }
       await db
         .from("events")
         .update({ status: outcome, processed_at: new Date().toISOString() })
@@ -201,17 +233,18 @@ export async function processPendingEvents(db: DB, now: Date = new Date()): Prom
   return summary;
 }
 
-/** Returns the new status for the event: "processed" (acted) or "skipped" (no action needed). */
-async function dispatch(db: DB, ev: PlatformEvent): Promise<"processed" | "skipped"> {
+/** Returns the new status for the event — "processed" (acted) / "skipped" (no action needed) —
+ *  or "deferred" (quiet hours: leave 'pending', send on the first in-window run). */
+async function dispatch(db: DB, ev: PlatformEvent, now: Date): Promise<"processed" | "skipped" | "deferred"> {
   switch (ev.type) {
     case "appointment_cancelled":
     case "appointment_rescheduled":
-      return notifyWaitlistForFreedSlot(db, ev);
+      return notifyWaitlistForFreedSlot(db, ev, now);
     case "reminder_due":
-      return sendReminder(db, ev);
+      return sendReminder(db, ev, now);
     case "waitlist_opportunity":
       // Opportunities are emitted already-targeted at a customer; communicate it.
-      return sendWaitlistOpportunity(db, ev);
+      return sendWaitlistOpportunity(db, ev, now);
     default:
       // booked / inactive / abandoned have no communicator in this slice.
       return "skipped";
@@ -219,7 +252,7 @@ async function dispatch(db: DB, ev: PlatformEvent): Promise<"processed" | "skipp
 }
 
 /** A slot just freed — notify the earliest matching waitlist customer(s). */
-async function notifyWaitlistForFreedSlot(db: DB, ev: PlatformEvent): Promise<"processed" | "skipped"> {
+async function notifyWaitlistForFreedSlot(db: DB, ev: PlatformEvent, now: Date): Promise<"processed" | "skipped" | "deferred"> {
   const p = ev.payload ?? {};
   const dateISO = (p.dateISO as string) ?? (p.fromDateISO as string);
   const time = (p.time as string) ?? (p.fromTime as string);
@@ -229,21 +262,21 @@ async function notifyWaitlistForFreedSlot(db: DB, ev: PlatformEvent): Promise<"p
   const matches = await matchWaitlistForSlot(db, ev.business_id, slot);
   if (matches.length === 0) return "skipped";
 
-  // Resolve the business slug once for booking links.
-  const { data: biz } = await db.from("businesses").select("slug").eq("id", ev.business_id).maybeSingle();
-  const slug = (biz?.slug as string) ?? null;
+  // One query resolves booking-link slug + the quiet-hours timezone.
+  const { slug, timezone } = await getBusinessSendContext(db, ev.business_id);
   if (!slug) return "skipped";
+  if (shouldDeferProactiveSend(ev, timezone, now)) return "deferred"; // entries stay 'active' — re-matched next run
 
   let notified = 0;
   for (const entry of matches.slice(0, MAX_WAITLIST_NOTIFY_PER_SLOT)) {
     const contact = await getCustomerContact(db, entry.customer_id);
     if (!contact) continue;
     const link = buildBookingLink(slug, contact.phone);
-    const msg =
-      `התפנה תור ב-${ddmm(dateISO)} בשעה ${time}!\n` +
-      `רצינו לעדכן אותך כי ביקשת להיכנס לרשימת ההמתנה. ` +
-      `התור פתוח לכל מי שיקבע ראשון:\n${link}`;
-    await sendOutbound(db, ev.business_id, entry.customer_id, contact.phone, msg, { source: "job_waitlist", reason: "freed_slot" });
+    const msg = buildWaitlistFreedSlotMessage({ dateISO, time, bookingLink: link });
+    // Same clean cta_url mechanism as booking confirmations (URL in the button; text fallback keeps it).
+    const cta = confirmationCta(msg, link);
+    await sendOutboundInteractive(db, ev.business_id, entry.customer_id, contact.phone, cta.interactive, cta.fallbackText,
+      { source: "job_waitlist", reason: "freed_slot", triggerRef: ev.id });
     await markWaitlistNotified(db, entry.id);
     notified++;
   }
@@ -251,26 +284,47 @@ async function notifyWaitlistForFreedSlot(db: DB, ev: PlatformEvent): Promise<"p
 }
 
 /** Sends a pre-emitted, already-targeted waitlist opportunity. */
-async function sendWaitlistOpportunity(db: DB, ev: PlatformEvent): Promise<"processed" | "skipped"> {
+async function sendWaitlistOpportunity(db: DB, ev: PlatformEvent, now: Date): Promise<"processed" | "skipped" | "deferred"> {
   if (!ev.customer_id) return "skipped";
   const contact = await getCustomerContact(db, ev.customer_id);
   if (!contact) return "skipped";
-  const { data: biz } = await db.from("businesses").select("slug").eq("id", ev.business_id).maybeSingle();
-  const slug = (biz?.slug as string) ?? null;
+  const { slug, timezone } = await getBusinessSendContext(db, ev.business_id);
   if (!slug) return "skipped";
+  if (shouldDeferProactiveSend(ev, timezone, now)) return "deferred";
   const p = ev.payload ?? {};
-  const when = p.dateISO ? ` ב-${ddmm(p.dateISO as string)}${p.time ? ` בשעה ${p.time}` : ""}` : "";
   const link = buildBookingLink(slug, contact.phone);
-  await sendOutbound(
-    db, ev.business_id, ev.customer_id, contact.phone,
-    `התפנה תור${when}! ביקשת שנעדכן — אפשר לקבוע כאן:\n${link}`,
-    { source: "job_waitlist", reason: "opportunity" }
-  );
+  const msg = buildWaitlistOpportunityMessage({
+    dateISO: (p.dateISO as string | null) ?? null, time: (p.time as string | null) ?? null, bookingLink: link,
+  });
+  const cta = confirmationCta(msg, link);
+  await sendOutboundInteractive(db, ev.business_id, ev.customer_id, contact.phone, cta.interactive, cta.fallbackText,
+    { source: "job_waitlist", reason: "opportunity", triggerRef: ev.id });
   return "processed";
 }
 
-/** Sends an upcoming-appointment reminder. */
-async function sendReminder(db: DB, ev: PlatformEvent): Promise<"processed" | "skipped"> {
+/** True when a reminder for this appointment was ALREADY persisted as an outbound message — the
+ *  send-level duplicate guard for the pending-retry window (an event left 'pending' after a send whose
+ *  status write-back failed would otherwise re-send next run). Reads the migration-012 trace columns;
+ *  FAIL-OPEN: any error (columns missing, table quirk) → false, so a guard failure can only ever mean
+ *  "behave exactly as before this slice", never a dropped reminder. */
+async function reminderAlreadySent(db: DB, businessId: string, appointmentId: string): Promise<boolean> {
+  try {
+    const { data, error } = await db
+      .from("messages")
+      .select("id")
+      .eq("business_id", businessId)
+      .eq("reason", "reminder_due")
+      .eq("trigger_ref", appointmentId)
+      .limit(1);
+    if (error) return false;
+    return (data?.length ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Sends an upcoming-appointment reminder (quiet-hours gated, duplicate-guarded). */
+async function sendReminder(db: DB, ev: PlatformEvent, now: Date): Promise<"processed" | "skipped" | "deferred"> {
   if (!ev.appointment_id) return "skipped";
   const view = await getAppointmentView(db, ev.appointment_id);
   // Only remind for an appointment that is still active and still in the future.
@@ -279,10 +333,18 @@ async function sendReminder(db: DB, ev: PlatformEvent): Promise<"processed" | "s
   const contact = await getCustomerContact(db, view.customerId);
   if (!contact) return "skipped";
 
-  const svc = view.serviceName ? ` ל${view.serviceName}` : "";
-  const msg =
-    `תזכורת ידידותית: יש לך תור${svc} ב-${ddmm(view.dateISO)} בשעה ${view.time}.\n` +
-    `אם צריך לשנות או לבטל: ${buildAppointmentLink(view.id)}`;
-  await sendOutbound(db, view.business.id, view.customerId, contact.phone, msg, { source: "job_reminder", reason: "reminder_due" });
+  if (shouldDeferProactiveSend(ev, view.business.timezone, now)) return "deferred";
+  if (await reminderAlreadySent(db, view.business.id, view.id)) {
+    console.log(`[events] reminder already sent (trigger_ref=${view.id}) — skipping duplicate`);
+    return "skipped";
+  }
+
+  const link = buildAppointmentLink(view.id);
+  const msg = buildReminderMessage({
+    serviceName: view.serviceName, dateISO: view.dateISO, time: view.time, manageLink: link,
+  });
+  const cta = confirmationCta(msg, link);
+  await sendOutboundInteractive(db, view.business.id, view.customerId, contact.phone, cta.interactive, cta.fallbackText,
+    { source: "job_reminder", reason: "reminder_due", triggerRef: view.id });
   return "processed";
 }

@@ -67,6 +67,10 @@ import {
   buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, formatApptDate, confirmationCta,
 } from "../../lib/booking/notifications";
 import { isAutoCompletable, completePastAppointments, enqueueDueReminders, processPendingEvents, AUTO_COMPLETE_GRACE_MS } from "../../lib/events/process";
+import {
+  buildBookingConfirmedMessage, buildReminderMessage, buildWaitlistFreedSlotMessage, buildWaitlistOpportunityMessage,
+} from "../../lib/messaging/templates";
+import { sendWindowDecision } from "../../lib/messaging/send-window";
 import { matchWaitlistForSlot, withinWindow } from "../../lib/booking/waitlist";
 import {
   shouldSuppressStaleInbound, STALE_INBOUND_SUPPRESS_AFTER_MS, OUT_OF_ORDER_MIN_AGE_MS,
@@ -4190,6 +4194,178 @@ async function main(): Promise<void> {
   }
   gap("§59 scope: locks the STATIC preview helper (pure string composition). It intentionally does NOT claim the live Gemini voice sounds like the preview — that remains the §53/§56 live-probe limitation. The dashboard wiring (cards → applyPreset seeding, controlled selects, StylePanel rendering) is thin client markup verified by the manual dashboard checklist.",
     "Deferred (documented in the sprint plan): live Gemini preview (API cost), per-language preview text (preview renders Hebrew with a note when language ≠ he), 'לפי הסגנון' inherit enum + provenance columns (DB), Phase C business-rules separation.");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 60. SYSTEM-MESSAGE TEMPLATES + QUIET-HOURS SEND WINDOW (Slice A) — the central template
+  //     module renders every system message with ONE consistent, gender-neutral, business-
+  //     agnostic structure (URL-last so confirmationCta yields a clean cta_url button), and
+  //     JOB-DRIVEN sends (reminders / waitlist) are gated to 08:00–21:00 BUSINESS-local:
+  //     outside the window an event is DEFERRED ('pending' stays; never dropped, never sent
+  //     at 06:37), and a reminder whose message was already persisted is never re-sent.
+  section("60. System-message templates + quiet-hours send window (defer, dedupe, consistent rendering)");
+  {
+    const SLASH_GENDER_60 = /[א-ת]\/[א-ת]/;
+    const BANNED_60 = /gemini|chatbot|רובוט|העוזר|מספרה|שיער|תספורת|סלון|קליניקה|hair|salon|clinic|beauty/i;
+    const IL = "Asia/Jerusalem";
+
+    // ── (A) SEND WINDOW — pure business-local decision (DST-correct, fail-open on bad tz) ──
+    check("§60.A window boundaries (IL summer/IDT): 07:59 deny(before) · 08:00 allow · 20:59 allow · 21:00 deny(after)",
+      (() => {
+        const d1 = sendWindowDecision(new Date("2026-07-10T04:59:00Z"), IL); // 07:59 IDT
+        const d2 = sendWindowDecision(new Date("2026-07-10T05:00:00Z"), IL); // 08:00
+        const d3 = sendWindowDecision(new Date("2026-07-10T17:59:00Z"), IL); // 20:59
+        const d4 = sendWindowDecision(new Date("2026-07-10T18:00:00Z"), IL); // 21:00
+        return !d1.allow && d1.reason === "before_window" && d2.allow && d2.localHour === 8
+          && d3.allow && d3.localHour === 20 && !d4.allow && d4.reason === "after_window";
+      })());
+    check("§60.A DST-correct: the SAME 05:00Z is 08:00 in July (allow) but 07:00 in January (deny) — Intl owns the offset",
+      sendWindowDecision(new Date("2026-07-10T05:00:00Z"), IL).allow === true
+      && sendWindowDecision(new Date("2026-01-15T05:00:00Z"), IL).allow === false
+      && sendWindowDecision(new Date("2026-01-15T06:00:00Z"), IL).allow === true); // 08:00 IST
+    check("§60.A the 06:37 incident is structurally locked out: a 03:37Z cron tick (06:37 IL) is DEFERRED",
+      (() => { const d = sendWindowDecision(new Date("2026-07-02T03:37:00Z"), IL); return !d.allow && d.reason === "before_window" && d.localHour === 6; })());
+    check("§60.A the window is BUSINESS-local, not server/UTC: 12:00Z is 08:00 in New York (allow) and 15:00 in IL (allow) but 07:59Z NY denies",
+      sendWindowDecision(new Date("2026-07-10T12:00:00Z"), "America/New_York").allow === true
+      && sendWindowDecision(new Date("2026-07-10T11:59:00Z"), "America/New_York").allow === false
+      && sendWindowDecision(new Date("2026-07-10T12:00:00Z"), IL).localHour === 15);
+    check("§60.A null/empty timezone falls back to the IL default (same decision as explicit Asia/Jerusalem)",
+      (() => {
+        const at = new Date("2026-07-10T05:00:00Z");
+        const dNull = sendWindowDecision(at, null); const dEmpty = sendWindowDecision(at, "  ");
+        const dIL = sendWindowDecision(at, IL);
+        return dNull.allow === dIL.allow && dNull.localHour === dIL.localHour && dEmpty.reason === dIL.reason;
+      })());
+    check("§60.A INVALID timezone fails OPEN (allow + tz_error) — a bad settings row can never silently disable reminders",
+      (() => { const d = sendWindowDecision(new Date("2026-07-10T05:00:00Z"), "Not/AZone"); return d.allow && d.reason === "tz_error" && d.localHour === null; })());
+
+    // ── (B) TEMPLATES — one structure, gender-neutral, business-agnostic, URL-last ──
+    const remFull = buildReminderMessage({ serviceName: "שירות לדוגמה", dateISO: "2026-07-10", time: "10:00", manageLink: "https://x/appointment/abc" });
+    const remNoSvc = buildReminderMessage({ serviceName: null, dateISO: "2026-07-10", time: "10:00", manageLink: "https://x/appointment/abc" });
+    check("§60.B reminder: date DD/MM/YYYY + time + manage URL; NO 'תזכורת ידידותית'; bold headline; service line omitted when unknown",
+      remFull.includes("10/07/2026") && remFull.includes("10:00") && remFull.includes("https://x/appointment/abc")
+      && remFull.includes("שירות לדוגמה") && !remFull.includes("ידידותית") && /^\*.+\*$/.test(remFull.split("\n")[0])
+      && !remNoSvc.includes("שירות:"));
+    const wlFreed = buildWaitlistFreedSlotMessage({ dateISO: "2026-07-10", time: "14:00", bookingLink: "https://x/book/biz" });
+    check("§60.B waitlist freed-slot: uniform DD/MM/YYYY (no more D/M), honest first-to-book line, booking URL",
+      wlFreed.includes("10/07/2026") && wlFreed.includes("14:00")
+      && wlFreed.includes("לכל מי שיקבע ראשון") && wlFreed.includes("https://x/book/biz"));
+    check("§60.B waitlist opportunity: date/time lines render when present and are OMITTED (no blank field) when absent",
+      (() => {
+        const withWhen = buildWaitlistOpportunityMessage({ dateISO: "2026-07-10", time: "14:00", bookingLink: "L" });
+        const noWhen = buildWaitlistOpportunityMessage({ dateISO: null, time: null, bookingLink: "L" });
+        return withWhen.includes("תאריך: 10/07/2026") && withWhen.includes("שעה: 14:00")
+          && !noWhen.includes("תאריך:") && !noWhen.includes("שעה:") && noWhen.includes("L");
+      })());
+    check("§60.B booking confirmation (template now feeds platform.ts): service + DD/MM/YYYY + time + manage URL all present",
+      (() => {
+        const m = buildBookingConfirmedMessage({ serviceName: "שירות בסיסי", dateISO: "2026-06-18", time: "11:15", manageLink: "https://x/appointment/abc" });
+        return m.includes("נקבע בהצלחה") && m.includes("שירות בסיסי") && m.includes("18/06/2026")
+          && m.includes("11:15") && m.includes("https://x/appointment/abc");
+      })());
+    check("§60.B ALL system templates: *bold* headline first line, NO slash-gender, business-agnostic, URL is the LAST line (cta-strippable)",
+      (() => {
+        const all: Array<[string, string]> = [
+          [buildBookingConfirmedMessage({ serviceName: "א", dateISO: "2026-06-18", time: "11:15", manageLink: "https://x/a/1" }), "https://x/a/1"],
+          [buildCancellationMessage({ serviceName: null, dateISO: "2026-06-18", time: "11:15", bookingLink: "https://x/b/1" }), "https://x/b/1"],
+          [buildRescheduleMessage({ serviceName: null, fromDateISO: "2026-06-18", fromTime: "11:15", toDateISO: "2026-06-20", toTime: "09:30", manageLink: "https://x/a/2" }), "https://x/a/2"],
+          [remFull, "https://x/appointment/abc"],
+          [wlFreed, "https://x/book/biz"],
+          [buildWaitlistOpportunityMessage({ dateISO: null, time: null, bookingLink: "https://x/b/2" }), "https://x/b/2"],
+        ];
+        return all.every(([m, url]) =>
+          /^\*.+\*$/.test(m.split("\n")[0]) && !SLASH_GENDER_60.test(m) && !BANNED_60.test(m)
+          && m.trimEnd().split("\n").pop() === url);
+      })());
+    check("§60.B confirmationCta over job messages: URL lives in the BUTTON only (absent from body), fallback keeps it; CTA label line survives",
+      (() => {
+        const r = confirmationCta(remFull, "https://x/appointment/abc");
+        const w = confirmationCta(wlFreed, "https://x/book/biz");
+        return r.interactive.kind === "cta_url" && !r.interactive.body.includes("https://")
+          && r.fallbackText.includes("https://x/appointment/abc") && r.interactive.body.includes("לצפייה, שינוי או ביטול:")
+          && w.interactive.kind === "cta_url" && !w.interactive.body.includes("https://") && w.fallbackText.includes("https://x/book/biz");
+      })());
+
+    // ── (C) DEFERRAL + DUPLICATE GUARD over the REAL processPendingEvents (fake DB; the probe
+    //    stops BEFORE the outbound layer — touching ai_settings would throw and fail the counts) ──
+    const apptRow60 = {
+      id: "appt60", status: "confirmed",
+      start_time: "2030-07-10T07:00:00.000Z", end_time: "2030-07-10T07:30:00.000Z", // far future → isFuture true
+      business_id: "biz", customer_id: "c60", service_id: "svc",
+      services: { name: "שירות לדוגמה" },
+      businesses: { id: "biz", name: "עסק", slug: "biz", timezone: IL },
+      customers: { name: null, phone: "972500000000" },
+    };
+    const reminderEv60: PlatformEvent = {
+      id: "e-r60", business_id: "biz", customer_id: "c60", appointment_id: "appt60",
+      type: "reminder_due", payload: {}, status: "pending", created_at: "2026-07-10T00:00:00.000Z", processed_at: null,
+    };
+    const db60 = (opts: {
+      pending: PlatformEvent[]; priorReminderRows: Array<{ id: string }>;
+      updates: Array<Record<string, unknown>>; outboundTouched: { v: boolean };
+    }): DB => ({
+      from: (table: string) => {
+        if (table === "ai_settings") {
+          opts.outboundTouched.v = true;
+          throw new Error("§60 probe reached the outbound layer — must stop at defer/dedupe");
+        }
+        if (table === "appointments") {
+          const c: Record<string, unknown> = {};
+          Object.assign(c, {
+            select: () => c, update: () => c, in: () => c, eq: () => c, gte: () => c, lte: () => c, lt: () => c, order: () => c,
+            limit: async () => ({ data: [], error: null }),                       // enqueue scan → none due
+            maybeSingle: async () => ({ data: apptRow60, error: null }),          // getAppointmentView
+            then: (resolve: (v: { data: unknown; error: unknown }) => unknown) => resolve({ data: [], error: null }), // completePast → 0
+          });
+          return c;
+        }
+        if (table === "customers") {
+          const c: Record<string, unknown> = {};
+          Object.assign(c, { select: () => c, eq: () => c, maybeSingle: async () => ({ data: { phone: "972500000000", name: null }, error: null }) });
+          return c;
+        }
+        if (table === "messages") {
+          const c: Record<string, unknown> = {};
+          Object.assign(c, { select: () => c, eq: () => c, limit: async () => ({ data: opts.priorReminderRows, error: null }) });
+          return c;
+        }
+        // events: pending list + status write-back capture
+        const c: Record<string, unknown> & { __row?: Record<string, unknown>; __id?: string } = {};
+        Object.assign(c, {
+          select: () => c, order: () => c, in: () => c,
+          eq: (col: string, val: string) => { if (col === "id") c.__id = val; return c; },
+          update: (row: Record<string, unknown>) => { c.__row = row; return c; },
+          limit: async () => ({ data: opts.pending, error: null }),
+          then: (resolve: (v: { data: unknown; error: unknown }) => unknown) => {
+            if (c.__row) opts.updates.push({ id: c.__id, ...c.__row });
+            resolve({ data: null, error: null });
+          },
+        });
+        return c;
+      },
+    } as unknown as DB);
+
+    // C1 — 21:30 business-local: the reminder is DEFERRED — event stays 'pending' (no write-back),
+    // counted as deferred, and the outbound layer is never touched. Next in-window run delivers it.
+    const upd1: Array<Record<string, unknown>> = []; const touch1 = { v: false };
+    const sum1 = await processPendingEvents(db60({ pending: [reminderEv60], priorReminderRows: [], updates: upd1, outboundTouched: touch1 }),
+      new Date("2026-07-10T18:30:00Z")); // 21:30 IDT
+    check("§60.C outside the window → DEFERRED: summary.deferred=1, zero processed/skipped, NO status write-back (event stays pending), outbound untouched",
+      sum1.deferred === 1 && sum1.processed === 0 && sum1.skipped === 0 && sum1.scanned === 1
+      && upd1.length === 0 && touch1.v === false && sum1.byType.reminder_due === 1,
+      `deferred=${sum1.deferred} processed=${sum1.processed} skipped=${sum1.skipped} updates=${upd1.length} outbound=${touch1.v}`);
+
+    // C2 — 12:00 business-local (window PASSES) but a reminder message for this appointment was already
+    // persisted (trigger_ref match) → the duplicate guard marks the event 'skipped'; nothing re-sends.
+    const upd2: Array<Record<string, unknown>> = []; const touch2 = { v: false };
+    const sum2 = await processPendingEvents(db60({ pending: [reminderEv60], priorReminderRows: [{ id: "m-prior" }], updates: upd2, outboundTouched: touch2 }),
+      new Date("2026-07-10T09:00:00Z")); // 12:00 IDT
+    check("§60.C in-window + already-sent (trigger_ref match) → dup guard: event written back 'skipped', deferred=0, outbound untouched (no re-send)",
+      sum2.skipped === 1 && sum2.deferred === 0 && sum2.processed === 0
+      && upd2.length === 1 && upd2[0].status === "skipped" && touch2.v === false,
+      `skipped=${sum2.skipped} deferred=${sum2.deferred} updates=${upd2.map((r) => r.status as string).join(",")} outbound=${touch2.v}`);
+  }
+  gap("§60 scope: proves the DECISIONS (business-local window boundaries incl. DST, defer-not-drop, send-level dedupe) and the TEMPLATE contracts (structure, neutrality, URL-last, cta stripping). The actual interactive SEND (sendOutboundInteractive → WhatsApp cta_url → text fallback) is the §16b/§16c-proven mechanism and needs live WhatsApp — covered by the manual jobs-runner QA (in-window + out-of-window + double-trigger).",
+    "Deferred by design (each needs separate approval): per-business window configurability + reminder offsets (Slice E schema), the vercel.json cron cadence decision (analysis-only in Slice A — with the current 03:00 UTC daily run a deferred reminder waits for a manual/in-window run), waitlist-deferral fake-DB probe (same shouldDeferProactiveSend gate as reminders; unit-proven via §60.A).");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

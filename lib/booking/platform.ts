@@ -23,6 +23,7 @@ import { sendOutboundInteractive } from "./outbound";
 import { emitEvent } from "@/lib/events/emit";
 import { buildAppointmentLink, buildBookingLink } from "@/lib/config";
 import { buildCancellationMessage, buildRescheduleMessage, rescheduleChanged, confirmationCta } from "./notifications";
+import { buildBookingConfirmedMessage } from "@/lib/messaging/templates";
 
 /** Customers can't book a slot starting sooner than this from "now". */
 const MIN_LEAD_MINUTES = 15;
@@ -264,14 +265,12 @@ export async function createPlatformBooking(db: DB, input: CreateBookingInput): 
     appointmentId,
     payload: { source: "platform", dateISO: input.dateISO, time: input.time, serviceId: input.serviceId },
   });
-  const [y, mo, d] = input.dateISO.split("-");
   const apptUrl = buildAppointmentLink(appointmentId);
-  const bookingText =
-    `התור נקבע בהצלחה!\n\n` +
-    `שירות: ${service.name as string}\n` +
-    `תאריך: ${d}/${mo}/${y}\n` +
-    `שעה: ${input.time}\n\n` +
-    `לצפייה, שינוי או ביטול: ${apptUrl}`;
+  // Rendering only — the central template renders the SAME details this path always sent
+  // (post-INSERT, deterministic); the INSERT/event logic above is untouched.
+  const bookingText = buildBookingConfirmedMessage({
+    serviceName: service.name as string, dateISO: input.dateISO, time: input.time, manageLink: apptUrl,
+  });
   // Clean cta_url button (URL in the button, not the body); the full text-with-URL is the fallback.
   const bookingCta = confirmationCta(bookingText, apptUrl);
   await sendOutboundInteractive(db, input.businessId, customerId, input.phone, bookingCta.interactive, bookingCta.fallbackText, { source: "booking_platform", reason: "book_confirm", triggerRef: appointmentId });
