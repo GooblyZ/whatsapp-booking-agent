@@ -4,6 +4,7 @@ import { enforceEmojiCap, enforceLength } from "@/lib/ai/style-fences";
 import { buildPromptProfile, type PromptProfile } from "@/lib/ai/prompt-profile";
 import { recordWhatsAppSendResult } from "@/lib/integration-health";
 import { type DB, saveOutboundMessage } from "./helpers";
+import { classifyOutbound, EXEMPT_SOURCES, DEFAULT_MAX_SOLICIT_GAP_MS } from "./outbound-audit";
 import type { AISettings } from "@/types/database";
 
 // ── OUTBOUND TRACEABILITY (observability only — never changes routing/behavior) ──────────────────────
@@ -55,6 +56,61 @@ function applyTextFences(text: string, profile: PromptProfile): string {
   out = enforceLength(out, profile.responseLength);
   out = enforceEmojiCap(out, profile.emojiCap);
   return out;
+}
+
+// ── "NO UNSOLICITED SEND" AUDIT (observability only — never blocks/alters a send) ────────────────────
+// Fetch a boundary inbound slightly outside the solicit window so the LOGGED gap is accurate near the
+// edge (the verdict itself still uses DEFAULT_MAX_SOLICIT_GAP_MS via classifyOutbound).
+const AUDIT_READ_MARGIN_MS = 60_000;
+
+/** Phone → "••••1234" (last 4 digits only). Never log a full number. */
+function maskPhoneLast4(phone: string): string {
+  const digits = (phone ?? "").replace(/\D/g, "");
+  return digits.length >= 4 ? `••••${digits.slice(-4)}` : "••••";
+}
+
+/**
+ * Observability tripwire for the "no unsolicited send" invariant. For a REACTIVE (`ai_turn`/
+ * `deterministic`) or UNKNOWN source it reads the customer's most-recent inbound within the solicit
+ * window and, when the send looks UNSOLICITED or the source is UNCLASSIFIED, logs one loud ⚠ line with
+ * full investigation metadata (masked phone, NO message body). Known proactive sources (reminders,
+ * waitlist, booking, dashboard, recovery) skip the read entirely — they are legitimately unsolicited.
+ * FAIL-OPEN + NON-BLOCKING: wrapped so a read error or slow query can never delay/block/alter a send.
+ * HEURISTIC: an in-window inbound is a strong signal of causation, not proof — the metadata lets a human
+ * confirm. See lib/booking/outbound-audit.ts.
+ */
+async function auditOutbound(db: DB, businessId: string, customerId: string, toPhone: string, trace: OutboundTrace): Promise<void> {
+  try {
+    if (EXEMPT_SOURCES.has(trace.source)) return; // proactive send — no inbound expected, no read
+
+    const nowMs = Date.now();
+    const sinceIso = new Date(nowMs - (DEFAULT_MAX_SOLICIT_GAP_MS + AUDIT_READ_MARGIN_MS)).toISOString();
+    const { data } = await db
+      .from("messages")
+      .select("meta_message_id, created_at")
+      .eq("business_id", businessId)
+      .eq("customer_id", customerId)
+      .eq("direction", "inbound")
+      .gte("created_at", sinceIso)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    const last = data?.[0] as { meta_message_id: string | null; created_at: string } | undefined;
+    const lastInboundAtMs = last ? new Date(last.created_at).getTime() : null;
+    const verdict = classifyOutbound({ source: trace.source, lastInboundAtMs, nowMs });
+    if (verdict === "solicited" || verdict === "exempt") return; // healthy → stay quiet
+
+    const gapMs = lastInboundAtMs === null ? "none" : String(nowMs - lastInboundAtMs);
+    const tag = verdict === "unknown_source" ? "unclassified_outbound_source" : "UNSOLICITED reactive send";
+    console.warn(
+      `[outbound] ⚠ ${tag} — src=${trace.source} reason=${trace.reason ?? "-"}` +
+      ` sentAt=${new Date(nowMs).toISOString()} lastInboundAt=${last?.created_at ?? "none"} gapMs=${gapMs}` +
+      ` lastInboundWamid=${last?.meta_message_id ?? "none"} phone=${maskPhoneLast4(toPhone)} customer=${customerId}`
+    );
+  } catch (err) {
+    // Observability must never fail a send.
+    console.error("[outbound] audit failed (ignored):", err instanceof Error ? err.message : String(err));
+  }
 }
 
 /** Safe profile observability — enums + hash + version ONLY. No text, no phone, no secrets. */
@@ -129,6 +185,10 @@ export async function sendOutbound(
   } catch (err) {
     console.error("[outbound] failed to save outbound message:", err instanceof Error ? err.message : String(err));
   }
+
+  // Observability only (fail-open): flag a reactive/unclassified send with no recent inbound. Runs AFTER
+  // the send + save so it can never delay delivery. See auditOutbound.
+  await auditOutbound(db, businessId, customerId, toPhone, trace);
 }
 
 /** Applies PRESENTATION fences to an interactive message. Body gets gender (incl. neutral) + emoji
@@ -179,4 +239,8 @@ export async function sendOutboundInteractive(
     triggerRef: trace.triggerRef ?? null,
   }); }
   catch (err) { console.error("[outbound] failed to save outbound message:", err instanceof Error ? err.message : String(err)); }
+
+  // Observability only (fail-open). The interactive FALLBACK path re-sends via sendOutbound, which audits
+  // there — so this covers the interactive-SUCCESS path only (no double audit).
+  await auditOutbound(db, businessId, customerId, toPhone, trace);
 }

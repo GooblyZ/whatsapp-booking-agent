@@ -71,6 +71,10 @@ import {
   buildBookingConfirmedMessage, buildReminderMessage, buildWaitlistFreedSlotMessage, buildWaitlistOpportunityMessage,
 } from "../../lib/messaging/templates";
 import { sendWindowDecision } from "../../lib/messaging/send-window";
+import {
+  classifyOutbound, isReactiveSource, REACTIVE_SOURCES, EXEMPT_SOURCES, DEFAULT_MAX_SOLICIT_GAP_MS,
+} from "../../lib/booking/outbound-audit";
+import type { OutboundSource } from "../../lib/booking/outbound";
 import { matchWaitlistForSlot, withinWindow } from "../../lib/booking/waitlist";
 import {
   shouldSuppressStaleInbound, STALE_INBOUND_SUPPRESS_AFTER_MS, OUT_OF_ORDER_MIN_AGE_MS,
@@ -4366,6 +4370,73 @@ async function main(): Promise<void> {
   }
   gap("§60 scope: proves the DECISIONS (business-local window boundaries incl. DST, defer-not-drop, send-level dedupe) and the TEMPLATE contracts (structure, neutrality, URL-last, cta stripping). The actual interactive SEND (sendOutboundInteractive → WhatsApp cta_url → text fallback) is the §16b/§16c-proven mechanism and needs live WhatsApp — covered by the manual jobs-runner QA (in-window + out-of-window + double-trigger).",
     "Deferred by design (each needs separate approval): per-business window configurability + reminder offsets (Slice E schema), the vercel.json cron cadence decision (analysis-only in Slice A — with the current 03:00 UTC daily run a deferred reminder waits for a manual/in-window run), waitlist-deferral fake-DB probe (same shouldDeferProactiveSend gate as reminders; unit-proven via §60.A).");
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 61. "NO UNSOLICITED SEND" AUDIT (observability only) — a CONVERSATIONAL (reactive) outbound must be
+  //     tied to a recent inbound; proactive system sends (reminder/waitlist/booking/dashboard/recovery)
+  //     are exempt; an `unknown`/unlisted source is NEVER assumed safe (→ unknown_source, always
+  //     surfaced). Pure classifier (lib/booking/outbound-audit.ts) — the same one the chokepoint uses.
+  section("61. No-unsolicited-send audit: reactive-vs-proactive classification + solicit window (heuristic tripwire)");
+  {
+    const now61 = 1_800_000_000_000; // fixed epoch (pure; no Date.now)
+    const ALL_SOURCES_61: OutboundSource[] = [
+      "ai_turn", "deterministic", "job_reminder", "job_waitlist", "booking_platform", "recovery", "dashboard", "unknown",
+    ];
+    const cls = (source: OutboundSource, lastInboundAtMs: number | null, maxGapMs?: number) =>
+      classifyOutbound({ source, lastInboundAtMs, nowMs: now61, maxGapMs });
+
+    // (1) Reactive set is EXACTLY ai_turn + deterministic; the rest are not reactive.
+    check("§61 isReactiveSource: ai_turn + deterministic are reactive; the other six are not",
+      isReactiveSource("ai_turn") && isReactiveSource("deterministic")
+      && (["job_reminder", "job_waitlist", "booking_platform", "recovery", "dashboard", "unknown"] as OutboundSource[])
+        .every((s) => !isReactiveSource(s)));
+
+    // (2) REACTIVE ∩ EXEMPT = ∅, and together they cover every source EXCEPT `unknown`.
+    check("§61 source partition: reactive and exempt are disjoint; union covers all sources except 'unknown'",
+      [...REACTIVE_SOURCES].every((s) => !EXEMPT_SOURCES.has(s))
+      && ALL_SOURCES_61.filter((s) => s !== "unknown").every((s) => REACTIVE_SOURCES.has(s) || EXEMPT_SOURCES.has(s))
+      && !REACTIVE_SOURCES.has("unknown") && !EXEMPT_SOURCES.has("unknown"));
+
+    // (3) Reactive + a fresh inbound (4 s ago) → solicited; a 20-min-old inbound → unsolicited; none → unsolicited.
+    check("§61 reactive: inbound 4s ago → solicited; 20min ago → unsolicited; no inbound → unsolicited",
+      cls("ai_turn", now61 - 4_000) === "solicited"
+      && cls("ai_turn", now61 - 20 * 60_000) === "unsolicited"
+      && cls("ai_turn", null) === "unsolicited"
+      && cls("deterministic", now61 - 4_000) === "solicited"
+      && cls("deterministic", null) === "unsolicited");
+
+    // (4) Every proactive source → exempt REGARDLESS of inbound presence (no false alarms on the cron path).
+    check("§61 proactive sources → exempt regardless of inbound (fresh, stale, or none)",
+      (["job_reminder", "job_waitlist", "booking_platform", "recovery", "dashboard"] as OutboundSource[])
+        .every((s) => cls(s, null) === "exempt" && cls(s, now61 - 4_000) === "exempt" && cls(s, now61 - 99 * 60_000) === "exempt"));
+
+    // (5) `unknown` (and any unlisted source) is NEVER exempt — always unknown_source, even with a fresh inbound.
+    check("§61 unknown source → unknown_source (NOT exempt, NOT solicited) even with a fresh inbound",
+      cls("unknown", now61 - 1_000) === "unknown_source"
+      && cls("unknown", null) === "unknown_source"
+      && cls("totally_new_source" as OutboundSource, now61 - 1_000) === "unknown_source");
+
+    // (6) Boundary: gap exactly N → solicited (inclusive); N+1ms → unsolicited.
+    check("§61 solicit-window boundary: gap == N inclusive (solicited), N+1ms → unsolicited",
+      cls("ai_turn", now61 - DEFAULT_MAX_SOLICIT_GAP_MS) === "solicited"
+      && cls("ai_turn", now61 - (DEFAULT_MAX_SOLICIT_GAP_MS + 1)) === "unsolicited"
+      && DEFAULT_MAX_SOLICIT_GAP_MS === 300_000);
+
+    // (7) FIXTURE REPLAY of the real 2026-07-03 incident: every reactive send had an inbound ≤6 s before →
+    //     ALL solicited (the guard would have stayed silent). A synthetic ghost (reactive, no inbound) → flagged.
+    const incident61: Array<{ src: OutboundSource; inboundAgoMs: number | null }> = [
+      { src: "ai_turn", inboundAgoMs: 6_000 },       // 22:52:27 reply to 22:52:20 inbound
+      { src: "deterministic", inboundAgoMs: 4_000 }, // 22:52:37 reply to 22:52:32 inbound
+      { src: "ai_turn", inboundAgoMs: 6_000 },       // 23:07:07 reply to 23:07:01 inbound
+      { src: "ai_turn", inboundAgoMs: 5_000 },       // 23:07:27 reply to 23:07:22 inbound
+    ];
+    const allSolicited = incident61.every((e) => cls(e.src, now61 - (e.inboundAgoMs as number)) === "solicited");
+    const ghost = cls("ai_turn", null); // a TRUE unsolicited send (no inbound at all)
+    check("§61 incident replay: all 2026-07-03 reactive sends → solicited (guard silent); a synthetic ghost → unsolicited",
+      allSolicited && ghost === "unsolicited");
+  }
+  gap("§61 scope: proves the PURE classifier (source partition + solicit-window verdict) the chokepoint and the offline scripts/audit-unsolicited-sends.ts both call. The runtime tripwire (one fail-open inbound read in lib/booking/outbound.ts) and the offline scan need a live DB — verified manually (a normal reply logs nothing; the offline script over the 2026-07-03 קובי window returns ZERO flags; a synthetic ghost returns one). The check is a HEURISTIC signal, not causal proof.",
+    "Deferred (not this slice): an optional (business_id, customer_id, created_at) index if the tripwire read ever shows in slow logs; threading the triggering-inbound ref through the turn to avoid the read entirely (would touch routing — out of scope).");
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
