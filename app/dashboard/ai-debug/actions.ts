@@ -101,6 +101,11 @@ export async function runAIDebug(_prev: AIDebugState, formData: FormData): Promi
       availabilityBlock: renderAvailabilityInfo(availability, pendingTimeNoDate),
       bookingBlock: renderSession(session0),
       allowedTimes,
+      // AI-Test honesty (post-v1 audit Slice 1b): every LIVE customer turn runs the PLATFORM
+      // persona variant (platform-turn.ts passes platformMode: true). Without this flag the test
+      // silently exercised the LEGACY conversational prompt — a different variant with different
+      // appointment rules. Debug-tool-only change; no customer path is affected.
+      platformMode: true,
     });
 
     // Show what the booking context WOULD become after this turn (no persistence).
@@ -173,6 +178,10 @@ export async function runAIDebug(_prev: AIDebugState, formData: FormData): Promi
         caps,
         availabilityBlock: renderAvailabilityInfo(availability, pendingTimeNoDate),
         bookingBlock: renderSession(session0),
+        // Match the live variant (see runReceptionistTurn call above): the prompt shown to the
+        // developer must be the PLATFORM prompt, not the legacy conversational one. In platform
+        // mode the persona correctly omits the availability block — same as production.
+        platformMode: true,
       }),
       appliedSettings: {
         assistantName: ai?.assistant_name?.trim() || "Assistant",

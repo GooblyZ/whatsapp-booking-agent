@@ -275,6 +275,14 @@ export async function runReceptionistTurn(
     // KB scoping observability (Stage 3B Phase 3): how many active KB items were sent vs available.
     const kbActive = ctx.knowledgeBaseItems.filter((k) => k.active).length;
     const kbScoped = facts.knowledge.length < kbActive;
+    // Prompt-budget visibility (post-v1 audit Slice 1 — LOG-ONLY, computed from data already in
+    // scope; no prompt byte changes): the FACTS block split by section, an EXPLICIT flag for the
+    // formatFacts 6k tail-truncation (previously silent — the top scaling risk), whether an owner
+    // personality is present (via the SAME legacy chain the prompt renders), and per-section token
+    // estimates so growth is attributable without re-deriving from chars.
+    const kbChars = facts.knowledge.reduce((n, k) => n + k.title.length + k.content.length, 0);
+    const factsTruncated = factsBlock.endsWith("…(truncated)");
+    const personaPresent = styleProfile.preset !== "default"; // resolved via effectivePersonality chain
     console.log(
       `[gemini-prompt] turn=${turnId} business=${ctx.business.id} mode=full kb=${facts.knowledge.length}/${kbActive} kb_scoped=${kbScoped} chars: instruction=${instruction.length}` +
       ` (persona_base≈${Math.max(0, instruction.length - injected)}` +
@@ -284,7 +292,12 @@ export async function runReceptionistTurn(
       ` transcript=${useNativeHistory ? 0 : sz(input.conversationContext)})` +
       ` + history_turns=${input.historyTurns?.length ?? 0} (${historyChars} chars)` +
       ` + message=${messageChars}` +
-      ` | promptTokensEst=${promptTokensEst} bucket=${promptSizeBucket(promptTokensEst)} instrHash=${safeHash(instruction)}` +
+      ` | facts_services_n=${facts.services.length} facts_hours_n=${facts.hours.length}` +
+      ` facts_kb_n=${facts.knowledge.length} facts_kb_chars=${kbChars} facts_truncated=${factsTruncated}` +
+      ` persona_present=${personaPresent}` +
+      ` | promptTokensEst=${promptTokensEst} bucket=${promptSizeBucket(promptTokensEst)}` +
+      ` instrTokensEst=${estimateTokens(instruction.length)} factsTokensEst=${estimateTokens(sz(factsBlock))}` +
+      ` historyTokensEst=${estimateTokens(historyChars)} instrHash=${safeHash(instruction)}` +
       // Settings traceability (safe metadata only — no prompt, message, phone, or custom-instruction text).
       // styleHash (Phase B2) = the RESOLVED presentation style only (ignores name; collapses
       // semantically identical styles) — additive next to the full profileHash, never replacing it.

@@ -16,7 +16,7 @@ export default function AIDebugPage() {
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
-        <h1 style={{ margin: 0 }}>בדיקת AI</h1>
+        <h1 style={{ margin: 0 }}>מעבדת AI — תצוגת הבנה וסגנון</h1>
         <span
           style={{
             fontSize: "11px",
@@ -31,10 +31,43 @@ export default function AIDebugPage() {
         </span>
       </div>
 
-      <p style={{ color: "#666", marginTop: "4px", marginBottom: "16px", fontSize: "14px" }}>
-        עמוד בדיקה בטוח — מריץ את שכבת ה‑AI בדיוק כמו בשיחה אמיתית, אך{" "}
+      <p style={{ color: "#666", marginTop: "4px", marginBottom: "12px", fontSize: "14px" }}>
+        עמוד בדיקה בטוח — מריץ את מוח ה-AI עם הפרומפט האמיתי של מצב הפלטפורמה,{" "}
         <strong>ללא שמירה לבסיס הנתונים, ללא קביעת תורים, וללא ספירת שימוש</strong>.
+        זו תצוגת הבנה וסגנון — לא סימולציה מלאה של שיחת וואטסאפ.
       </p>
+
+      {/* HONESTY PANEL (post-v1 audit Slice 1b): exactly what a run here proves — and what it
+          deliberately does NOT. Mirrors the AI-Settings scope-panel pattern. */}
+      <aside
+        aria-label="מה הבדיקה בודקת"
+        style={{
+          background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "8px",
+          padding: "12px 16px", marginBottom: "16px", maxWidth: "720px", fontSize: "13px", color: "#475569",
+        }}
+      >
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "12px" }}>
+          <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "8px", padding: "8px 12px" }}>
+            <strong style={{ color: "#15803d", display: "block", marginBottom: "4px" }}>✓ מה זה בודק</strong>
+            <ul style={{ margin: 0, paddingInlineStart: "18px", lineHeight: 1.6 }}>
+              <li>מוח ה-AI האמיתי + פרומפט הפלטפורמה המלא</li>
+              <li>הגדרות העוזר (אישיות, סגנון, שם, מין)</li>
+              <li>עובדות העסק ובסיס הידע האמיתיים</li>
+              <li>זיהוי כוונה, הבנה מובנית ועיגון עובדות</li>
+            </ul>
+          </div>
+          <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: "8px", padding: "8px 12px" }}>
+            <strong style={{ color: "#b91c1c", display: "block", marginBottom: "4px" }}>✗ מה זה לא בודק</strong>
+            <ul style={{ margin: 0, paddingInlineStart: "18px", lineHeight: 1.6 }}>
+              <li>זיכרון שיחה והיסטוריה (ריצה חד-פעמית, בלי לקוח)</li>
+              <li>ניתוב וצירוף קישורי קביעה/ניהול</li>
+              <li>מוני הודעות חריגות, מצב גיבוי ובריאות ספק</li>
+              <li>מסנני היציאה (אימוג׳י/אורך/לשון) — התשובה כאן לפני המסננים</li>
+              <li>עיצוב וואטסאפ והודעות אינטראקטיביות</li>
+            </ul>
+          </div>
+        </div>
+      </aside>
 
       <div
         style={{
