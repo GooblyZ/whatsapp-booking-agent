@@ -7,13 +7,17 @@ export function getDefaultBusinessId(): string {
 export type BookingMode = "conversational" | "platform";
 
 /**
- * Transition flag (see TRANSITION_PLAN.md). "conversational" preserves the
- * pre-pivot live behavior exactly; "platform" routes booking intent to the
- * web booking platform. Defaults to "conversational" so flipping is an
- * explicit founder action.
+ * Transition flag (see TRANSITION_PLAN.md). "platform" routes booking intent to the web booking
+ * platform and runs the full trust/safety layer (routing SSOT, link fences, behavior classes);
+ * "conversational" is the LEGACY pre-pivot path and runs WITHOUT those guards.
+ *
+ * Default is now "platform" (owner decision 2026-07-06): platform is the canonical runtime, and a
+ * silent env-default to the legacy path was making the trust/safety work dark. Legacy is now
+ * OPT-IN via BOOKING_MODE=conversational. Keep BOOKING_MODE=platform set explicitly in every env
+ * (Vercel + .env.local) so parity never depends on this default.
  */
 export function getBookingMode(): BookingMode {
-  return process.env.BOOKING_MODE === "platform" ? "platform" : "conversational";
+  return process.env.BOOKING_MODE === "conversational" ? "conversational" : "platform";
 }
 
 /**

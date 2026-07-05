@@ -13,6 +13,7 @@ import { runConversationTurn } from "@/lib/ai/idle-handler";
 import { runPlatformTurn } from "@/lib/ai/platform-turn";
 import { loadBookingSession } from "@/lib/ai/booking-session";
 import { getBookingMode } from "@/lib/config";
+import { logRuntimeOnce } from "@/lib/runtime-info";
 
 // Conversation states that mean "a booking is in progress, missing field X".
 // These are CONTEXT for the AI receptionist, not menus that own the conversation.
@@ -80,6 +81,10 @@ export async function handleBookingFlow(
   triggerCreatedAt: string | null = null,
   interactivePayloadId?: string
 ): Promise<void> {
+  // Fingerprint the running build/mode/model once per process (visible in dev.log) — makes a stale
+  // dev server or a mismatched BOOKING_MODE obvious instead of silently producing "old" behavior.
+  logRuntimeOnce();
+
   const { state: rawState, context: rawContext, expiresAt } = await getConversationState(db, businessId, customerId);
   const timezone = await getBusinessTimezone(db, businessId);
 
