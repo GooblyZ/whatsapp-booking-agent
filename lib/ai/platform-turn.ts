@@ -21,6 +21,7 @@ import {
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording } from "./reply-polish";
 import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
+import { resolveBookingGuidance, type BookingGuidanceVerdict } from "./booking-guidance";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
 import { buildMyAppointmentsLink } from "@/lib/booking/appointment-token";
@@ -205,6 +206,28 @@ const COLD_YES_CLARIFY =
 // or the last outbound was proactive) — never guess which link; ask once, same spirit as COLD_YES_CLARIFY.
 const WHICH_LINK_CLARIFY =
   "לא בטוח/ה לאיזה קישור התכוונת 🙂 לקביעת תור חדש, או לניהול תור קיים?";
+// ── BOOKING-GUIDANCE COPY (Slice E1) ─────────────────────────────────────────────
+// Deterministic, business-agnostic explanation of HOW booking works, used when the customer clearly
+// wants to book / asks how / asks for the site — so the link never ships next to a vague model line.
+// No service words, gender-neutral, no emoji baked in (the outbound chokepoint owns emoji, and the CTA
+// label stays emoji-free for consistent rendering). The booking link + label are appended after it.
+// NOTE: deliberately avoids "התור נקבע" (would trip the booked-claim fence — chat never books) and
+// "איזה שירות" (would trip the in-chat scheduling-question fence). Describes the SITE's flow, not a claim.
+const BOOK_GUIDANCE_FULL =
+  "בשמחה. את קביעת התור עושים דרך הקישור — בוחרים שם שירות, יום ושעה ומאשרים, וזה הכול. ואם יש התלבטות מה מתאים, אפשר לשאול אותי קודם.";
+// Short form for the anti-repetition second tier (a customer sending several booking messages in a row
+// shouldn't get the identical full explanation each time).
+const BOOK_GUIDANCE_SHORT =
+  "הכול דרך הקישור — בוחרים שירות, יום ושעה ומאשרים שם.";
+// WhatsApp-aware link-trouble recovery: the CTA button doesn't render on every device — resend the link.
+// Neutral lead so it pairs with EITHER a booking or a manage label (chosen by the resend kind).
+const LINK_TROUBLE_RECOVERY =
+  "אנחנו כאן בוואטסאפ, ולפעמים הכפתור לא מופיע בכל מכשיר. הנה שוב:";
+/** Picks the full guidance, or the short form when the full one was just sent (anti-robotic repetition;
+ *  reads the last assistant line only — no new state). */
+function pickBookGuidance(lastAssistant: string | null): string {
+  return (lastAssistant ?? "").includes(BOOK_GUIDANCE_FULL) ? BOOK_GUIDANCE_SHORT : BOOK_GUIDANCE_FULL;
+}
 // Accountability repair: the user references our earlier overload/system message. ACKNOWLEDGE it
 // (never deny, never blame the user), say it was momentary, bridge back to the task.
 const ACCOUNTABILITY_REPAIR =
@@ -946,6 +969,12 @@ export async function runPlatformTurn(
   let interactive: WhatsAppInteractive | undefined;
   let platformRoute = "-";
   let platformRouteReason = "-";
+  // Booking-guidance verdict (Slice E1) — one typed decision computed once inside the resolveRoute
+  // branch (it consumes route/reason), then consumed by the booking-link branch (copy) and by the
+  // dedicated block placed BEFORE the help-escape. Default NONE so the suppress / degraded / non-
+  // actionable paths keep today's behavior; `guidanceHandled` stops downstream escapes from overriding.
+  let guidance: BookingGuidanceVerdict = { intent: "NONE", link: "none", copy: "KEEP_MODEL" };
+  let guidanceHandled = false;
 
   if (decision.ok && suppressLinkFor(messageText)) {
     platformRoute = "NONE"; // complaints / bare-meta / one-char never get a link
@@ -969,6 +998,22 @@ export async function runPlatformTurn(
     const bookingSignal = hasBookingSignal(messageText, activeServiceNames);
     platformRoute = route;
     platformRouteReason = reason;
+
+    // ── BOOKING-GUIDANCE VERDICT (Slice E1): one typed decision the booking-link branch (copy) and
+    //    the dedicated block below both consume — so "which link" and "which copy" can never disagree.
+    //    All business/turn-state inputs are computed HERE and passed in explicitly (the resolver is pure).
+    const fulfilledKind: "booking" | "manage" | "none" =
+      prevPending?.stage === "fulfilled" ? (prevPending.kind === "BOOK" ? "booking" : "manage")
+        : lastContract.sentBookingLink ? "booking"
+        : lastContract.sentManageLink ? "manage" : "none";
+    guidance = resolveBookingGuidance({
+      latest, route, reason,
+      // A bare service ANSWER: a service signal that is neither an operation verb nor a question.
+      serviceSignal: bookingSignal && messageOperation(latest) === null && !isQuestionLike(latest),
+      bookingContextActive: prevPending?.kind === "BOOK" || lastContract.offeredBooking || lastContract.sentBookingLink,
+      messageBookingSignal: hasBookingSignal(latest, activeServiceNames),
+      fulfilledKind,
+    });
 
     // When the user's words OVERRODE the model's own operation, the model's free text was
     // written for the WRONG operation — replace it with a deterministic, route-appropriate
@@ -1028,6 +1073,13 @@ export async function runPlatformTurn(
       ({ replyText, interactive } = attachPlatformLink(replyText, label, url, lastAssistant, messageText));
       logPlatformLink(linkAttached, url);
     } else if (linkKind === "booking") {
+      // ── BOOKING-GUIDANCE COPY (Slice E1, failure #1): on a HIGH-CONFIDENCE book intent (the customer's
+      //    own words named booking, or a service answer while booking context is active) the model's raw
+      //    reply can be vague/contradictory ("מה תרצה שנעשה?") next to the link. Replace it with the
+      //    deterministic "how booking works" explanation so the copy always agrees with the link. Soft /
+      //    exploratory booking (model_intent without an explicit verb) is verdict NONE → the model's
+      //    warmth is kept (the fences below only strip specific bad patterns).
+      if (guidance.copy === "BOOK_GUIDANCE") replyText = pickBookGuidance(lastAssistant);
       // A booking reply must never ask the customer to pick service/day/time in chat —
       // that's the website's job. Strip any such question deterministically.
       const fenced = defuseSchedulingQuestion(replyText);
@@ -1055,6 +1107,56 @@ export async function runPlatformTurn(
     // route === NONE → no link (any override reply replacement already applied above).
   }
 
+  // ── BOOKING-GUIDANCE ESCAPE (Slice E1): rescue the booking-adjacent intents resolveRoute leaves at
+  //    NONE — "how does one book?", a site request, link trouble, a booking-status question, or a bare
+  //    service answer in an active booking thread — with an actionable, WhatsApp-aware, link-first
+  //    answer (or a no-link clarification). Placed BEFORE the help-escape so a link-TROUBLE complaint
+  //    never reaches helpEscapesToManage and mis-routes to a manage page. Fires only when nothing was
+  //    attached yet (a real BOOK route already applied its guidance copy above); `guidanceHandled` then
+  //    stops the help / cold-yes / which-link escapes from overriding it.
+  if (decision.ok && linkAttached === null && guidance.intent !== "NONE") {
+    if (guidance.copy === "STATUS_CLARIFY") {
+      // No appointment is booked until it's completed on the site. Attach NO link so a still-valid
+      // pending BOOK offer survives (newPending stays undefined → carried forward below).
+      replyText = BOOKED_CLAIM_CORRECTION;
+      guidanceHandled = true;
+      platformRoute = "NONE"; platformRouteReason = "booking_status";
+      console.log("[platform-turn] booking-guidance: status question → 'not booked yet, complete on site' (no link)");
+    } else if (guidance.copy === "WHICH_LINK") {
+      // Contextless link trouble — no fulfilled link and no booking/site words to justify a guess.
+      replyText = WHICH_LINK_CLARIFY;
+      guidanceHandled = true;
+      platformRoute = "NONE"; platformRouteReason = "link_trouble_clarify";
+      console.log("[platform-turn] booking-guidance: contextless link-trouble → which-link clarification (no link)");
+    } else if (guidance.link === "manage") {
+      // Link-trouble resend of a manage link (customer was mid-manage). Force-resend the correct
+      // manage page (sized by real upcoming count) with the WhatsApp-aware recovery lead.
+      const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
+      const m = manageLinkFor(upcoming, ctx.business.slug, customerPhone, customerId);
+      ({ replyText, interactive } = attachPlatformLink(LINK_TROUBLE_RECOVERY, m.label, m.url, lastAssistant, messageText, true));
+      linkAttached = m.kind;
+      guidanceHandled = true;
+      platformRoute = "MANAGE"; platformRouteReason = "link_trouble_resend";
+      logPlatformLink(m.kind, m.url);
+      console.log(`[platform-turn] booking-guidance: link-trouble → resend manage link (upcoming=${upcoming.length})`);
+    } else if (guidance.link === "booking") {
+      // BOOK_HOWTO / SITE_REQUEST / service-pick → booking guidance + link; LINK_TROUBLE with booking
+      // context → WhatsApp-aware recovery + a (force-resent) booking link.
+      const url = buildBookingLink(ctx.business.slug, customerPhone);
+      const trouble = guidance.copy === "TROUBLE_RECOVERY";
+      const lead = trouble ? LINK_TROUBLE_RECOVERY : pickBookGuidance(lastAssistant);
+      ({ replyText, interactive } = attachPlatformLink(lead, BOOK_LINE, url, lastAssistant, messageText, trouble));
+      linkAttached = "booking";
+      guidanceHandled = true;
+      platformRoute = "BOOK";
+      platformRouteReason = guidance.intent === "SITE_REQUEST" ? "site_request"
+        : guidance.intent === "BOOK_HOWTO" ? "booking_howto"
+        : guidance.intent === "LINK_TROUBLE" ? "link_trouble_resend" : "service_pick";
+      logPlatformLink("booking", url);
+      console.log(`[platform-turn] booking-guidance: ${guidance.intent} → booking link (${trouble ? "trouble recovery" : "guidance"})`);
+    }
+  }
+
   // ── ACTION / HELP ESCAPE (Customer Safety Contract): a help request, OR an operation
   //    the model MISSED, gets the RIGHT link + TRUTH-SAFE guidance. The website performs
   //    the action; chat NEVER does and never claims it did. Latest-message-driven; a
@@ -1077,9 +1179,10 @@ export async function runPlatformTurn(
   const wantsBook = (latestSignal === "action" && escapeOp === "BOOK") || confirmIntoBooking;
   const pendingResolved = confirmIntoBooking || confirmIntoManage;
   let softIntentLink = false;
-  if (decision.ok && !suppressLinkFor(latest) && wantsManage && (latestSignal === "help" || linkAttached === null)) {
+  if (decision.ok && !guidanceHandled && !suppressLinkFor(latest) && wantsManage && (latestSignal === "help" || linkAttached === null)) {
     // HELP overrides even an attached link (truth-safe guidance beats a vague model reply);
-    // a MISSED manage operation fires only when nothing was attached.
+    // a MISSED manage operation fires only when nothing was attached. Skipped when the booking-guidance
+    // escape already handled this turn (e.g. a link-TROUBLE resend must not be re-grabbed as manage-help).
     const upcoming = await listUpcomingByCustomer(db, businessId, customerId, 5);
     const m = manageLinkFor(upcoming, ctx.business.slug, customerPhone, customerId);
     ({ replyText, interactive } = attachPlatformLink(buildManageHelpReply(upcoming.length, escapeOp), m.label, m.url, lastAssistant, messageText));
@@ -1088,7 +1191,7 @@ export async function runPlatformTurn(
     platformRouteReason = "help_escape";
     logPlatformLink(m.kind, m.url);
     console.log(`[platform-turn] help-escape: truth-safe manage/help (op=${escapeOp ?? "-"}, upcoming=${upcoming.length})`);
-  } else if (decision.ok && linkAttached === null && wantsBook && !suppressLinkFor(latest)) {
+  } else if (decision.ok && !guidanceHandled && linkAttached === null && wantsBook && !suppressLinkFor(latest)) {
     const url = buildBookingLink(ctx.business.slug, customerPhone);
     ({ replyText, interactive } = attachPlatformLink(`בטח! ${FENCE_BRIDGE_BOOK}`, BOOK_LINE, url, lastAssistant, messageText));
     linkAttached = "booking";
@@ -1096,7 +1199,7 @@ export async function runPlatformTurn(
     platformRouteReason = continuation.status === "EXPLICIT_RESEND" ? "explicit_resend" : confirmIntoBooking ? "contextual_confirm" : "action_escape";
     logPlatformLink("booking", url);
     console.log(`[platform-turn] ${continuation.status === "EXPLICIT_RESEND" ? "explicit-resend: link re-sent on request" : confirmIntoBooking ? "contextual-confirm: 'כן' resolved a pending/open booking offer" : "action-escape: model missed a booking imperative"} → booking link`);
-  } else if (decision.ok && linkAttached === null && latestSignal === "soft_intent" && !suppressLinkFor(latest)) {
+  } else if (decision.ok && !guidanceHandled && linkAttached === null && latestSignal === "soft_intent" && !suppressLinkFor(latest)) {
     // SOFT SERVICE INTENT ("חשבתי על להסתפר, יש לי טיסה..."): keep the model's WARMTH,
     // strip any in-chat scheduling question / availability promise, and route to the
     // booking page (the safe universal entry — link-first, never an in-chat flow).
@@ -1119,7 +1222,7 @@ export async function runPlatformTurn(
   //    booking (when there's intent/booking context) or neutralize the promise — so an
   //    unsupported "אני אבדוק לך זמינות" never ships and never dangles an unanswerable yes.
   let capabilityFenceApplied = false;
-  if (decision.ok && linkAttached === null && mentionsCapabilityPromise(replyText)) {
+  if (decision.ok && !guidanceHandled && linkAttached === null && mentionsCapabilityPromise(replyText)) {
     const bookingContext = latestSignal === "soft_intent"
       || hasBookingSignal(messageText, activeServiceNames)
       || (affirm && (lastContract.sentBookingLink || lastContract.offeredBooking || prevPending?.kind === "BOOK"));
@@ -1138,6 +1241,28 @@ export async function runPlatformTurn(
     capabilityFenceApplied = true;
   }
 
+  // ── LINK-CAPABILITY-DENIAL FENCE (Slice E1, failure #7): the model must never claim it can't send
+  //    links — false in platform mode. Replace the false denial with a link-first bridge; attach a
+  //    booking link when there's booking context, else fall back to a safe neutral line (no phantom
+  //    link). Same route-agnostic shape as the capability-promise fence above.
+  if (decision.ok && !guidanceHandled && linkAttached === null && mentionsLinkCapabilityDenial(replyText)) {
+    const bookingContext = latestSignal === "soft_intent"
+      || hasBookingSignal(messageText, activeServiceNames)
+      || lastContract.offeredBooking || lastContract.sentBookingLink || prevPending?.kind === "BOOK";
+    if (bookingContext && !suppressLinkFor(latest)) {
+      const url = buildBookingLink(ctx.business.slug, customerPhone);
+      ({ replyText, interactive } = attachPlatformLink(defuseLinkCapabilityDenial(replyText).text, BOOK_LINE, url, lastAssistant, messageText));
+      linkAttached = "booking";
+      platformRoute = "BOOK";
+      platformRouteReason = "link_denial_fence";
+      logPlatformLink("booking", url);
+      console.log("[platform-turn] link-denial fence: false 'can't send links' → booking link");
+    } else {
+      replyText = META_FALLBACK; // no booking context → don't dangle a phantom link; safe neutral line
+      console.log("[platform-turn] link-denial fence: neutralized false 'can't send links' (no link)");
+    }
+  }
+
   // ── COLD AFFIRMATION GUARD: a bare "כן"/"סבבה" with NO resolvable context (continuation resolver
   //    says NONE, and our last reply neither asked nor offered anything actionable) must NOT route to
   //    an action — give ONE safe clarification instead of a cold guess. (An open/fulfilled offer is
@@ -1148,11 +1273,11 @@ export async function runPlatformTurn(
   const hasAnyLastReplyContext = lastContract.askedQuestion || lastContract.offeredHelp
     || lastContract.offeredBooking || lastContract.sentBookingLink || lastContract.sentManageLink;
   let coldYes = false;
-  if (decision.ok && linkAttached === null && affirm && continuation.status === "NONE" && !hasAnyLastReplyContext) {
+  if (decision.ok && !guidanceHandled && linkAttached === null && affirm && continuation.status === "NONE" && !hasAnyLastReplyContext) {
     replyText = COLD_YES_CLARIFY;
     coldYes = true;
     console.log("[platform-turn] cold affirmation with no pending context → safe clarification (no action)");
-  } else if (decision.ok && linkAttached === null && continuation.status === "NONE" && isExplicitLinkRequest(latest)) {
+  } else if (decision.ok && !guidanceHandled && linkAttached === null && continuation.status === "NONE" && isExplicitLinkRequest(latest)) {
     // An explicit "תשלח"/"שלח שוב" with no valid offer to resolve against (none persisted, expired, or
     // the last outbound was proactive) never guesses which link — ask once instead of silently
     // resending a possibly-stale/irrelevant one.
@@ -2721,11 +2846,14 @@ export function stripModelUrls(text: string): string {
 }
 
 /** Appends the single deterministic link — OR, if we just sent this exact link and
- *  the user didn't ask for it again, references it instead of re-spamming the URL. */
+ *  the user didn't ask for it again, references it instead of re-spamming the URL.
+ *  `forceResend` (Slice E1 link-trouble) always re-sends the URL: the customer reported the
+ *  button didn't render, so the "still waiting" reference would be exactly the wrong answer. */
 function appendPlatformLink(
-  reply: string, label: string, url: string, lastAssistant: string | null, message: string
+  reply: string, label: string, url: string, lastAssistant: string | null, message: string,
+  forceResend = false
 ): string {
-  if (lastAssistant?.includes(url) && !isExplicitLinkRequest(message)) {
+  if (!forceResend && lastAssistant?.includes(url) && !isExplicitLinkRequest(message)) {
     return `${reply}\n\nהקישור שכבר שלחתי קודם עדיין מחכה לך — בודקים שם 🙂`;
   }
   return `${reply}\n\n${label}\n${url}`;
@@ -2741,10 +2869,11 @@ function appendPlatformLink(
  * never writes it. Gender/emoji enforcement on the cta_url body happens at the outbound chokepoint.
  */
 export function attachPlatformLink(
-  reply: string, label: string, url: string, lastAssistant: string | null, message: string
+  reply: string, label: string, url: string, lastAssistant: string | null, message: string,
+  forceResend = false
 ): { replyText: string; interactive: WhatsAppInteractive | undefined } {
-  const replyText = appendPlatformLink(reply, label, url, lastAssistant, message);
-  const referencedPrevious = !!lastAssistant?.includes(url) && !isExplicitLinkRequest(message);
+  const replyText = appendPlatformLink(reply, label, url, lastAssistant, message, forceResend);
+  const referencedPrevious = !forceResend && !!lastAssistant?.includes(url) && !isExplicitLinkRequest(message);
   if (referencedPrevious) return { replyText, interactive: undefined }; // reference line has no URL → text only
   // Length-cap the cta_url body so a long model reply never trips an avoidable interactive rejection.
   return { replyText, interactive: { kind: "cta_url", body: capInteractiveBody(`${reply}\n\n${label}`), buttonText: "לחץ כאן", url } };
@@ -2904,6 +3033,25 @@ export function defuseActionRefusal(reply: string, route: Route): { text: string
   if (!mentionsActionRefusal(reply)) return { text: reply, defused: false };
   const bridge = route === "BOOK" ? FENCE_BRIDGE_BOOK : FENCE_BRIDGE_MANAGE;
   return { text: `בטח! ${bridge}`, defused: true };
+}
+
+// ── Deterministic LINK-CAPABILITY-DENIAL fence (platform mode, Slice E1, failure #7) ─────────────
+// The model must NEVER claim it can't send a link / can't do this in chat — false in platform mode,
+// where the SYSTEM attaches the link right after the reply. Catches a NEGATION (reused ACTION_REFUSAL_NEG)
+// co-located with a LINK/SITE noun in the SAME sentence. Distinct from defuseActionRefusal (which needs
+// an operation infinitive like לבטל/לקבוע) — this is about the link-SENDING capability, not the booking
+// action. Deliberately keyed on "לא יכול/אי אפשר" (not "אין"), so "אין צורך בקישור" never trips it.
+const LINK_DENIAL_NOUN_RE = /קישור|לינק|\blink\b|(?<![֐-׿])[בהל]?אתר(?![֐-׿])/i;
+export function mentionsLinkCapabilityDenial(reply: string): boolean {
+  return (reply ?? "")
+    .split(/[.!?\n]/)
+    .some((s) => ACTION_REFUSAL_NEG.test(s) && LINK_DENIAL_NOUN_RE.test(s));
+}
+/** Replaces a false "I can't send links" claim with the link-first bridge (the caller attaches the
+ *  booking link when there's booking context). No-op when no such denial is present. */
+export function defuseLinkCapabilityDenial(reply: string): { text: string; defused: boolean } {
+  if (!mentionsLinkCapabilityDenial(reply)) return { text: reply, defused: false };
+  return { text: `בטח! ${FENCE_BRIDGE_BOOK}`, defused: true };
 }
 
 /**

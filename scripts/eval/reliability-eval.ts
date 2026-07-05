@@ -46,7 +46,11 @@ import {
   runPlatformTurn, type PlatformTurnTestDeps, type PlatformTurnOutcome,
   hasBusinessAnchor, ACK_REASON, isTerminalClosure, DETERMINISTIC_NONANSWER_REASONS, isSoftCloseAffirmation,
   resolveContinuation, isBareDecline,
+  mentionsLinkCapabilityDenial, defuseLinkCapabilityDenial,
 } from "../../lib/ai/platform-turn";
+import {
+  resolveBookingGuidance, isBookingHowTo, isSiteRequest, isLinkTrouble, isBookingStatusQuestion,
+} from "../../lib/ai/booking-guidance";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
 } from "../../lib/ai/telemetry";
@@ -4631,6 +4635,133 @@ async function main(): Promise<void> {
     check("E2E regression: FAQ question after a link → handled normally, not swallowed by continuation logic",
       rFaqAfterLink.outcome.linkAttached !== "booking" && (rFaqAfterLink.outcome.replyText ?? "").includes("80"),
       `linkAttached=${rFaqAfterLink.outcome.linkAttached} reply="${rFaqAfterLink.outcome.replyText}"`);
+  })();
+
+  // ── 63. BOOKING-GUIDANCE POLICY (Slice E1) — resolver truth-table + predicates + false-denial fence ──
+  section("63. Booking-guidance: how-to / site / link-trouble / status intents + deterministic copy ownership");
+  {
+    // Part A — predicates (SHAPE recognition, business-agnostic; a miss falls through to today's behavior)
+    check("isBookingHowTo: 'איך קובעים?'/'איך מזמינים?' yes; 'איך מבטלים?'/'מתי סוגרים?'/price-FAQ no",
+      isBookingHowTo("איך קובעים?") && isBookingHowTo("איך מזמינים תור?") && isBookingHowTo("כיצד קובעים תור")
+      && !isBookingHowTo("איך מבטלים?") && !isBookingHowTo("מתי אתם סוגרים?") && !isBookingHowTo("כמה עולה תספורת?"));
+    check("isSiteRequest: site-access shapes yes; a bare FAQ mentioning the site no; link words stay Slice B's",
+      isSiteRequest("אני צריך את האתר") && isSiteRequest("יכול לשלוח לי את האתר?") && isSiteRequest("אפשר את האתר?")
+      && isSiteRequest("איך אני מגיע לאתר") && !isSiteRequest("ראיתי באתר שיש מבצע") && !isSiteRequest("תשלח לי קישור"));
+    check("isLinkTrouble: trouble+button/link yes; a link REQUEST or an unrelated complaint no",
+      isLinkTrouble("אין כפתור שמופיע למטה") && isLinkTrouble("לא רואה קישור") && isLinkTrouble("הקישור לא עובד")
+      && !isLinkTrouble("תשלח לי את הקישור") && !isLinkTrouble("אין לי זמן"));
+    check("isBookingStatusQuestion: 'קבעת לי?'/'אז קבעת?' yes; imperative 'תקבע לי' and statement 'קבעתי' no",
+      isBookingStatusQuestion("קבעת לי?") && isBookingStatusQuestion("אז קבעת?") && isBookingStatusQuestion("זה נקבע?")
+      && !isBookingStatusQuestion("תקבע לי תור") && !isBookingStatusQuestion("קבעתי כבר אצלכם"));
+
+    // Part B — resolver truth-table (one verdict per intent; precedence; fail-safe)
+    const g = (over: Partial<Parameters<typeof resolveBookingGuidance>[0]>) => resolveBookingGuidance({
+      latest: "", route: "NONE", reason: "not_actionable", serviceSignal: false,
+      bookingContextActive: false, messageBookingSignal: false, fulfilledKind: "none", ...over,
+    });
+    check("resolver: explicit book verb → BOOK_ACTION/booking/BOOK_GUIDANCE",
+      (() => { const v = g({ latest: "אני רוצה לקבוע תור", route: "BOOK", reason: "message_verb" }); return v.intent === "BOOK_ACTION" && v.link === "booking" && v.copy === "BOOK_GUIDANCE"; })());
+    check("resolver: 'איך קובעים?' → BOOK_HOWTO/booking/BOOK_GUIDANCE (a NONE route is rescued)",
+      (() => { const v = g({ latest: "איך קובעים?" }); return v.intent === "BOOK_HOWTO" && v.link === "booking" && v.copy === "BOOK_GUIDANCE"; })());
+    check("resolver: 'אני צריך את האתר' → SITE_REQUEST/booking/BOOK_GUIDANCE",
+      (() => { const v = g({ latest: "אני צריך את האתר" }); return v.intent === "SITE_REQUEST" && v.link === "booking" && v.copy === "BOOK_GUIDANCE"; })());
+    check("resolver: 'אז קבעת?' → STATUS_QUESTION/none/STATUS_CLARIFY (no link)",
+      (() => { const v = g({ latest: "אז קבעת?" }); return v.intent === "STATUS_QUESTION" && v.link === "none" && v.copy === "STATUS_CLARIFY"; })());
+    check("resolver: link trouble is KIND-EXACT — fulfilled BOOK → resend booking; fulfilled MANAGE → resend manage",
+      g({ latest: "אין כפתור", fulfilledKind: "booking" }).link === "booking"
+      && g({ latest: "אין כפתור", fulfilledKind: "manage" }).link === "manage"
+      && g({ latest: "אין כפתור", fulfilledKind: "booking" }).copy === "TROUBLE_RECOVERY");
+    check("resolver: contextless link trouble → none/WHICH_LINK (never a blind booking guess)",
+      (() => { const v = g({ latest: "אין כפתור" }); return v.intent === "LINK_TROUBLE" && v.link === "none" && v.copy === "WHICH_LINK"; })());
+    check("resolver: link trouble with a booking signal in the message → booking recovery",
+      g({ latest: "אין כפתור לקבוע תור", messageBookingSignal: true }).link === "booking");
+    check("resolver: service answer WITH active booking context → BOOK_ACTION; WITHOUT context → NONE (no forced link)",
+      g({ latest: "תספורת", serviceSignal: true, bookingContextActive: true }).intent === "BOOK_ACTION"
+      && g({ latest: "תספורת", serviceSignal: true, bookingContextActive: false }).intent === "NONE");
+    check("resolver: precedence — a link-trouble complaint outranks a status shape in the same message",
+      g({ latest: "אין כפתור, אז קבעת?", fulfilledKind: "booking" }).intent === "LINK_TROUBLE");
+    check("resolver: a plain exploration message → NONE/KEEP_MODEL (no link, no copy override)",
+      (() => { const v = g({ latest: "כמה זמן זה לוקח?" }); return v.intent === "NONE" && v.link === "none" && v.copy === "KEEP_MODEL"; })());
+
+    // Part C — false-capability-denial fence (failure #7)
+    check("link-denial fence: catches 'לא יכול לשלוח קישורים'/'אי אפשר לשלוח לינק'; ignores 'אין צורך בקישור' + plain replies",
+      mentionsLinkCapabilityDenial("אני לא יכול לשלוח קישורים") && mentionsLinkCapabilityDenial("אי אפשר לשלוח לינק כאן")
+      && !mentionsLinkCapabilityDenial("אין צורך בקישור נוסף") && !mentionsLinkCapabilityDenial("בשמחה, אני כאן לכל שאלה")
+      && defuseLinkCapabilityDenial("אני לא יכול לשלוח קישורים").defused
+      && !defuseLinkCapabilityDenial("בשמחה, אני כאן").defused);
+  }
+  gap("§63 scope: proves the PURE resolver + predicates + denial fence. End-to-end wiring (the booking-guidance escape + booking-branch copy override in runPlatformTurn) is proven below via the real runPlatformTurn through runLane.",
+    "none — the runtime-lane checks immediately following cover every required end-to-end scenario.");
+
+  section("63b. Booking-guidance wired into runPlatformTurn (runtime lane, real deterministic routing)");
+  await (async () => {
+    const nowE = Date.now();
+    const bookFulfilled = { kind: "BOOK" as const, stage: "fulfilled" as const, at: nowE - 60_000 };
+    const bookOffered = { kind: "BOOK" as const, stage: "offered" as const, at: nowE - 60_000 };
+    const manageFulfilled = { kind: "MANAGE" as const, stage: "fulfilled" as const, at: nowE - 60_000 };
+    const bookSent = "Assistant (you, earlier): בשמחה. את קביעת התור עושים דרך הקישור.\nhttps://example.com/book/test-biz?p=972500000000";
+    const manageSent = "Assistant (you, earlier): הנה הקישור לניהול התור: https://example.com/appointment/appt-1";
+    const future = new Date(nowE + 86_400_000).toISOString();
+    const upcoming = [{ id: "appt-1", start_time: future, status: "confirmed", services: { name: "תספורת" } }];
+    const hasGuidance = (t: string | undefined) => !!t && t.includes("דרך הקישור") && t.includes("בוחרים");
+
+    const r1 = await runLane({ message: "אפשר לקבוע תור?", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "מה תרצה שנעשה?" } });
+    check("E2E #1: 'אפשר לקבוע תור?' → booking link + guidance copy, NOT the model's 'מה תרצה שנעשה?'",
+      r1.outcome.linkAttached === "booking" && hasGuidance(r1.outcome.replyText) && !(r1.outcome.replyText ?? "").includes("מה תרצה"),
+      `link=${r1.outcome.linkAttached} reply="${r1.outcome.replyText}"`);
+
+    const r3 = await runLane({ message: "איך קובעים?", prevLow: 0, model: { intent: "faq", action: false, reply: "פשוט מאוד" } });
+    check("E2E #3: 'איך קובעים?' → booking link + guidance (today: NONE dead-end)",
+      r3.outcome.linkAttached === "booking" && hasGuidance(r3.outcome.replyText),
+      `link=${r3.outcome.linkAttached} reply="${r3.outcome.replyText}"`);
+
+    const r5 = await runLane({ message: "יכול לשלוח לי את האתר?", prevLow: 0, model: { intent: "faq", action: false, reply: "בטח" } });
+    check("E2E #5: site request → booking link + guidance",
+      r5.outcome.linkAttached === "booking" && hasGuidance(r5.outcome.replyText),
+      `link=${r5.outcome.linkAttached} reply="${r5.outcome.replyText}"`);
+
+    const r7 = await runLane({ message: "אין כפתור", prevLow: 0, pendingOffer: bookFulfilled, transcript: bookSent, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "?" } });
+    check("E2E #7: link trouble after a booking link → WhatsApp-aware recovery + resend booking, pending preserved",
+      r7.outcome.linkAttached === "booking" && (r7.outcome.replyText ?? "").includes("בכל מכשיר")
+      && (r7.pendingOfferAfter?.kind === "BOOK" || r7.pendingOfferAfter === undefined),
+      `link=${r7.outcome.linkAttached} reply="${r7.outcome.replyText}" pending=${JSON.stringify(r7.pendingOfferAfter)}`);
+
+    const r9 = await runLane({ message: "אין כפתור", prevLow: 0, pendingOffer: manageFulfilled, transcript: manageSent, lastAssistantSource: "ai_turn", upcoming, model: { intent: "unclear", action: false, reply: "?" } });
+    check("E2E #9: link trouble after a manage link → resend MANAGE, never booking (kind guard)",
+      r9.outcome.linkAttached === "manage",
+      `link=${r9.outcome.linkAttached} reply="${r9.outcome.replyText}"`);
+
+    const r9b = await runLane({ message: "אין כפתור", prevLow: 0, model: { intent: "unclear", action: false, reply: "?" } });
+    check("E2E #9b: contextless 'אין כפתור' → which-link clarify, NO arbitrary booking link",
+      r9b.outcome.linkAttached == null && (r9b.outcome.replyText ?? "").includes("לאיזה קישור"),
+      `link=${r9b.outcome.linkAttached} reply="${r9b.outcome.replyText}"`);
+
+    const r10 = await runLane({ message: "אז קבעת?", prevLow: 0, pendingOffer: bookOffered, transcript: "Assistant (you, earlier): רוצה שנתאם לך תור?", lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "כן, סגור" } });
+    check("E2E #10: 'אז קבעת?' → 'not booked yet, complete on site' clarification, no link, pending BOOK preserved",
+      r10.outcome.linkAttached == null && (r10.outcome.replyText ?? "").includes("קובעים באתר")
+      && (r10.pendingOfferAfter?.kind === "BOOK" || r10.pendingOfferAfter === undefined),
+      `link=${r10.outcome.linkAttached} reply="${r10.outcome.replyText}" pending=${JSON.stringify(r10.pendingOfferAfter)}`);
+
+    const r13 = await runLane({ message: "כמה זמן תספורת לוקחת?", prevLow: 0, model: { intent: "faq", action: false, reply: "בערך שעה" } });
+    check("E2E #13: service-duration FAQ → model answer kept, NO link (exploration stays link-free)",
+      r13.outcome.linkAttached == null && (r13.outcome.replyText ?? "").includes("שעה"),
+      `link=${r13.outcome.linkAttached} reply="${r13.outcome.replyText}"`);
+
+    const r14 = await runLane({ message: "תספורת", prevLow: 0, pendingOffer: bookOffered, transcript: "Assistant (you, earlier): רוצה שנתאם לך תור? לאיזה שירות?", lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "תספורת זה מעולה" } });
+    check("E2E #14: bare service answer in active booking context → booking guidance + link (not a dead-end ack)",
+      r14.outcome.linkAttached === "booking" && hasGuidance(r14.outcome.replyText),
+      `link=${r14.outcome.linkAttached} reply="${r14.outcome.replyText}"`);
+
+    const r16 = await runLane({ message: "אז מה עכשיו?", prevLow: 0, transcript: "Assistant (you, earlier): רוצה שנתאם לך תור?", lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "אני לא יכול לשלוח קישורים" } });
+    check("E2E #16: model 'אני לא יכול לשלוח קישורים' + booking context → false denial removed (never shipped)",
+      !(r16.outcome.replyText ?? "").includes("לא יכול"),
+      `link=${r16.outcome.linkAttached} reply="${r16.outcome.replyText}"`);
+
+    const r19a = await runLane({ message: "אפשר לקבוע תור?", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "כן" } });
+    const r19b = await runLane({ message: "אפשר לקבוע תור?", prevLow: 0, transcript: `Assistant (you, earlier): ${r19a.outcome.replyText}`, lastAssistantSource: "ai_turn", model: { intent: "booking", appt: "BOOK", action: true, reply: "כן" } });
+    check("E2E #19: repeated 'אפשר לקבוע תור?' → turn-2 reply differs from turn-1 (short/nudge form, no robotic repeat)",
+      r19a.outcome.linkAttached === "booking" && (r19b.outcome.replyText ?? "") !== (r19a.outcome.replyText ?? ""),
+      `t1="${r19a.outcome.replyText}" t2="${r19b.outcome.replyText}"`);
   })();
 
   // ── summary ────────────────────────────────────────────────────────────────────
