@@ -2148,6 +2148,35 @@ async function main() {
       (d60.replyText ?? "").trim().length > 0 && !claimsBookingCompleted(d60.replyText) ? "PASS ✓" : `FAIL ✗ ("${d60.replyText}")`}`);
   }
 
+  console.log("\n================ SCENARIO 61: AI trust/safety behavior classes (Slice E3) ================");
+  // Live WhatsApp QA: (B) "רגע לא רציתי לבטל" still routed to CANCEL/manage; (C) "זה לא מה ששאלתי"/"לא הבנת"
+  // got no recovery; (F) "אפשר לעשן?" got a confident invented "yes". E3 fences these CLASSES deterministically
+  // (routing negation guard + B/C/D reply lanes + unknown-policy fence). The runtime behavior is proven in
+  // reliability-eval §66/§67; here we assert the class predicates fire on the real incident phrases + the routing
+  // invariant, and live-check that a raw model answer to an unknown policy is exactly why the fence is needed.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const rt = await import("../lib/ai/routing");
+    console.log("  [pure] class B — retraction: 'לא רציתי לבטל' → reversal + route NONE; real 'אני רוצה לבטל' → CANCEL:",
+      pt.isActionReversal("לא רציתי לבטל") === true && rt.messageOperation("לא רציתי לבטל") === null
+      && rt.messageOperation("אני רוצה לבטל") === "CANCEL" && rt.messageOperation("לא לבטל, רק לשנות") === "RESCHEDULE"
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] class C/D — correction vs abandon are distinct: 'זה לא מה ששאלתי'/'לא הבנת' = correction; 'עזוב' = abandon:",
+      pt.isMisunderstandingCorrection("זה לא מה ששאלתי") === true && pt.isMisunderstandingCorrection("לא הבנת") === true
+      && pt.isAbandon("עזוב") === true && pt.isAbandon("עזוב, כמה עולה?") === false
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] class F — unknown policy: 'אפשר לעשן?' is a policy Q, NOT covered by empty KB → fence fires:",
+      pt.policyTopicOf("אפשר לעשן?") === "smoking" && pt.kbCoversPolicyTopic("smoking", []) === false
+      && pt.policyTopicOf("כמה עולה תספורת?") === null
+        ? "PASS ✓" : "FAIL ✗");
+
+    // Live: a raw model answer to an unknown policy is unreliable (documents why the DETERMINISTIC fence exists).
+    const d61 = await runReceptionistTurn(ctx, {
+      conversationContext: "", message: "אפשר לעשן במספרה?", bookingBlock: "", platformMode: true,
+    });
+    console.log(`  [live] raw model answer to an unknown policy (fence handles this deterministically in runPlatformTurn): "${(d61.replyText ?? "").slice(0, 80)}"`);
+  }
+
   console.log("\nDONE.");
 }
 

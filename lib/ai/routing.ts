@@ -62,17 +62,57 @@ const APPT_REF_RE = /תור|פגיש|הזמנ|מועד/;
  * present. Precedence among multiple signals: RESCHEDULE > CANCEL > LIST > BOOK — so
  * "לבטל ולקבוע מחדש" (cancel & re-book) resolves to RESCHEDULE, not a fresh BOOK. Pure.
  */
+// ── E3 (behavior class B — action negation / reversal): a negation/mistake cue in the SAME clause as an
+//    operation verb ("לא רציתי לבטל", "בטעות ביטלתי") means that operation is being RETRACTED — it must
+//    not route to a manage/cancel link. Partial negation is respected by PRECEDENCE: "לא לבטל, רק לשנות"
+//    negates CANCEL but leaves RESCHEDULE affirmed → RESCHEDULE (checked first). Shape-based, not phrases.
+const NEG_CUE = `(?<![${HEB}])(?:לא|אל|בטעות|בעצם\\s+לא|לא\\s+רצית(?:י|ה)?|לא\\s+צרי[כך]|לא\\s+רוצ(?:ה|ים)?)`;
+/** True when a negation cue precedes the verb within the SAME clause (≤2 words). Clause-scoped so an
+ *  affirmed op in a later clause ("…רק לשנות") is never counted as negated by an earlier "לא". */
+function negatedNear(clause: string, term: string): boolean {
+  return new RegExp(`${NEG_CUE}(?:\\s+\\S+){0,2}\\s+[בהלושמכ]?${term}`).test(clause);
+}
+/** True when EVERY clause that contains one of the op's verbs negates it (the op is being retracted).
+ *  Clauses split on punctuation + affirmation cues (רק/אבל/אלא), so "לא לבטל, רק לשנות" negates only
+ *  CANCEL and leaves RESCHEDULE affirmed. */
+function opNegated(text: string, terms: string[]): boolean {
+  const clauses = text.split(/[,.;!?]|\s+רק\s+|\s+אבל\s+|\s+אלא\s+/);
+  let anyPresent = false;
+  let allNegated = true;
+  for (const clause of clauses) {
+    for (const term of terms) {
+      if (new RegExp(tok(term)).test(clause)) {
+        anyPresent = true;
+        if (!negatedNear(clause, term)) allNegated = false;
+      }
+    }
+  }
+  return anyPresent && allNegated;
+}
+function anyOpVerbPresent(text: string): boolean {
+  return RESCHEDULE_RE.test(text) || RESCHEDULE_PHRASE_RE.test(text) || CANCEL_RE.test(text)
+    || LIST_RE.test(text) || LIST_PHRASE_RE.test(text) || CREATE_RE.test(text);
+}
+
 export function messageOperation(message: string): Route | null {
   const t = (message ?? "").trim();
   if (!t) return null;
-  if (RESCHEDULE_RE.test(t) || RESCHEDULE_PHRASE_RE.test(t)) return "RESCHEDULE";
-  if (CANCEL_RE.test(t)) return "CANCEL";
+  if ((RESCHEDULE_RE.test(t) || RESCHEDULE_PHRASE_RE.test(t)) && !opNegated(t, RESCHEDULE_VERBS)) return "RESCHEDULE";
+  if (CANCEL_RE.test(t) && !opNegated(t, CANCEL_VERBS)) return "CANCEL";
   // LIST is the most over-triggered op: a generic view-verb counts only WITH an appointment
   // reference ("תראה לי את התור"); the explicit phrase ("התורים שלי") stands alone. Bare
   // "תראה"/"הנה תראה" (discourse "look here") no longer false-routes to a manage link.
-  if (LIST_PHRASE_RE.test(t) || (LIST_RE.test(t) && APPT_REF_RE.test(t))) return "LIST";
-  if (CREATE_RE.test(t)) return "BOOK";
+  if ((LIST_PHRASE_RE.test(t) || (LIST_RE.test(t) && APPT_REF_RE.test(t))) && !opNegated(t, LIST_VERBS)) return "LIST";
+  if (CREATE_RE.test(t) && !opNegated(t, CREATE_VERBS)) return "BOOK";
   return null;
+}
+
+/** E3 (class B): an operation verb is PRESENT but the user retracted it ("לא רציתי לבטל") — so
+ *  messageOperation returned null. resolveRoute forces NONE on this so a retraction never falls through
+ *  to the model's route; the reversal reply lane owns the wording. Pure. */
+export function isNegatedOperation(message: string): boolean {
+  const t = (message ?? "").trim();
+  return anyOpVerbPresent(t) && messageOperation(t) === null;
 }
 
 const APPT_TO_ROUTE: Record<string, Route> = {
@@ -99,6 +139,9 @@ export function resolveRoute(u: Understanding, message: string): RouteDecision {
   // 2) The user's explicit verb is authoritative for WHICH operation.
   const msgOp = messageOperation(message);
   if (msgOp) return { route: msgOp, reason: "message_verb", modelRoute };
+  // 2b) E3 (class B): the user RETRACTED an operation ("לא רציתי לבטל") — never fall through to the
+  //     model's route (which may still say CANCEL). Force NONE; the reversal reply lane owns the wording.
+  if (isNegatedOperation(message)) return { route: "NONE", reason: "not_actionable", modelRoute };
   // 3) Otherwise trust the (reconciled) model understanding.
   return { route: modelRoute, reason: "model_intent", modelRoute };
 }

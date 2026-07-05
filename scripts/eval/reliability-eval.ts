@@ -15,7 +15,7 @@
 //
 // Exit code: non-zero if any deterministic check FAILS (CI/owner-friendly).
 
-import { resolveRoute, linkKindForRoute, modelOperation, messageOperation } from "../../lib/ai/routing";
+import { resolveRoute, linkKindForRoute, modelOperation, messageOperation, isNegatedOperation } from "../../lib/ai/routing";
 import {
   hasBookingSignal, applyBookingEvidenceGate, suppressLinkFor, isExplicitLinkRequest,
   isEmojiOnly, looksLikeNoise, lowSignalActionFor, quietModePlan, countsTowardQuiet,
@@ -27,6 +27,8 @@ import {
   deriveLastAssistantContract, replyLooksStaleManage, helpEscapesToManage, type LastAssistantContract,
   hasSoftServiceIntent, mentionsCapabilityPromise, defuseCapabilityPromise,
   serviceExplorationContext, isServiceDesireOrPick,
+  isActionReversal, refersToPastAction, isMisunderstandingCorrection, isAbandon,
+  policyTopicOf, isPolicyQuestion, kbCoversPolicyTopic, alreadyDefers,
   looksLikeGreetingOrMeta, collapseElongation,
   looksLikePresenceCheck, looksLikeSocialOpener, isRecoveryFollowup, wasDegradedReply, preGeminiAction,
   readPendingOffer, PENDING_OFFER_TTL_MS,
@@ -187,13 +189,19 @@ function makeFakeDb(captured: Array<Record<string, unknown>>, upcoming: Upcoming
 // Persona-delta harness (§53): an optional aiSettings override lets a test inject contrasting OWNER
 // settings (e.g. custom_instructions presets, emoji/length/gender) to prove they reach the model boundary
 // and stay style-only. With no override this is the original context, so every existing caller is byte-identical.
-function harnessCtx(aiOver?: Partial<AISettings>): BusinessAIContext {
+function harnessCtx(
+  aiOver?: Partial<AISettings>,
+  kb?: Array<{ category?: string; title?: string; content?: string; active?: boolean }>,
+  cancellationPolicy?: string | null,
+): BusinessAIContext {
   return {
     business: { id: "biz", slug: "test-biz", name: "עסק לדוגמה", timezone: "Asia/Jerusalem" },
-    businessSettings: null,
+    businessSettings: cancellationPolicy != null ? { cancellation_policy_text: cancellationPolicy } : null,
     aiSettings: { ai_enabled: true, emoji_usage: "none", ...(aiOver ?? {}) },
     services: SERVICES.map((name, i) => ({ id: `svc${i}`, name, active: true })),
-    knowledgeBaseItems: [],
+    knowledgeBaseItems: (kb ?? []).map((k, i) => ({
+      id: `kb${i}`, category: k.category ?? "faq", title: k.title ?? "", content: k.content ?? "", active: k.active ?? true,
+    })),
     businessHours: [],
   } as unknown as BusinessAIContext;
 }
@@ -210,6 +218,8 @@ async function runLane(opts: {
   message: string; prevLow: number; prevGreet?: number; model?: ModelScript; upcoming?: UpcomingRow[];
   lastAssistantReason?: string; transcript?: string; historyTurns?: { role: "user" | "model"; text: string }[];
   aiSettings?: Partial<AISettings>; // §53 persona-delta: inject contrasting owner settings into the context
+  kb?: Array<{ category?: string; title?: string; content?: string; active?: boolean }>; // §67: inject KB coverage
+  cancellationPolicy?: string | null; // §67: business_settings.cancellation_policy_text
   // Slice B: inject a persisted pending offer (with lifecycle stage) and whether the last outbound was
   // reactive vs. proactive — feeds the continuation resolver via priorContext/ConversationContext,
   // mirroring how lastAssistantReason already flows in.
@@ -218,7 +228,7 @@ async function runLane(opts: {
 }): Promise<LaneResult> {
   const captured: Array<Record<string, unknown>> = [];
   const db = makeFakeDb(captured, opts.upcoming ?? []);
-  const ctx = harnessCtx(opts.aiSettings);
+  const ctx = harnessCtx(opts.aiSettings, opts.kb, opts.cancellationPolicy);
   let modelCalled = false;
   let modelMessage: string | undefined; // the message the model actually received (post mixed-burst sanitize)
   let modelContext: string | undefined; // EVERY model-facing field concatenated (message+transcript+history+guidance)
@@ -4892,6 +4902,117 @@ async function main(): Promise<void> {
     const junk = await runLane({ message: "אשמח לדבר עם מישהו", prevLow: 2, model: { intent: "unclear", action: false, reply: "?" } });
     check("§65: genuine non-interest 'אשמח לדבר עם מישהו' → no link, no offer (low-signal path intact)",
       junk.outcome.linkAttached == null && !isOffer(junk.outcome.replyText), `link=${junk.outcome.linkAttached} reply="${junk.outcome.replyText}"`);
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 66. CONVERSATION-BEHAVIOR CLASSES B/C/D (Slice E3) — action reversal / misunderstanding correction /
+  //     abandon. Assertions prove CLASS behavior + invariants (no unsafe action route, no hallucinated
+  //     prior question, real cancel still cancels), not exact strings.
+  section("66. Behavior classes B/C/D (Slice E3) — action reversal, correction, abandon");
+  {
+    // ── Tier 1 — pure predicates ──
+    // Class B: negation-aware operation reading + reversal detection.
+    check("§66 B: 'לא רציתי לבטל' → messageOperation null / isNegatedOperation true; real 'אני רוצה לבטל' → CANCEL",
+      messageOperation("לא רציתי לבטל") === null && isNegatedOperation("לא רציתי לבטל") === true
+      && messageOperation("אני רוצה לבטל") === "CANCEL" && isNegatedOperation("אני רוצה לבטל") === false);
+    check("§66 B: partial negation 'לא לבטל, רק לשנות' → RESCHEDULE (affirmed op wins, not NONE)",
+      messageOperation("לא לבטל, רק לשנות") === "RESCHEDULE");
+    check("§66 B: resolveRoute forces NONE on a retracted op (model still says CANCEL)",
+      resolveRoute(u({ requestsBusinessAction: true, intent: "cancel_request", appointmentIntent: "CANCEL" }), "לא רציתי לבטל").route === "NONE");
+    check("§66 B: isActionReversal catches retraction + past/site action, not a real op",
+      isActionReversal("לא רציתי לבטל") === true && isActionReversal("ביטלתי בטעות") === true
+      && isActionReversal("תחזיר לי את התור") === true && isActionReversal("אני רוצה לבטל") === false
+      && refersToPastAction("ביטלתי בטעות") === true && refersToPastAction("אני רוצה לבטל") === false);
+    // Class C
+    check("§66 C: isMisunderstandingCorrection catches interpretation-rejection, not a fresh request",
+      isMisunderstandingCorrection("זה לא מה ששאלתי") === true && isMisunderstandingCorrection("לא הבנת") === true
+      && isMisunderstandingCorrection("מה לא מובן?") === true && isMisunderstandingCorrection("אתה לא עוזר") === true
+      && isMisunderstandingCorrection("אני רוצה לקבוע") === false);
+    // Class D
+    check("§66 D: isAbandon catches drop-this, excludes an attached request (latest-wins)",
+      isAbandon("עזוב") === true && isAbandon("לא משנה") === true && isAbandon("תשכח מזה") === true
+      && isAbandon("עזוב, כמה עולה?") === false && isAbandon("לא משנה, אני רוצה לקבוע") === false);
+  }
+  await (async () => {
+    // ── Tier 2 — runLane (class behavior end-to-end) ──
+    // Class B: a reversal never routes/claims an action; states nothing-done + a rebook OFFER; "כן" resolves.
+    const rev = await runLane({ message: "לא רציתי לבטל", prevLow: 0, model: { intent: "cancel_request", appt: "CANCEL", action: true, reply: "ביטלתי לך את התור" } });
+    check("§66 B E2E: 'לא רציתי לבטל' → no link, 'nothing done here', NOT the false 'ביטלתי', soft-offer pending",
+      rev.outcome.linkAttached == null && (rev.outcome.replyText ?? "").includes("שום שינוי לא בוצע")
+      && !(rev.outcome.replyText ?? "").includes("ביטלתי לך") && rev.pendingOfferAfter?.stage === "offered",
+      `link=${rev.outcome.linkAttached} reply="${rev.outcome.replyText}" pending=${JSON.stringify(rev.pendingOfferAfter)}`);
+    const revYes = await runLane({ message: "כן", prevLow: 0, pendingOffer: { kind: "BOOK", stage: "offered", source: "soft_interest_offer", at: Date.now() - 60_000 }, transcript: "Assistant (you, earlier): רוצה שאשלח קישור?", lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "סבבה" } });
+    check("§66 B E2E: reversal offer + 'כן' → booking link",
+      revYes.outcome.linkAttached === "booking", `link=${revYes.outcome.linkAttached}`);
+    // Partial negation → the affirmed RESCHEDULE routes to a manage link (not a reversal).
+    const partial = await runLane({ message: "לא לבטל, רק לשנות", prevLow: 0, upcoming: [{ id: "a1", start_time: new Date(Date.now() + 86_400_000).toISOString(), status: "confirmed", services: { name: "תספורת" } }], model: { intent: "reschedule_request", appt: "RESCHEDULE", action: true, reply: "בסדר" } });
+    check("§66 B E2E: 'לא לבטל, רק לשנות' → manage link (affirmed reschedule), not a reversal",
+      partial.outcome.linkAttached === "manage", `link=${partial.outcome.linkAttached}`);
+    // Class C: correction → open clarification, no link, no LOW_SIGNAL_SHORT; repeat varies.
+    const corr1 = await runLane({ message: "לא הבנת", prevLow: 0, model: { intent: "unclear", action: false, reply: "?" } });
+    check("§66 C E2E: 'לא הבנת' → clarification (a '?'), no link, NOT 'לא הצלחתי להבין'",
+      corr1.outcome.linkAttached == null && (corr1.outcome.replyText ?? "").includes("?")
+      && !(corr1.outcome.replyText ?? "").includes("לא הצלחתי להבין"),
+      `reply="${corr1.outcome.replyText}"`);
+    const corr2 = await runLane({ message: "לא הבנת", prevLow: 0, transcript: `Assistant (you, earlier): ${corr1.outcome.replyText}`, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "?" } });
+    check("§66 C E2E: repeated correction VARIES (turn-2 ≠ turn-1)",
+      (corr2.outcome.replyText ?? "") !== (corr1.outcome.replyText ?? ""), `t1="${corr1.outcome.replyText}" t2="${corr2.outcome.replyText}"`);
+    // Correction carrying a real question → answer it (latest-wins), not a clarify.
+    const corrQ = await runLane({ message: "עזוב, כמה עולה תספורת?", prevLow: 0, model: { intent: "faq", action: false, reply: "תספורת עולה 80 שקל" } });
+    check("§66 D E2E: 'עזוב, כמה עולה?' → answers the price (abandon does NOT swallow the request)",
+      (corrQ.outcome.replyText ?? "").includes("80"), `reply="${corrQ.outcome.replyText}"`);
+    // Class D: bare abandon → light ack, no forced clarification, no link.
+    const ab = await runLane({ message: "עזוב", prevLow: 0, model: { intent: "unclear", action: false, reply: "?" } });
+    check("§66 D E2E: 'עזוב' → light ack ('אני כאן'), no link, no forced clarification",
+      ab.outcome.linkAttached == null && (ab.outcome.replyText ?? "").includes("אני כאן") && !(ab.outcome.replyText ?? "").includes("לא הצלחתי"),
+      `reply="${ab.outcome.replyText}"`);
+    // No-regression: a real cancel still cancels → manage link.
+    const realCancel = await runLane({ message: "אני רוצה לבטל את התור", prevLow: 0, upcoming: [{ id: "a1", start_time: new Date(Date.now() + 86_400_000).toISOString(), status: "confirmed", services: { name: "תספורת" } }], model: { intent: "cancel_request", appt: "CANCEL", action: true, reply: "בסדר" } });
+    check("§66 no-regression: real 'אני רוצה לבטל את התור' → manage link (cancel still works)",
+      realCancel.outcome.linkAttached === "manage", `link=${realCancel.outcome.linkAttached}`);
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 67. CLASS F — unknown business policy (Slice E3). A policy question on a topic ABSENT from the tenant's
+  //     KB/facts must not ship an invented yes/no; a COVERED topic (or an already-deferred reply) is kept.
+  section("67. Behavior class F (Slice E3) — unknown-policy 'don't invent' fence");
+  {
+    // ── Tier 1 — pure predicates ──
+    check("§67 policyTopicOf: policy questions map to a topic; non-policy/action → null",
+      policyTopicOf("אפשר לעשן?") === "smoking" && policyTopicOf("יש חניה?") === "parking"
+      && policyTopicOf("כמה עולה תספורת?") === null && policyTopicOf("אפשר לבטל את התור?") === null
+      && isPolicyQuestion("אפשר לעשן?") === true && isPolicyQuestion("כמה עולה תספורת?") === false);
+    check("§67 kbCoversPolicyTopic: absent → false; present in KB or settings → true",
+      kbCoversPolicyTopic("smoking", []) === false
+      && kbCoversPolicyTopic("smoking", [{ content: "אצלנו מותר לעשן רק בחצר" }]) === true
+      && kbCoversPolicyTopic("cancellation", [], "ביטול עד 24 שעות מראש") === true);
+    check("§67 alreadyDefers: an honest deferral is recognized; a definitive answer is not",
+      alreadyDefers("אין לי את המידע הזה כרגע") === true && alreadyDefers("בטח, מותר לעשן אצלנו") === false);
+  }
+  await (async () => {
+    // Unknown policy (no KB) + a model that invents "yes" → replaced with the honest 'don't have it'.
+    const unk = await runLane({ message: "אפשר לעשן?", prevLow: 0, model: { intent: "faq", action: false, reply: "בטח, מותר לעשן אצלנו" } });
+    check("§67 F E2E: 'אפשר לעשן?' no-KB + invented 'yes' → honest 'don't have it', NO 'מותר'",
+      (unk.outcome.replyText ?? "").includes("אין לי את המידע") && !(unk.outcome.replyText ?? "").includes("מותר"),
+      `reply="${unk.outcome.replyText}"`);
+    // Covered topic → the model's grounded answer is KEPT.
+    const cov = await runLane({ message: "אפשר לעשן?", prevLow: 0, kb: [{ category: "policy", title: "עישון", content: "אסור לעשן בתוך המספרה" }], model: { intent: "faq", action: false, reply: "אסור לעשן בפנים, רק בחוץ" } });
+    check("§67 F E2E: 'אפשר לעשן?' WITH smoking KB → model answer kept (not fenced)",
+      (cov.outcome.replyText ?? "").includes("אסור") && !(cov.outcome.replyText ?? "").includes("אין לי את המידע"),
+      `reply="${cov.outcome.replyText}"`);
+    // Model already deferred → kept (no double-replace).
+    const def = await runLane({ message: "אפשר לעשן?", prevLow: 0, model: { intent: "faq", action: false, reply: "אין לי מידע על זה, כדאי לבדוק מול העסק" } });
+    check("§67 F E2E: model already deferred → reply kept (no re-replace)",
+      (def.outcome.replyText ?? "").includes("כדאי לבדוק"), `reply="${def.outcome.replyText}"`);
+    // Covered parking FAQ → answered.
+    const park = await runLane({ message: "יש חניה?", prevLow: 0, kb: [{ category: "parking", title: "חניה", content: "יש חניון ציבורי במרחק 2 דקות" }], model: { intent: "faq", action: false, reply: "כן, יש חניון ציבורי קרוב" } });
+    check("§67 F E2E: 'יש חניה?' with parking KB → answered (kept)",
+      (park.outcome.replyText ?? "").includes("חניון") && !(park.outcome.replyText ?? "").includes("אין לי את המידע"),
+      `reply="${park.outcome.replyText}"`);
+    // No-regression: a non-policy FAQ is never fenced.
+    const price = await runLane({ message: "כמה עולה תספורת?", prevLow: 0, model: { intent: "faq", action: false, reply: "תספורת עולה 80 שקל" } });
+    check("§67 no-regression: non-policy FAQ 'כמה עולה?' → model answer kept (not policy-fenced)",
+      (price.outcome.replyText ?? "").includes("80"), `reply="${price.outcome.replyText}"`);
   })();
 
   // ── summary ────────────────────────────────────────────────────────────────────

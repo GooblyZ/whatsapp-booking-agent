@@ -20,7 +20,7 @@ import {
   runReceptionistTurn, FALLBACK, isLowValueAck, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
 import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording, mentionsSelectionOrBookingClaim } from "./reply-polish";
-import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
+import { resolveRoute, linkKindForRoute, messageOperation, isNegatedOperation, type Route } from "./routing";
 import { resolveBookingGuidance, type BookingGuidanceVerdict } from "./booking-guidance";
 import { logAIEvent } from "./events";
 import { buildBookingLink, buildAppointmentLink } from "@/lib/config";
@@ -245,6 +245,93 @@ function pickOffer(lastAssistant: string | null): string {
 // (never deny, never blame the user), say it was momentary, bridge back to the task.
 const ACCOUNTABILITY_REPAIR =
   "צודק, הייתה אצלי הודעת עומס רגעית קודם 🙏 נראה שעכשיו חזרתי — בוא נמשיך, במה אוכל לעזור?";
+
+// ══ SLICE E3 — class-based trust/safety layer (B action-reversal · C misunderstanding-correction ·
+//    D abandon/stop · F unknown-policy). Shape-based, business-agnostic; the QA phrases are symptoms of
+//    these CLASSES, not the logic. Copy is gender-neutral with no baked links (emoji owned by the
+//    outbound chokepoint). Each class has its OWN response principle (§4 of the E3 plan).
+const ACTION_REVERSAL =
+  "הכול טוב — שום שינוי לא בוצע כאן בצ׳אט 🙂 אם כבר עשית משהו באתר ובא לך לקבוע תור חדש, רוצה שאשלח קישור?";
+const CORRECTION_VARIANTS = [
+  "סליחה אם לא הבנתי נכון 🙂 מה בדיוק רצית לדעת?",
+  "אולי ניסחתי לא טוב — תכתוב לי שוב בקצרה מה חיפשת ואשמח לעזור.",
+  "בוא ננסה שוב 🙂 מה הכי יעזור לך עכשיו?",
+];
+// Emoji-free markers so the rotation still matches after the outbound chokepoint strips emojis.
+const CORRECTION_MARKERS = ["סליחה אם לא הבנתי", "אולי ניסחתי לא טוב", "בוא ננסה שוב"];
+/** Rotates the correction clarify so a repeated correction never loops the same line (reads last reply). */
+function pickCorrection(lastAssistant: string | null): string {
+  const la = lastAssistant ?? "";
+  const idx = CORRECTION_MARKERS.findIndex((m) => la.includes(m));
+  return CORRECTION_VARIANTS[(idx + 1) % CORRECTION_VARIANTS.length];
+}
+const ABANDON_ACK = "אין בעיה 🙂 אני כאן אם תצטרך משהו.";
+const UNKNOWN_POLICY = "אין לי את המידע הזה כרגע 🙂 עדיף לבדוק ישירות מול העסק.";
+
+// ── Class B — action negation / reversal / undo ──
+const PAST_ACTION_RE = /ביטלתי|שיניתי|כבר\s+(ביטלתי|שיניתי)|בטעות\s+(ביטלתי|לחצתי|שיניתי)|תחזיר\s+לי\s+(את\s+)?ה?תור|להחזיר\s+(את\s+)?ה?תור/;
+export function refersToPastAction(message: string): boolean { return PAST_ACTION_RE.test((message ?? "").trim()); }
+/** Class B: the user RETRACTED an operation ("לא רציתי לבטל") or references a past/site action
+ *  ("ביטלתי בטעות", "תחזיר לי את התור"). Reply states nothing was done here + offers the rebook path. */
+export function isActionReversal(message: string): boolean {
+  const t = (message ?? "").trim();
+  return isNegatedOperation(t) || refersToPastAction(t);
+}
+
+// ── Class C — assistant-misunderstanding correction ──
+const CORRECTION_RE = /זה\s+לא\s+מה\s+ש?שאלתי|לא\s+שאלתי\s+(את\s+)?זה|לא\s+ל?זה\s+התכוונתי|לא\s+התכוונתי|לא\s+הבנת(?:\s+אותי)?|מה\s+לא\s+(מובן|ברור)|לא\s+ככה|את[ה]?\s+לא\s+(עוזר|עוזרת|מבין|מבינה)|לא\s+עזרת|טעית/;
+/** Class C: the user rejects the assistant's INTERPRETATION. One open clarification; NEVER guess the
+ *  unstated question. Excluded when the turn carries a fresh business request (latest-wins). */
+export function isMisunderstandingCorrection(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (!CORRECTION_RE.test(t)) return false;
+  if (messageOperation(t) || isPolicyQuestion(t) || hasBookingSignal(t, serviceNames)) return false; // fresh request wins
+  return true;
+}
+
+// ── Class D — abandon / stop / topic-closed ──
+const ABANDON_RE = /^(?:אה?\s+)?(?:עזוב(?:י|\s+את\s+זה|\s+רגע)?|תעזוב|לא\s+משנה|תשכח\s+מ?זה|שכח[יי]?\s+מ?זה|לא\s+חשוב)/;
+/** Class D: the user DROPS the thread ("עזוב", "לא משנה") with NO attached request → light ack, do NOT
+ *  force a clarification. A new request in the same turn wins (latest-wins) and is handled elsewhere. */
+export function isAbandon(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (!ABANDON_RE.test(t)) return false;
+  if (isQuestionLike(t) || messageOperation(t) || hasBookingSignal(t, serviceNames)) return false; // new request wins
+  return true;
+}
+
+// ── Class F — unknown business policy (don't invent) ──
+export type PolicyTopic = "smoking" | "pets" | "parking" | "accessibility" | "payment" | "late" | "cancellation";
+const POLICY_TOPICS: { topic: PolicyTopic; kw: RegExp }[] = [
+  { topic: "smoking",       kw: /עיש[ןון]|לעשן|סיגרי/ },
+  { topic: "pets",          kw: /כלב|חתול|חיית\s+מחמד|חיות\s+מחמד|בעל[יי]\s+חיים/ },
+  { topic: "parking",       kw: /חניי?ה|לחנות|חניון/ },
+  { topic: "accessibility", kw: /נגיש|לנכים|כיסא\s+גלגלים|\bנכה\b/ },
+  { topic: "payment",       kw: /לשלם|תשלום|אשראי|מזומן|ביט(?:\s|$|[?？])|אמצעי\s+תשלום|העברה\s+בנקאית|פייבוקס/ },
+  { topic: "late",          kw: /לאחר|איחור|מאחר|יאחר|באיחור/ },
+  { topic: "cancellation",  kw: /מדיניות\s+(ה)?ביטול|דמי\s+ביטול|תנאי\s+ביטול/ },
+];
+const POLICY_Q_SHAPE = /אפשר|מותר|מקבל|יש\s+לכם|יש\s+אצלכם|האם|[?？]|מה\s+ה?מדיניות|צריך\s+ל/;
+/** The policy topic a message asks about, or null. Requires a permission/yes-no SHAPE + a policy topic. */
+export function policyTopicOf(message: string): PolicyTopic | null {
+  const t = (message ?? "").trim();
+  if (!POLICY_Q_SHAPE.test(t)) return null;
+  for (const { topic, kw } of POLICY_TOPICS) if (kw.test(t)) return topic;
+  return null;
+}
+export function isPolicyQuestion(message: string): boolean { return policyTopicOf(message) !== null; }
+/** True when the tenant's KB/settings actually cover a policy topic (so a grounded answer is possible). */
+export function kbCoversPolicyTopic(
+  topic: PolicyTopic, kbItems: { title?: string; content?: string; active?: boolean }[] = [], cancellationPolicyText?: string | null
+): boolean {
+  if (topic === "cancellation" && (cancellationPolicyText ?? "").trim().length > 0) return true;
+  const entry = POLICY_TOPICS.find((x) => x.topic === topic);
+  if (!entry) return false;
+  return kbItems.some((k) => (k.active ?? true) && entry.kw.test(`${k.title ?? ""} ${k.content ?? ""}`));
+}
+const POLICY_DEFER_RE = /אין\s+לי\s+(את\s+)?ה?מידע|לא\s+בטוח|כדאי\s+לבדוק|עדיף\s+לבדוק|תוכל[יי]?\s+לבדוק|מול\s+העסק|לברר\s+ישירות|אין\s+לי\s+מושג/;
+/** True when the reply already honestly defers — the F fence must NOT re-replace an honest answer. */
+export function alreadyDefers(reply: string): boolean { return POLICY_DEFER_RE.test(reply ?? ""); }
 
 // ── REPEAT-ANSWER TONE GUARD ─────────────────────────────────────────────────────
 // Even when the customer asks something already answered, the receptionist must NOT sound
@@ -809,7 +896,10 @@ export async function runPlatformTurn(
   //    Escalation tiers mirror the emoji-only pre-Gemini skip exactly, so repeated low-signal still climbs
   //    to boundary/quiet. SKIPPED in deterministic mode (every turn there is menu-anchored). The whole
   //    message is checked (multi-fragment bursts have whitespace → never skipped → they reach Gemini).
-  if (!deterministicMenu && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, lastAssistant ?? "", activeServiceNames, memory.lastAssistantReason)) {
+  // E3: a lone abandon/correction/reversal token ("עזוב") must NOT be pre-skipped as low-signal — it has
+  // its own deterministic behavior lane after the decision, so let it through (never LOW_SIGNAL_SHORT it).
+  const isBehaviorTurn = isActionReversal(latest) || isMisunderstandingCorrection(latest, activeServiceNames) || isAbandon(latest, activeServiceNames);
+  if (!deterministicMenu && !isBehaviorTurn && shouldPreSkipSingleTokenClarify(messageText, lastContract.askedQuestion, lastAssistant ?? "", activeServiceNames, memory.lastAssistantReason)) {
     const newCount = prevLowSignal + 1;
     const action = lowSignalActionFor(newCount);
     let replyText = LOW_SIGNAL_SHORT;
@@ -988,6 +1078,7 @@ export async function runPlatformTurn(
   // actionable paths keep today's behavior; `guidanceHandled` stops downstream escapes from overriding.
   let guidance: BookingGuidanceVerdict = { intent: "NONE", link: "none", copy: "KEEP_MODEL" };
   let guidanceHandled = false;
+  let behaviorHandled = false; // E3: a class B/C/D/F lane produced the reply this turn (no link; don't override)
 
   if (decision.ok && suppressLinkFor(messageText)) {
     platformRoute = "NONE"; // complaints / bare-meta / one-char never get a link
@@ -1446,6 +1537,51 @@ export async function runPlatformTurn(
     newLowSignal = 0;
     suppressReply = false;
     console.log(`[platform-turn] ${accountabilityRepair ? "accountability repair" : "recovery follow-up"}: degraded context → calm repair/recovery reply, no link`);
+  }
+
+  // ── E3 BEHAVIOR LANES (classes B/C/D): deterministic, human replies for an action REVERSAL, a
+  //    misunderstanding CORRECTION, or an ABANDON — each with its OWN response principle. Replaces any
+  //    low-signal/model reply, attaches NO link, resets the low-signal counter, and sets behaviorHandled
+  //    so the F fence / downstream escapes never override. Skipped when a link/E1-guidance/degraded-
+  //    recovery already handled the turn (a real request in the burst already won via routing/FAQ).
+  if (decision.ok && !behaviorHandled && !guidanceHandled && !recoveryFollowup && !accountabilityRepair && linkAttached === null) {
+    if (isActionReversal(latest)) {
+      // Class B: never claim/undo an action; state nothing was done here + offer the rebook path (soft
+      // offer, no auto-link — offerProduced sets a soft-interest pending so a following "כן" resolves).
+      replyText = ACTION_REVERSAL;
+      offerProduced = true;
+      behaviorHandled = true; suppressReply = false; newLowSignal = 0;
+      platformRoute = "NONE"; platformRouteReason = "action_reversal";
+      console.log("[platform-turn] E3 class B: action reversal → nothing-done + rebook offer, no link");
+    } else if (isMisunderstandingCorrection(latest, activeServiceNames)) {
+      // Class C: one OPEN clarification, varied wording, never assert the unstated question.
+      replyText = pickCorrection(lastAssistant);
+      behaviorHandled = true; suppressReply = false; newLowSignal = 0;
+      platformRoute = "NONE"; platformRouteReason = "correction";
+      console.log("[platform-turn] E3 class C: misunderstanding correction → open clarification (no guessed question)");
+    } else if (isAbandon(latest, activeServiceNames)) {
+      // Class D: light ack, do NOT force a clarification (they're closing the topic).
+      replyText = ABANDON_ACK;
+      behaviorHandled = true; suppressReply = false; newLowSignal = 0;
+      platformRoute = "NONE"; platformRouteReason = "abandon";
+      console.log("[platform-turn] E3 class D: abandon/stop → light ack, no forced clarification");
+    }
+  }
+
+  // ── E3 CLASS F — unknown-policy fence: a business-policy question on a topic ABSENT from the tenant's
+  //    KB/facts, where the model didn't already defer, must not ship an invented yes/no. Replace with an
+  //    honest, human "I don't have that" and log the missed topic (fail-open) for a future owner KB
+  //    suggestion. Runs only on a non-action, no-link FAQ turn.
+  if (decision.ok && !behaviorHandled && linkAttached === null) {
+    const policyTopic = policyTopicOf(latest);
+    if (policyTopic
+        && !kbCoversPolicyTopic(policyTopic, ctx.knowledgeBaseItems ?? [], ctx.businessSettings?.cancellation_policy_text)
+        && !alreadyDefers(replyText)) {
+      replyText = UNKNOWN_POLICY;
+      behaviorHandled = true;
+      platformRoute = "NONE"; platformRouteReason = "unknown_policy";
+      console.log(`[platform-turn] E3 class F: unknown policy '${policyTopic}' not in KB → honest 'don't have it' (missed-topic logged)`);
+    }
   }
 
   // ── LINK-WORDING FENCE: never imply a link is present/sent unless one was
