@@ -202,7 +202,7 @@ interface LaneResult {
   outcome: PlatformTurnOutcome; low: number | undefined; greet: number | undefined; modelCalled: boolean;
   modelMessage?: string; modelContext?: string; modelAiSettings?: Partial<AISettings>;
   /** The pendingOffer persisted THIS turn (Slice B), or undefined if the write carried the prior value forward. */
-  pendingOfferAfter?: { kind: "BOOK" | "MANAGE"; stage?: "offered" | "fulfilled"; service?: string; at: number } | null;
+  pendingOfferAfter?: { kind: "BOOK" | "MANAGE"; stage?: "offered" | "fulfilled"; source?: "explicit_booking" | "soft_interest_offer"; service?: string; at: number } | null;
 }
 // One REAL runPlatformTurn invocation with the given prior streak. Captures the persisted counters and
 // whether the model was consulted; silences the function's verbose per-turn logging so eval output stays clean.
@@ -213,7 +213,7 @@ async function runLane(opts: {
   // Slice B: inject a persisted pending offer (with lifecycle stage) and whether the last outbound was
   // reactive vs. proactive — feeds the continuation resolver via priorContext/ConversationContext,
   // mirroring how lastAssistantReason already flows in.
-  pendingOffer?: { kind: "BOOK" | "MANAGE"; stage?: "offered" | "fulfilled"; service?: string; at: number };
+  pendingOffer?: { kind: "BOOK" | "MANAGE"; stage?: "offered" | "fulfilled"; source?: "explicit_booking" | "soft_interest_offer"; service?: string; at: number };
   lastAssistantSource?: string | null;
 }): Promise<LaneResult> {
   const captured: Array<Record<string, unknown>> = [];
@@ -4697,8 +4697,10 @@ async function main(): Promise<void> {
   section("63b. Booking-guidance wired into runPlatformTurn (runtime lane, real deterministic routing)");
   await (async () => {
     const nowE = Date.now();
-    const bookFulfilled = { kind: "BOOK" as const, stage: "fulfilled" as const, at: nowE - 60_000 };
-    const bookOffered = { kind: "BOOK" as const, stage: "offered" as const, at: nowE - 60_000 };
+    const bookFulfilled = { kind: "BOOK" as const, stage: "fulfilled" as const, source: "explicit_booking" as const, at: nowE - 60_000 };
+    // An EXPLICIT active-booking offer (user asked to book → assistant asked which service). E2.1: a bare
+    // service pick resolves this to a link; a soft-interest offer (below) would NOT.
+    const bookOffered = { kind: "BOOK" as const, stage: "offered" as const, source: "explicit_booking" as const, at: nowE - 60_000 };
     const manageFulfilled = { kind: "MANAGE" as const, stage: "fulfilled" as const, at: nowE - 60_000 };
     const bookSent = "Assistant (you, earlier): בשמחה. את קביעת התור עושים דרך הקישור.\nhttps://example.com/book/test-biz?p=972500000000";
     const manageSent = "Assistant (you, earlier): הנה הקישור לניהול התור: https://example.com/appointment/appt-1";
@@ -4766,13 +4768,14 @@ async function main(): Promise<void> {
   })();
 
   // ════════════════════════════════════════════════════════════════════════════════
-  // 64. SOFT-CONVERSION PROGRESSION (Slice E2) — after service exploration, a customer service
-  //     desire/preference/pick progresses to a booking link (PRIMARY, deterministic, model-INDEPENDENT);
-  //     a model "book on the site" pointer without a link is the backstop net; generic contact/inquiry/
-  //     meta desires never attach a link (even after exploration); a COLD desire gets no forced link.
-  section("64. Soft-conversion progression (Slice E2) — exploration→desire link, backstop fence, false-positive + cold protection");
+  // 64. SERVICE-INTEREST → OFFER (Slice E2.1) — bare service interest/preference is NOT explicit booking
+  //     intent: it gets a conversational OFFER (no auto-link), setting a soft-interest pending so a later
+  //     affirmative resolves to a link. Predicates unchanged; the runtime lanes now assert an OFFER
+  //     (no link) where E2 used to auto-link. Explicit-intent / active-context / source-distinction lanes
+  //     live in §65.
+  section("64. Service-interest → OFFER (Slice E2.1) — bare interest offers (no auto-link), false-positive + cold protection");
   {
-    // ── Tier 1 — pure predicates ──
+    // ── Tier 1 — pure predicates (unchanged) ──
     const EXPLORED_64 = "יש פן, צבע ותספורת. מה בא לך לעשות?";
     check("§64 serviceExplorationContext: assistant listed services / asked which → true",
       serviceExplorationContext(EXPLORED_64, SERVICES) === true);
@@ -4795,35 +4798,100 @@ async function main(): Promise<void> {
   }
   await (async () => {
     const explored = "Assistant (you, earlier): יש פן, צבע ותספורת. מה בא לך לעשות?";
-    // ── Tier 2 — PRIMARY exploration-progression (scripted model reply does NOT point to the site,
-    //    proving Layer B is model-independent) ──
+    const isOffer = (t: string | undefined) => !!t && t.includes("רוצה שאשלח לך קישור");
+    // ── Tier 2 — bare interest → OFFER (no auto-link), and a soft-interest pending is recorded ──
     const p1 = await runLane({ message: "אשמח להסתפר", prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "אחלה!" } });
-    check("§64 E2E: exploration → 'אשמח להסתפר' (model reply has NO booking pointer) → booking link (model-independent)",
-      p1.outcome.linkAttached === "booking", `link=${p1.outcome.linkAttached} reply="${p1.outcome.replyText}"`);
+    check("§64 E2E: exploration → 'אשמח להסתפר' → OFFER, no link, soft-interest pending",
+      p1.outcome.linkAttached == null && isOffer(p1.outcome.replyText) && p1.pendingOfferAfter?.stage === "offered" && p1.pendingOfferAfter?.source === "soft_interest_offer",
+      `link=${p1.outcome.linkAttached} reply="${p1.outcome.replyText}" pending=${JSON.stringify(p1.pendingOfferAfter)}`);
     const p2 = await runLane({ message: "בא לי צבע", prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "יאמי" } });
-    check("§64 E2E: exploration → 'בא לי צבע' → booking link",
-      p2.outcome.linkAttached === "booking", `link=${p2.outcome.linkAttached} reply="${p2.outcome.replyText}"`);
+    check("§64 E2E: exploration → 'בא לי צבע' → OFFER, no link",
+      p2.outcome.linkAttached == null && isOffer(p2.outcome.replyText), `link=${p2.outcome.linkAttached} reply="${p2.outcome.replyText}"`);
     const p3 = await runLane({ message: "יאללה תספורת", prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "מעולה" } });
-    check("§64 E2E: exploration → 'יאללה תספורת' → booking link",
-      p3.outcome.linkAttached === "booking", `link=${p3.outcome.linkAttached} reply="${p3.outcome.replyText}"`);
+    check("§64 E2E: exploration → 'יאללה תספורת' → OFFER, no link",
+      p3.outcome.linkAttached == null && isOffer(p3.outcome.replyText), `link=${p3.outcome.linkAttached} reply="${p3.outcome.replyText}"`);
 
-    // ── Cold (no exploration): no forced link when the model doesn't point to the site (stated intent) ──
+    // ── Cold desire (no exploration): still an OFFER (a clear desire cue offers regardless of context) ──
     const cold = await runLane({ message: "אשמח להסתפר", prevLow: 0, model: { intent: "unclear", action: false, reply: "אחלה!" } });
-    check("§64 E2E: COLD 'אשמח להסתפר' (no exploration, model no pointer) → NO link (deliberate)",
-      cold.outcome.linkAttached == null, `link=${cold.outcome.linkAttached} reply="${cold.outcome.replyText}"`);
+    check("§64 E2E: COLD 'אשמח להסתפר' → OFFER, no link",
+      cold.outcome.linkAttached == null && isOffer(cold.outcome.replyText), `link=${cold.outcome.linkAttached} reply="${cold.outcome.replyText}"`);
 
-    // ── Layer C backstop: cold desire, but the model DID point to the site → attach link ──
+    // ── Safe copy: even if the model points to the site with unsafe copy, the OFFER strips it ──
     const back = await runLane({ message: "אשמח להסתפר", prevLow: 0, model: { intent: "unclear", action: false, reply: "קבע תור באתר ונתראה" } });
-    check("§64 E2E: backstop — model 'קבע תור באתר' without link + desire context → booking link",
-      back.outcome.linkAttached === "booking", `link=${back.outcome.linkAttached} reply="${back.outcome.replyText}"`);
+    check("§64 E2E: 'אשמח להסתפר' + unsafe model 'קבע תור באתר ונתראה' → OFFER, no 'נתראה', no link",
+      back.outcome.linkAttached == null && isOffer(back.outcome.replyText) && !(back.outcome.replyText ?? "").includes("נתראה"),
+      `link=${back.outcome.linkAttached} reply="${back.outcome.replyText}"`);
 
-    // ── False positives — even AFTER exploration, contact/inquiry/meta desires never attach a link ──
+    // ── False positives — contact/inquiry/meta desires never attach a link AND never offer ──
     const fpMsgs = ["אשמח לדבר עם מישהו", "רוצה לשאול שאלה", "אשמח לקבל מידע", "רוצה לשלוח תמונה", "רוצה להבין מחירים", "אשמח לדעת מה האפשרויות"];
     for (const m of fpMsgs) {
       const fp = await runLane({ message: m, prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "בטח, נשמח לעזור" } });
-      check(`§64 E2E false-positive: exploration → '${m}' → NO booking link`,
-        fp.outcome.linkAttached == null, `link=${fp.outcome.linkAttached} reply="${fp.outcome.replyText}"`);
+      check(`§64 E2E false-positive: exploration → '${m}' → NO link AND NO offer`,
+        fp.outcome.linkAttached == null && !isOffer(fp.outcome.replyText), `link=${fp.outcome.linkAttached} reply="${fp.outcome.replyText}"`);
     }
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 65. BOOKING-LINK DISCIPLINE (Slice E2.1) — links attach ONLY on explicit intent or an EXPLICIT-source
+  //     active booking context; a soft-interest offer converts on an affirmative but NOT on a bare service
+  //     pick; safe booking-link copy; and a productive route beats the low-signal fallback.
+  section("65. Booking-link discipline (Slice E2.1) — source distinction, safe copy, productive-route invariant");
+  await (async () => {
+    const now65 = Date.now();
+    const softPending = { kind: "BOOK" as const, stage: "offered" as const, source: "soft_interest_offer" as const, at: now65 - 60_000 };
+    const explicitPending = { kind: "BOOK" as const, stage: "offered" as const, source: "explicit_booking" as const, at: now65 - 60_000 };
+    const offeredTranscript = "Assistant (you, earlier): רוצה שאשלח לך קישור? בוחרים שם שירות, יום ושעה ומאשרים ישירות באתר.";
+    const isOffer = (t: string | undefined) => !!t && t.includes("רוצה שאשלח לך קישור");
+    const hasBookingUrl = (t: string | undefined) => !!t && /\/book\//.test(t);
+
+    // (1) Owner sequence: interest → offer, then "כן" → booking link (Slice B resolves the soft pending).
+    const yes = await runLane({ message: "כן", prevLow: 0, pendingOffer: softPending, transcript: offeredTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "סבבה" } });
+    check("§65: soft-interest offer + 'כן' → booking link",
+      yes.outcome.linkAttached === "booking" && hasBookingUrl(yes.outcome.replyText), `link=${yes.outcome.linkAttached} reply="${yes.outcome.replyText}"`);
+
+    // (2) Owner sequence: interest → offer, then a bare service PICK → NO link (soft pending never links a
+    //     recognized pick). Uses "תספורת"/"פן" (matched by hasBookingSignal; "צבע" is an unrecognized
+    //     short-form of "צביעת שיער" — a separate matcher gap, out of E2.1 scope).
+    const pickSoft = await runLane({ message: "תספורת", prevLow: 0, pendingOffer: softPending, transcript: offeredTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "אחלה בחירה" } });
+    check("§65: soft-interest offer + bare service pick 'תספורת' → NO automatic link",
+      pickSoft.outcome.linkAttached == null, `link=${pickSoft.outcome.linkAttached} reply="${pickSoft.outcome.replyText}"`);
+    const pickSoft2 = await runLane({ message: "פן", prevLow: 0, pendingOffer: softPending, transcript: offeredTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "מעולה" } });
+    check("§65: soft-interest offer + bare service pick 'פן' → NO automatic link",
+      pickSoft2.outcome.linkAttached == null, `link=${pickSoft2.outcome.linkAttached} reply="${pickSoft2.outcome.replyText}"`);
+
+    // (3) EXPLICIT booking context + service pick → link (the legitimate active-booking case).
+    const pickExplicit = await runLane({ message: "תספורת", prevLow: 0, pendingOffer: explicitPending, transcript: "Assistant (you, earlier): רוצה שנתאם לך תור? לאיזה שירות?", lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "תספורת זה מעולה" } });
+    check("§65: EXPLICIT booking context + service pick 'תספורת' → booking link",
+      pickExplicit.outcome.linkAttached === "booking", `link=${pickExplicit.outcome.linkAttached} reply="${pickExplicit.outcome.replyText}"`);
+
+    // (4) Explicit booking / link / site intent → link (unchanged E1/Slice B).
+    const wantBook = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה" } });
+    check("§65: 'אני רוצה לקבוע תור' → booking link", wantBook.outcome.linkAttached === "booking", `link=${wantBook.outcome.linkAttached}`);
+    const sendLink = await runLane({ message: "שלח קישור", prevLow: 0, pendingOffer: softPending, transcript: offeredTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "בסדר" } });
+    check("§65: soft-interest offer + explicit 'שלח קישור' → booking link (link request converts any offer)",
+      sendLink.outcome.linkAttached === "booking", `link=${sendLink.outcome.linkAttached}`);
+
+    // (5) Safe booking-link copy: a link path never keeps a selection/booking claim.
+    const unsafe = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה, עוברים לצבע, קבע תור באתר ונתראה" } });
+    check("§65: booking link + unsafe model copy → link kept, no 'עוברים ל'/'נתראה'",
+      unsafe.outcome.linkAttached === "booking"
+      && !(unsafe.outcome.replyText ?? "").includes("עוברים ל") && !(unsafe.outcome.replyText ?? "").includes("נתראה"),
+      `link=${unsafe.outcome.linkAttached} reply="${unsafe.outcome.replyText}"`);
+
+    // (6) PRODUCTIVE-ROUTE INVARIANT: a model 'unclear' label must not clobber an offer/link with "לא הצלחתי להבין".
+    const prodOffer = await runLane({ message: "אשמח להסתפר", prevLow: 0, transcript: "Assistant (you, earlier): יש פן, צבע ותספורת. מה בא לך לעשות?", lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "אחלה!" } });
+    check("§65: productive OFFER survives a model 'unclear' (no 'לא הצלחתי להבין')",
+      isOffer(prodOffer.outcome.replyText) && !(prodOffer.outcome.replyText ?? "").includes("לא הצלחתי להבין"),
+      `reply="${prodOffer.outcome.replyText}"`);
+    const prodLink = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, model: { intent: "unclear", action: false, appt: "BOOK", reply: "אחלה!" } });
+    check("§65: productive BOOK link survives a model 'unclear' (no 'לא הצלחתי להבין', link kept)",
+      prodLink.outcome.linkAttached === "booking" && !(prodLink.outcome.replyText ?? "").includes("לא הצלחתי להבין"),
+      `link=${prodLink.outcome.linkAttached} reply="${prodLink.outcome.replyText}"`);
+
+    // (7) Genuine junk still gets the low-signal fallback (the guard didn't disable low-signal).
+    const junk = await runLane({ message: "אשמח לדבר עם מישהו", prevLow: 2, model: { intent: "unclear", action: false, reply: "?" } });
+    check("§65: genuine non-interest 'אשמח לדבר עם מישהו' → no link, no offer (low-signal path intact)",
+      junk.outcome.linkAttached == null && !isOffer(junk.outcome.replyText), `link=${junk.outcome.linkAttached} reply="${junk.outcome.replyText}"`);
   })();
 
   // ── summary ────────────────────────────────────────────────────────────────────

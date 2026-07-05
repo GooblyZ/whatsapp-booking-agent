@@ -2114,24 +2114,30 @@ async function main() {
         ? "PASS ✓" : "FAIL ✗");
   }
 
-  console.log("\n================ SCENARIO 60: soft-conversion progression — exploration → service desire → booking link (Slice E2) ================");
-  // Live WhatsApp QA incident: after the assistant listed services / asked which one, the customer said
-  // "אשמח להסתפר" (a service expressed as a VERB) and the bot replied "קבע באתר ונתראה" WITHOUT a link.
-  // Fix (E2): a DETERMINISTIC exploration-progression signal attaches the booking link (model-independent),
-  // while generic contact/inquiry desires never do. The link attaches in runPlatformTurn (proven
-  // deterministically in reliability-eval §64); here we assert the E2 predicates fire on the real incident
-  // transcript + live-check that the model's raw reply to the desire is warm and claims no completed booking.
+  console.log("\n================ SCENARIO 60: service-interest → OFFER, not auto-link (Slice E2.1) ================");
+  // Live WhatsApp QA: E2 over-corrected — a bare service interest ("בא לי צבע" / "אשמח להסתפר") got a
+  // SILENT booking link, sometimes with unsafe copy ("עוברים לצבע" / "קבע באתר ונתראה"), and a productive
+  // route was sometimes clobbered by "לא הצלחתי להבין". E2.1: interest ≠ booking intent → a conversational
+  // OFFER (no link); links only on explicit intent or an EXPLICIT-source active booking context; safe copy;
+  // productive route beats low-signal. The runtime offer/link/source/low-signal invariants are proven
+  // deterministically in reliability-eval §64/§65; here we assert the predicates + a live warmth check.
   {
     const pt = await import("../lib/ai/platform-turn");
+    const rp = await import("../lib/ai/reply-polish");
     const serviceNames = SERVICES.map((s) => s.name);
     const listedReply = "יש פן, צבע ותספורת. מה בא לך לעשות?";
     console.log("  [pure] exploration context detected from the assistant's listed-services / which-service reply:",
       pt.serviceExplorationContext(listedReply, serviceNames) === true ? "PASS ✓" : "FAIL ✗");
-    console.log("  [pure] service desire/pick progresses ('אשמח להסתפר','בא לי צבע'); contact/inquiry does NOT ('אשמח לדבר','אשמח לקבל מידע'):",
+    console.log("  [pure] service desire/pick is recognized ('אשמח להסתפר','בא לי צבע'); contact/inquiry is NOT ('אשמח לדבר','אשמח לקבל מידע'):",
       pt.isServiceDesireOrPick("אשמח להסתפר", serviceNames) === true &&
       pt.isServiceDesireOrPick("בא לי צבע", serviceNames) === true &&
       pt.isServiceDesireOrPick("אשמח לדבר עם מישהו", serviceNames) === false &&
       pt.isServiceDesireOrPick("אשמח לקבל מידע", serviceNames) === false
+        ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] unsafe booking-link copy is caught ('עוברים לצבע'/'נתראה'/'קבעתי'); safe framing is not:",
+      rp.mentionsSelectionOrBookingClaim("אין בעיה, עוברים לצבע") === true &&
+      rp.mentionsSelectionOrBookingClaim("קבע תור באתר ונתראה") === true &&
+      rp.mentionsSelectionOrBookingClaim("בוחרים שם שירות, יום ושעה ומאשרים באתר") === false
         ? "PASS ✓" : "FAIL ✗");
 
     const d60 = await runReceptionistTurn(ctx, {

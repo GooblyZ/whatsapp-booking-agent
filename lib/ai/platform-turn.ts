@@ -19,7 +19,7 @@ import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured, get
 import {
   runReceptionistTurn, FALLBACK, isLowValueAck, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
-import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording } from "./reply-polish";
+import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording, mentionsSelectionOrBookingClaim } from "./reply-polish";
 import { resolveRoute, linkKindForRoute, messageOperation, type Route } from "./routing";
 import { resolveBookingGuidance, type BookingGuidanceVerdict } from "./booking-guidance";
 import { logAIEvent } from "./events";
@@ -227,6 +227,19 @@ const LINK_TROUBLE_RECOVERY =
  *  reads the last assistant line only — no new state). */
 function pickBookGuidance(lastAssistant: string | null): string {
   return (lastAssistant ?? "").includes(BOOK_GUIDANCE_FULL) ? BOOK_GUIDANCE_SHORT : BOOK_GUIDANCE_FULL;
+}
+// Slice E2.1 — SERVICE-INTEREST OFFER: a bare interest/preference is NOT explicit booking intent, so we
+// OFFER the booking link (never auto-attach it) and let an affirmative resolve it (Slice B). States booking
+// completes on the SITE; no service words, gender-neutral, no baked emoji, and deliberately avoids
+// "קבעתי"/"נתראה"/"עוברים ל" (the safe-copy fence would otherwise trip). Not an imperative — an offer.
+const BOOK_OFFER =
+  "רוצה שאשלח לך קישור? בוחרים שם שירות, יום ושעה ומאשרים ישירות באתר.";
+const BOOK_OFFER_SHORT =
+  "רוצה שאשלח לך קישור לקביעה?";
+/** Full offer, or the short form when an offer was just sent (anti-robotic repetition; reads last line only). */
+function pickOffer(lastAssistant: string | null): string {
+  const la = lastAssistant ?? "";
+  return la.includes(BOOK_OFFER) || la.includes(BOOK_OFFER_SHORT) ? BOOK_OFFER_SHORT : BOOK_OFFER;
 }
 // Accountability repair: the user references our earlier overload/system message. ACKNOWLEDGE it
 // (never deny, never blame the user), say it was momentary, bridge back to the task.
@@ -1010,7 +1023,10 @@ export async function runPlatformTurn(
       latest, route, reason,
       // A bare service ANSWER: a service signal that is neither an operation verb nor a question.
       serviceSignal: bookingSignal && messageOperation(latest) === null && !isQuestionLike(latest),
-      bookingContextActive: prevPending?.kind === "BOOK" || lastContract.offeredBooking || lastContract.sentBookingLink,
+      // E2.1: a bare service PICK resolves to a link ONLY in an EXPLICIT booking context — an
+      // explicit-source pending or an actually-sent booking link. A soft-interest-offer pending does NOT
+      // qualify (that pending only converts on an affirmative / explicit link request, via Slice B).
+      bookingContextActive: (prevPending?.kind === "BOOK" && prevPending.source === "explicit_booking") || lastContract.sentBookingLink,
       messageBookingSignal: hasBookingSignal(latest, activeServiceNames),
       fulfilledKind,
     });
@@ -1099,6 +1115,12 @@ export async function runPlatformTurn(
         console.log("[platform-turn] fence: neutralized false action-refusal (booking link attached)");
         replyText = refused.text;
       }
+      // Safe action copy (E2.1): a booking link must never sit next to a selection/booking claim
+      // ("עוברים לצבע"/"נתראה"/"קבעתי") — replace such model prose with the safe deterministic framing.
+      if (mentionsSelectionOrBookingClaim(replyText)) {
+        console.log("[platform-turn] fence: replaced selection/booking claim next to booking link (safe framing)");
+        replyText = pickBookGuidance(lastAssistant);
+      }
       const url = buildBookingLink(ctx.business.slug, customerPhone);
       ({ replyText, interactive } = attachPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText));
       linkAttached = "booking";
@@ -1178,7 +1200,8 @@ export async function runPlatformTurn(
     || confirmIntoManage;
   const wantsBook = (latestSignal === "action" && escapeOp === "BOOK") || confirmIntoBooking;
   const pendingResolved = confirmIntoBooking || confirmIntoManage;
-  let softIntentLink = false;
+  const softIntentLink = false; // retained for telemetry parity; bare interest now routes to an OFFER (E2.1)
+  let offerProduced = false; // E2.1: a deterministic service-interest OFFER (no link) was produced this turn
   if (decision.ok && !guidanceHandled && !suppressLinkFor(latest) && wantsManage && (latestSignal === "help" || linkAttached === null)) {
     // HELP overrides even an attached link (truth-safe guidance beats a vague model reply);
     // a MISSED manage operation fires only when nothing was attached. Skipped when the booking-guidance
@@ -1199,50 +1222,36 @@ export async function runPlatformTurn(
     platformRouteReason = continuation.status === "EXPLICIT_RESEND" ? "explicit_resend" : confirmIntoBooking ? "contextual_confirm" : "action_escape";
     logPlatformLink("booking", url);
     console.log(`[platform-turn] ${continuation.status === "EXPLICIT_RESEND" ? "explicit-resend: link re-sent on request" : confirmIntoBooking ? "contextual-confirm: 'כן' resolved a pending/open booking offer" : "action-escape: model missed a booking imperative"} → booking link`);
-  } else if (decision.ok && !guidanceHandled && linkAttached === null && latestSignal === "soft_intent" && !suppressLinkFor(latest)) {
-    // SOFT SERVICE INTENT ("חשבתי על להסתפר, יש לי טיסה..."): keep the model's WARMTH,
-    // strip any in-chat scheduling question / availability promise, and route to the
-    // booking page (the safe universal entry — link-first, never an in-chat flow).
-    let warm = defuseSchedulingQuestion(replyText).text;
-    warm = defuseCapabilityPromise(warm).text;
-    const refused = defuseActionRefusal(warm, "BOOK");
-    if (refused.defused) warm = refused.text;
-    const url = buildBookingLink(ctx.business.slug, customerPhone);
-    ({ replyText, interactive } = attachPlatformLink(warm, BOOK_LINE, url, lastAssistant, messageText));
-    linkAttached = "booking";
-    platformRoute = "BOOK";
-    platformRouteReason = "soft_intent";
-    softIntentLink = true;
-    logPlatformLink("booking", url);
-    console.log("[platform-turn] soft-intent: indirect service intent → booking link (warmth kept)");
   } else if (
     decision.ok && !guidanceHandled && linkAttached === null && !suppressLinkFor(latest)
     && escapeOp !== "CANCEL" && escapeOp !== "RESCHEDULE" && escapeOp !== "LIST"
-    && serviceExplorationContext(lastAssistant, activeServiceNames, {
-      offeredBooking: lastContract.offeredBooking, sentBookingLink: lastContract.sentBookingLink, prevPendingKind: prevPending?.kind ?? null,
-    })
-    && isServiceDesireOrPick(latest, activeServiceNames)
+    && (
+      latestSignal === "soft_intent"
+      || (SOFT_DESIRE_RE.test(latest) && !isQuestionLike(latest) && !CONTACT_INQUIRY_RE.test(latest))
+      || (serviceExplorationContext(lastAssistant, activeServiceNames, {
+            offeredBooking: lastContract.offeredBooking, sentBookingLink: lastContract.sentBookingLink, prevPendingKind: prevPending?.kind ?? null,
+          }) && isServiceDesireOrPick(latest, activeServiceNames))
+    )
   ) {
-    // ── EXPLORATION-PROGRESSION (Slice E2, PRIMARY): after the assistant listed services / asked which
-    //    service (or an active booking context), a customer service desire/preference/pick ("אשמח
-    //    להסתפר", "בא לי צבע", "יאללה תספורת") IS booking progression → attach the booking link. Fully
-    //    deterministic and model-INDEPENDENT (it does NOT need the model to say "book on the site").
-    //    Keeps the model's warmth; strips any in-chat scheduling question / availability promise / false
-    //    refusal. The gate already excluded plain questions and generic contact/inquiry/meta desires
-    //    ("אשמח לדבר", "אשמח לקבל מידע"). NOTE: when a per-tenant appointments-capability flag exists,
-    //    gate this (like the wantsBook / soft-intent branches) on it too.
+    // ── SERVICE-INTEREST → OFFER (Slice E2.1): a bare service interest/preference — a soft desire
+    //    ("בא לי צבע", "אשמח להסתפר", "חשבתי על להסתפר, יש לי טיסה") OR a service pick in an exploration
+    //    context ("יאללה תספורת" after we listed services) — is NOT explicit booking intent. Do NOT
+    //    auto-attach a link: keep the model's warm acknowledgment (fenced so it never implies we
+    //    selected/booked anything), OFFER to send the booking link, and record a SOFT-interest pending
+    //    (below, Part 5) so a following "כן"/"תשלח" resolves to a link (Slice B) while a bare service pick
+    //    does NOT. Explicit intent / active booking context still attach links (E1). Questions and generic
+    //    contact/inquiry desires were already excluded; escapeOp guards keep a cancel/reschedule out.
     let warm = defuseSchedulingQuestion(replyText).text;
     warm = defuseCapabilityPromise(warm).text;
     const refused = defuseActionRefusal(warm, "BOOK");
     if (refused.defused) warm = refused.text;
-    const url = buildBookingLink(ctx.business.slug, customerPhone);
-    ({ replyText, interactive } = attachPlatformLink(warm, BOOK_LINE, url, lastAssistant, messageText));
-    linkAttached = "booking";
+    if (mentionsSelectionOrBookingClaim(warm)) warm = ""; // never keep a selection/booking claim next to an offer
+    const offer = pickOffer(lastAssistant);
+    replyText = warm.trim() ? `${warm.trim()}\n${offer}` : offer;
+    offerProduced = true;
     platformRoute = "BOOK";
-    platformRouteReason = "exploration_progression";
-    softIntentLink = true;
-    logPlatformLink("booking", url);
-    console.log("[platform-turn] exploration-progression: service desire/pick in exploration context → booking link (warmth kept)");
+    platformRouteReason = "interest_offer";
+    console.log("[platform-turn] service-interest → OFFER (no auto-link; soft-interest pending set)");
   }
 
   // ── CAPABILITY-PROMISE FENCE (route-agnostic backstop): the model promised an in-chat
@@ -1298,18 +1307,20 @@ export async function runPlatformTurn(
   //    a site/link noun (BOOK_ON_SITE_RE, not a bare "אתר"), so a casual site mention never triggers it.
   if (decision.ok && !guidanceHandled && linkAttached === null && BOOK_ON_SITE_RE.test(replyText)
       && escapeOp !== "CANCEL" && escapeOp !== "RESCHEDULE" && escapeOp !== "LIST") {
-    const bookingContext = latestSignal === "soft_intent"
-      || hasBookingSignal(latest, activeServiceNames)
-      || lastContract.offeredBooking || lastContract.sentBookingLink || prevPending?.kind === "BOOK"
-      || (SOFT_DESIRE_RE.test(latest) && !CONTACT_INQUIRY_RE.test(latest));
+    // E2.1: the backstop fires ONLY in an EXPLICIT booking context (an explicit-source pending or an
+    // actually-sent booking link) — bare interest routes to the OFFER above, never a backstop link.
+    const bookingContext = (prevPending?.kind === "BOOK" && prevPending.source === "explicit_booking")
+      || lastContract.sentBookingLink;
     if (bookingContext && !suppressLinkFor(latest)) {
+      // Safe copy: the model's "book on the site" prose must not imply we selected/booked anything.
+      const safe = mentionsSelectionOrBookingClaim(replyText) ? `בטח! ${FENCE_BRIDGE_BOOK}` : replyText;
       const url = buildBookingLink(ctx.business.slug, customerPhone);
-      ({ replyText, interactive } = attachPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText));
+      ({ replyText, interactive } = attachPlatformLink(safe, BOOK_LINE, url, lastAssistant, messageText));
       linkAttached = "booking";
       platformRoute = "BOOK";
       platformRouteReason = "progression_fence";
       logPlatformLink("booking", url);
-      console.log("[platform-turn] progression fence: 'book on the site' without link + booking context → booking link");
+      console.log("[platform-turn] progression fence: 'book on the site' without link + explicit booking context → booking link");
     }
   }
 
@@ -1357,7 +1368,12 @@ export async function runPlatformTurn(
   const kind: LowSignalKind = decision.ok && decision.turn
     ? lowSignalKind(decision, messageText, activeServiceNames, latestSignal)
     : "unclear";
-  const lowSignal = decision.ok && !!decision.turn && countsTowardQuiet(kind);
+  // ── PRODUCTIVE-ROUTE INVARIANT (Slice E2.1): if this turn already produced a productive deterministic
+  //    outcome — a link, an E1 booking-guidance reply, or a service-interest OFFER — it is NOT low-signal.
+  //    The low-signal fallback below must never override it with "לא הצלחתי להבין" / a boundary line or null
+  //    the link (the live QA bug: route=BOOK/interest_offer yet the customer saw "לא הצלחתי להבין").
+  const productiveTurn = linkAttached !== null || guidanceHandled || offerProduced || softIntentLink;
+  const lowSignal = decision.ok && !!decision.turn && countsTowardQuiet(kind) && !productiveTurn;
   let newLowSignal = prevLowSignal;
   // Greeting run: a greeting/meta turn that reached Gemini advances the counter
   // (so a sustained loop eventually short-circuits, Risk C); any other turn resets
@@ -1386,7 +1402,11 @@ export async function runPlatformTurn(
     // (kind === "out_of_domain" = the model judged it out_of_scope AND there is no business anchor). An
     // anchored out_of_scope (a real FAQ the model mislabeled) is `productive` → it is NOT force-deflected here.
     const isOffTopic = kind === "out_of_domain";
-    if (isOffTopic && lowSignalAct !== "quiet_mode") {
+    if (productiveTurn) {
+      // E2.1 PRODUCTIVE-ROUTE INVARIANT: a link / E1 guidance / a service-interest OFFER already set the
+      // customer reply this turn — the low-signal fallback must NOT replace it or drop the link.
+    }
+    else if (isOffTopic && lowSignalAct !== "quiet_mode") {
       // off-topic ladder: tiers 1–2 → short scope deflection, tier 3 → the shared visible boundary (deep
       // off-topic in quiet is intercepted pre-Gemini by the off-topic cap above). Then quiet suppression.
       replyText = lowSignalAct === "boundary" ? LOW_VALUE_BOUNDARY : OFF_TOPIC_DEFLECTION;
@@ -1460,13 +1480,20 @@ export async function runPlatformTurn(
     // A decline always clears — never left to silently affirm later, regardless of what else this
     // turn did (Slice B: previously an old pendingOffer survived a decline unchanged for up to 3h).
     newPending = null;
+  } else if (offerProduced) {
+    // E2.1: a service-interest OFFER — record a SOFT-interest pending so a later affirmative / explicit
+    // link request resolves to a link (Slice B), while a bare service PICK does NOT (Part 5). Set even
+    // when the model labeled the turn "unclear" — the deterministic offer IS the productive outcome.
+    newPending = { kind: "BOOK", stage: "offered", source: "soft_interest_offer", service: discussedService, at: now };
   } else if (!coldYes && kind !== "gibberish" && kind !== "unclear" && kind !== "out_of_domain") {
     // linkAttached this turn means the link was ACTUALLY sent — always "fulfilled", never a fresh
     // "offered" (Slice B: previously this refreshed pendingOffer to a brand-new "offered" record even
     // when the attach itself was fulfilling an existing offer, which is what caused the resend loop).
-    if (linkAttached === "booking") newPending = { kind: "BOOK", stage: "fulfilled", service: discussedService, at: now };
+    // E2.1 source tag: a SENT booking link ⇒ "explicit_booking" (a bare service pick may resolve to a
+    // link next turn); a bare model-prose booking offer ⇒ "soft_interest_offer" (only an affirmative does).
+    if (linkAttached === "booking") newPending = { kind: "BOOK", stage: "fulfilled", source: "explicit_booking", service: discussedService, at: now };
     else if (linkAttached === "manage") newPending = { kind: "MANAGE", stage: "fulfilled", service: discussedService, at: now };
-    else if (decision.ok && BOOKING_OFFER_RE.test(decision.replyText)) newPending = { kind: "BOOK", stage: "offered", service: discussedService, at: now };
+    else if (decision.ok && BOOKING_OFFER_RE.test(decision.replyText)) newPending = { kind: "BOOK", stage: "offered", source: "soft_interest_offer", service: discussedService, at: now };
   }
 
   // Persist the counters + pending offer (platform state is always idle; merge-safe + supersede-aware).
@@ -1709,6 +1736,12 @@ export interface PendingOffer {
    *  link/nudge-loop bug this field exists to fix). Missing on pre-Slice-B data — readPendingOffer
    *  defaults that case to "offered" (conservative: never assume "already sent" for old data). */
   stage: "offered" | "fulfilled";
+  /** E2.1: how the pending arose. "explicit_booking" (user asked to book / booking-guidance / site /
+   *  link request, or a link was actually sent) lets a later bare service PICK resolve to a link;
+   *  "soft_interest_offer" (we offered after mere interest) does NOT — only an affirmative / explicit
+   *  link request converts it (Slice B). Missing/legacy → read as "soft_interest_offer" (safe default:
+   *  a bare service pick never over-links old data; a real explicit context still has sentBookingLink). */
+  source?: "explicit_booking" | "soft_interest_offer";
   service?: string;   // last discussed service name (for warmth), or undefined
   at: number;         // epoch ms when offered
 }
@@ -1722,6 +1755,8 @@ export function readPendingOffer(context: Record<string, unknown>, now: number =
   return {
     kind: p.kind,
     stage: p.stage === "fulfilled" ? "fulfilled" : "offered", // legacy/missing shape → conservative default
+    // legacy/missing source → "soft_interest_offer" (safe: a bare service pick won't auto-link old data).
+    source: p.source === "explicit_booking" ? "explicit_booking" : "soft_interest_offer",
     service: typeof p.service === "string" && p.service.trim() ? p.service : undefined,
     at: p.at,
   };
@@ -2797,7 +2832,7 @@ const META_ONLY_RE =
   /^(מה|למה|הא|נו|אה|לא\s*הבנתי|מה\s*זאת\s*אומרת|מה\s*אמרת|מה\s*זה|באמת|מה\s*קרה)\s*[?!.…׳"']*$/;
 // An explicit REQUEST for the link (imperative/future) — these DO get one link.
 const EXPLICIT_LINK_REQUEST_RE =
-  /תשלח|תשלחי|שלח\s*לי|שלחי\s*לי|אפשר\s*(את\s*)?ה?קישור|איפה\s*ה?קישור|תן\s*לי\s*(את\s*)?ה?קישור|תני\s*לי\s*(את\s*)?ה?קישור|רוצה\s*(את\s*)?ה?(קישור|לינק)/;
+  /תשלח|תשלחי|שלח\s*לי|שלחי\s*לי|שלחי?\s*(לי\s*)?(את\s*)?ה?(קישור|לינק)|אפשר\s*(את\s*)?ה?(קישור|לינק)|איפה\s*ה?(קישור|לינק)|תן\s*לי\s*(את\s*)?ה?(קישור|לינק)|תני\s*לי\s*(את\s*)?ה?(קישור|לינק)|רוצה\s*(את\s*)?ה?(קישור|לינק)/;
 
 export const COMPLAINT_ACK =
   "סליחה על הבלבול! 🙏 אני כאן לכל שאלה על העסק. מתי שתרצה לקבוע, לשנות או לבטל תור — תגיד לי ואשלח קישור אחד מסודר.";

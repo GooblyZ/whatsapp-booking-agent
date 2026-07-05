@@ -114,6 +114,18 @@ export function claimsBookingCompleted(reply: string): boolean {
   return /התור\s+(שלך\s+)?נקבע|נקבע\s+(לך\s+)?ה?תור|קבעתי\s+לך|התור\s+(נרשם|סגור|מאושר)|מאשרים\s+את\s+ה|מחכים\s+לך\s+ל/.test(reply);
 }
 
+// Slice E2.1 — SELECTION / BOOKING claim next to a booking link (or a booking offer). The assistant never
+// selects, changes, confirms, or books anything IN CHAT (booking completes on the SITE). Broader than
+// claimsBookingCompleted: also catches the live-QA phrases "עוברים ל<service>" (implies we switched the
+// selected service), "נתראה" (implies a confirmed meeting), and "סגרנו" (implies we closed it). A DETECTOR
+// only — the caller replaces the offending prose with its own safe deterministic framing (the safe copy
+// lives in platform-turn.ts, so this module stays copy-free and import-cycle-free).
+const SELECTION_OR_BOOKING_CLAIM_RE = /עוברים\s+ל|נתראה|סגרנו/;
+export function mentionsSelectionOrBookingClaim(reply: string): boolean {
+  const t = reply ?? "";
+  return SELECTION_OR_BOOKING_CLAIM_RE.test(t) || claimsBookingCompleted(t);
+}
+
 /** True when the reply contains NO honest unavailability signal — used to decide
  *  whether a non-available verdict must replace it. */
 export function lacksUnavailabilityMarker(reply: string): boolean {
