@@ -59,6 +59,11 @@ export interface ConversationContext {
    *  last reply WAS (e.g. an acknowledgement close) without re-matching reply text — used to break the
    *  ack→close→ack→close loop (a repeated ack after an ack-close is suppressed). */
   lastAssistantReason: string | null;
+  /** The `source` of our MOST RECENT outbound (migration 012), or null. Lets a turn know whether that
+   *  last outbound was a live reactive reply (`ai_turn`/`deterministic`) or a proactive/system send
+   *  (`job_reminder`/`job_waitlist`/`booking_platform`/…) — used so a vague ack doesn't get resolved
+   *  against conversational context that a proactive message actually interrupted. */
+  lastAssistantSource: string | null;
 }
 
 /**
@@ -248,6 +253,7 @@ const EMPTY = (windowTurns: number, maxAgeHours: number): ConversationContext =>
   windowTurns,
   maxAgeHours,
   lastAssistantReason: null,
+  lastAssistantSource: null,
 });
 
 // ── AI-FACING HISTORY HYGIENE ────────────────────────────────────────────────────
@@ -327,14 +333,15 @@ export async function getConversationContext(
     const sinceISO = new Date(Date.now() - maxAgeHours * 3_600_000).toISOString();
     const limit = maxTurns * 2 + 1; // +1 for the current inbound row we drop
 
-    // `reason` (migration 012) lets the AI-facing history drop a token we already deflected. FAIL-OPEN:
-    // on a pre-012 DB the column is missing → re-read without it (history still works, hygiene no-ops).
+    // `reason`/`source` (migration 012) let the AI-facing history drop a token we already deflected and
+    // let a turn know whether our last outbound was reactive or proactive. FAIL-OPEN: on a pre-012 DB
+    // both columns are missing → re-read without them (history still works, hygiene/source no-op).
     // `cols` is a widened string so both selects share one (untyped) response shape.
     const runSelect = (cols: string) => db
       .from("messages").select(cols)
       .eq("business_id", businessId).eq("customer_id", customerId)
       .gte("created_at", sinceISO).order("created_at", { ascending: false }).limit(limit);
-    let res = await runSelect("direction, body, created_at, reason");
+    let res = await runSelect("direction, body, created_at, reason, source");
     if (res.error && isMissingColumnError(res.error)) res = await runSelect("direction, body, created_at");
 
     if (res.error || !res.data) {
@@ -342,7 +349,7 @@ export async function getConversationContext(
       return EMPTY(maxTurns, maxAgeHours);
     }
 
-    let rows = res.data as unknown as { direction: string; body: string | null; created_at: string; reason?: string | null }[];
+    let rows = res.data as unknown as { direction: string; body: string | null; created_at: string; reason?: string | null; source?: string | null }[];
     // Drop the newest row if it is the current inbound message.
     if (rows.length > 0 && rows[0].direction === "inbound") rows = rows.slice(1);
     rows.reverse(); // chronological
@@ -359,10 +366,13 @@ export async function getConversationContext(
       .map((t) => `${t.role === "user" ? "Customer" : "Assistant (you, earlier)"}: ${t.text}`)
       .join("\n");
 
-    // The durable reason of our most recent outbound (chronologically last) — drives the terminal-ack loop
-    // break. FAIL-OPEN: null on a pre-012 DB (the select dropped `reason`) or when there is no outbound yet.
-    const lastAssistantReason =
-      ([...rows].reverse().find((r) => r.direction === "outbound")?.reason ?? null) as string | null;
+    // The durable reason/source of our most recent outbound (chronologically last). `reason` drives the
+    // terminal-ack loop break; `source` tells the continuation resolver whether that outbound was a live
+    // reactive reply or a proactive/system send. FAIL-OPEN: null on a pre-012 DB (the select dropped both
+    // columns) or when there is no outbound yet.
+    const lastOutbound = [...rows].reverse().find((r) => r.direction === "outbound");
+    const lastAssistantReason = (lastOutbound?.reason ?? null) as string | null;
+    const lastAssistantSource = (lastOutbound?.source ?? null) as string | null;
 
     return {
       turns,
@@ -371,6 +381,7 @@ export async function getConversationContext(
       windowTurns: maxTurns,
       maxAgeHours,
       lastAssistantReason,
+      lastAssistantSource,
     };
   } catch (err) {
     console.error("[ai-memory] unexpected error:", err instanceof Error ? err.message : String(err));

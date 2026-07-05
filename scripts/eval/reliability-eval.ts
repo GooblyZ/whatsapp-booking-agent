@@ -45,6 +45,7 @@ import {
   hasPendingAnswerExpectedQuestion,
   runPlatformTurn, type PlatformTurnTestDeps, type PlatformTurnOutcome,
   hasBusinessAnchor, ACK_REASON, isTerminalClosure, DETERMINISTIC_NONANSWER_REASONS, isSoftCloseAffirmation,
+  resolveContinuation, isBareDecline,
 } from "../../lib/ai/platform-turn";
 import {
   estimateTokens, promptSizeBucket, safeHash, classifyGeminiError, kv, geminiAttemptLine,
@@ -192,13 +193,23 @@ function harnessCtx(aiOver?: Partial<AISettings>): BusinessAIContext {
   } as unknown as BusinessAIContext;
 }
 
-interface LaneResult { outcome: PlatformTurnOutcome; low: number | undefined; greet: number | undefined; modelCalled: boolean; modelMessage?: string; modelContext?: string; modelAiSettings?: Partial<AISettings> }
+interface LaneResult {
+  outcome: PlatformTurnOutcome; low: number | undefined; greet: number | undefined; modelCalled: boolean;
+  modelMessage?: string; modelContext?: string; modelAiSettings?: Partial<AISettings>;
+  /** The pendingOffer persisted THIS turn (Slice B), or undefined if the write carried the prior value forward. */
+  pendingOfferAfter?: { kind: "BOOK" | "MANAGE"; stage?: "offered" | "fulfilled"; service?: string; at: number } | null;
+}
 // One REAL runPlatformTurn invocation with the given prior streak. Captures the persisted counters and
 // whether the model was consulted; silences the function's verbose per-turn logging so eval output stays clean.
 async function runLane(opts: {
   message: string; prevLow: number; prevGreet?: number; model?: ModelScript; upcoming?: UpcomingRow[];
   lastAssistantReason?: string; transcript?: string; historyTurns?: { role: "user" | "model"; text: string }[];
   aiSettings?: Partial<AISettings>; // §53 persona-delta: inject contrasting owner settings into the context
+  // Slice B: inject a persisted pending offer (with lifecycle stage) and whether the last outbound was
+  // reactive vs. proactive — feeds the continuation resolver via priorContext/ConversationContext,
+  // mirroring how lastAssistantReason already flows in.
+  pendingOffer?: { kind: "BOOK" | "MANAGE"; stage?: "offered" | "fulfilled"; service?: string; at: number };
+  lastAssistantSource?: string | null;
 }): Promise<LaneResult> {
   const captured: Array<Record<string, unknown>> = [];
   const db = makeFakeDb(captured, opts.upcoming ?? []);
@@ -210,6 +221,7 @@ async function runLane(opts: {
   const memory = {
     turns: opts.historyTurns ?? [], transcript: opts.transcript ?? "", turnsUsed: (opts.historyTurns ?? []).length,
     windowTurns: 5, maxAgeHours: 24, lastAssistantReason: opts.lastAssistantReason ?? null,
+    lastAssistantSource: opts.lastAssistantSource ?? null,
   } as unknown as ConversationContext;
   const testDeps: PlatformTurnTestDeps = {
     loadContext: async () => ctx,
@@ -225,6 +237,7 @@ async function runLane(opts: {
   };
   const prior: Record<string, unknown> = {
     consecutiveLowSignalTurns: opts.prevLow, consecutiveGreetingTurns: opts.prevGreet ?? 0,
+    pendingOffer: opts.pendingOffer,
   };
   const cust = `c-${Math.random().toString(36).slice(2)}`; // distinct per call → no turn-registry cross-talk
   const c = console as unknown as Record<string, (...a: unknown[]) => void>;
@@ -246,6 +259,7 @@ async function runLane(opts: {
     modelMessage,
     modelContext,
     modelAiSettings,
+    pendingOfferAfter: lastCtx?.pendingOffer as LaneResult["pendingOfferAfter"],
   };
 }
 
@@ -4437,6 +4451,187 @@ async function main(): Promise<void> {
   }
   gap("§61 scope: proves the PURE classifier (source partition + solicit-window verdict) the chokepoint and the offline scripts/audit-unsolicited-sends.ts both call. The runtime tripwire (one fail-open inbound read in lib/booking/outbound.ts) and the offline scan need a live DB — verified manually (a normal reply logs nothing; the offline script over the 2026-07-03 קובי window returns ZERO flags; a synthetic ghost returns one). The check is a HEURISTIC signal, not causal proof.",
     "Deferred (not this slice): an optional (business_id, customer_id, created_at) index if the tripwire read ever shows in slow logs; threading the triggering-inbound ref through the turn to avoid the read entirely (would touch routing — out of scope).");
+
+  // ── 62. CONTINUATION RESOLVER (Slice B) — offer lifecycle, decline, explicit resend, proactive suppression ──
+  section("62. Continuation resolver: fulfilled offers never resend, declines clear state, proactive sends don't seed context");
+  {
+    const NOW62 = 1_200_000_000_000;
+    const bookOffered = { kind: "BOOK" as const, stage: "offered" as const, at: NOW62 };
+    const bookFulfilled = { kind: "BOOK" as const, stage: "fulfilled" as const, at: NOW62 };
+    const manageOffered = { kind: "MANAGE" as const, stage: "offered" as const, at: NOW62 };
+    const manageFulfilled = { kind: "MANAGE" as const, stage: "fulfilled" as const, at: NOW62 };
+    const resolve = (
+      latest: string,
+      prevPending: { kind: "BOOK" | "MANAGE"; stage: "offered" | "fulfilled"; service?: string; at: number } | null,
+      lastWasReactive = true, fallbackOfferedBooking = false,
+    ) => resolveContinuation({ latest, prevPending, lastWasReactive, fallbackOfferedBooking });
+
+    check("no pendingOffer + bare 'כן' → NONE (no invented intent)",
+      resolve("כן", null).status === "NONE" && resolve("כן", null).offerKind === null);
+
+    check("offered BOOK + 'כן'/'סבבה' → OPEN_OFFER/BOOK (send the link)",
+      resolve("כן", bookOffered).status === "OPEN_OFFER" && resolve("כן", bookOffered).offerKind === "BOOK"
+      && resolve("סבבה", bookOffered).status === "OPEN_OFFER");
+
+    check("fulfilled BOOK + 'כן'/'סבבה' → FULFILLED/BOOK (core invariant: never reopens the same offer)",
+      resolve("כן", bookFulfilled).status === "FULFILLED" && resolve("כן", bookFulfilled).offerKind === "BOOK"
+      && resolve("סבבה", bookFulfilled).status === "FULFILLED");
+
+    check("fulfilled BOOK + 'תשלח' → EXPLICIT_RESEND/BOOK (explicit re-ask still resends)",
+      resolve("תשלח", bookFulfilled).status === "EXPLICIT_RESEND" && resolve("תשלח", bookFulfilled).offerKind === "BOOK");
+
+    check("offered MANAGE + 'כן' → OPEN_OFFER/MANAGE (manage symmetry with booking)",
+      resolve("כן", manageOffered).status === "OPEN_OFFER" && resolve("כן", manageOffered).offerKind === "MANAGE");
+
+    check("fulfilled MANAGE + 'סבבה' → FULFILLED/MANAGE (never leaks into a booking link)",
+      resolve("סבבה", manageFulfilled).status === "FULFILLED" && resolve("סבבה", manageFulfilled).offerKind === "MANAGE");
+
+    check("fulfilled MANAGE + 'תשלח' → EXPLICIT_RESEND/MANAGE (never crosses to booking)",
+      resolve("תשלח", manageFulfilled).status === "EXPLICIT_RESEND" && resolve("תשלח", manageFulfilled).offerKind === "MANAGE");
+
+    check("any pendingOffer + 'לא'/'לא תודה' → DECLINED regardless of stage or kind",
+      resolve("לא", bookOffered).status === "DECLINED" && resolve("לא תודה", bookFulfilled).status === "DECLINED"
+      && resolve("לא", manageOffered).status === "DECLINED");
+
+    check("isBareDecline: bare declines match; a content-ful decline or a real request does not",
+      isBareDecline("לא") && isBareDecline("לא תודה") && isBareDecline("עזוב") && isBareDecline("לא משנה")
+      && isBareDecline("לא, אני אחשוב על זה") === false && isBareDecline("כמה עולה?") === false);
+
+    check("pendingOffer past PENDING_OFFER_TTL_MS → readPendingOffer null → resolver sees NONE (stale offers go cold)",
+      (() => {
+        const stale = readPendingOffer({ pendingOffer: { kind: "BOOK", stage: "fulfilled", at: NOW62 } }, NOW62 + PENDING_OFFER_TTL_MS + 1);
+        return stale === null && resolve("כן", stale).status === "NONE";
+      })());
+
+    check("legacy pendingOffer with missing stage → readPendingOffer defaults to 'offered' (conservative, not 'already fulfilled')",
+      (() => {
+        const legacy = readPendingOffer({ pendingOffer: { kind: "BOOK", at: NOW62 } }, NOW62 + 60_000);
+        return legacy?.stage === "offered" && resolve("כן", legacy).status === "OPEN_OFFER";
+      })());
+
+    check("pendingOffer exists but last outbound was proactive (job_reminder) + 'כן' → NONE (suppresses an EXISTING offer, not just the no-offer case)",
+      resolve("כן", bookFulfilled, false).status === "NONE");
+    check("pendingOffer exists but last outbound was proactive (job_waitlist) + 'סבבה' → NONE (same, second proactive source)",
+      resolve("סבבה", manageFulfilled, false).status === "NONE");
+    check("pendingOffer exists but last outbound was proactive + explicit 'תשלח' → NONE, NOT EXPLICIT_RESEND (no bypass of the proactive gate)",
+      resolve("תשלח", bookFulfilled, false).status === "NONE");
+
+    check("no valid pendingOffer at all + 'תשלח' → NONE (which-link territory, never guesses)",
+      resolve("תשלח", null, true).status === "NONE");
+
+    check("no persisted offer but a fresh history 'offeredBooking' fallback + 'כן' → OPEN_OFFER/BOOK",
+      resolve("כן", null, true, true).status === "OPEN_OFFER" && resolve("כן", null, true, true).offerKind === "BOOK");
+    check("no persisted offer, lastWasReactive=false → fallback signal ignored → NONE",
+      resolve("כן", null, false, true).status === "NONE");
+
+    // PRECEDENCE FIX (Slice B): a message matching a trusted deterministic platform signal (explicit link
+    // request, manage-help topic) must NOT be suppressed as gibberish before the router/resolver sees it.
+    // A bare 4-letter no-mater-lectionis token used to trip the consonant-smash heuristic and skip Gemini.
+    check("looksLikeNoise exempts explicit-link-request 'תשלח' (reaches the resolver, not suppressed as gibberish)",
+      looksLikeNoise("תשלח") === false && isExplicitLinkRequest("תשלח") === true);
+    check("looksLikeNoise exempts manage-help 'מבטל' / 'מסתבך' (bare cancel / link-trouble tokens are not gibberish)",
+      looksLikeNoise("מבטל") === false && looksLikeNoise("מסתבך") === false
+      && isManageHelpTopic("מבטל") === true && isManageHelpTopic("מסתבך") === true);
+    check("looksLikeNoise still flags a REAL consonant-smash (no over-correction): 'חכלגצג' / 'חבצב' stay noise",
+      looksLikeNoise("חכלגצג") === true && looksLikeNoise("חבצב") === true);
+    check("preGeminiAction no longer skips Gemini for 'תשלח' / 'מבטל' (they reach the model → deterministic routing)",
+      preGeminiAction(0, 0, "תשלח", []) !== "skip_gemini_gibberish"
+      && preGeminiAction(0, 0, "מבטל", []) !== "skip_gemini_gibberish"
+      && preGeminiAction(0, 0, "חכלגצג", []) === "skip_gemini_gibberish");
+  }
+  gap("§62 resolver scope: proves the PURE decision function in isolation. End-to-end wiring (the four call sites in runPlatformTurn that now consume it) is proven below via the real runPlatformTurn through runLane.",
+    "none — the runtime-lane checks immediately following this gap cover every required end-to-end scenario.");
+
+  section("62b. Continuation resolver wired into runPlatformTurn (runtime lane, real deterministic routing)");
+  await (async () => {
+    const nowLane = Date.now();
+    const bookOfferedLane = { kind: "BOOK" as const, stage: "offered" as const, at: nowLane - 60_000 };
+    const bookFulfilledLane = { kind: "BOOK" as const, stage: "fulfilled" as const, at: nowLane - 60_000 };
+    const manageFulfilledLane = { kind: "MANAGE" as const, stage: "fulfilled" as const, at: nowLane - 60_000 };
+    const bookSentTranscript =
+      "Assistant (you, earlier): בטח! את השירות, היום והשעה בוחרים ישירות בקישור — קל ומהיר.\n" +
+      "*לקביעת תור — מהיר ופשוט:*\nhttps://example.com/book/biz?p=972500000000";
+    const manageSentTranscript = "Assistant (you, earlier): הנה הקישור לניהול התור שלך: https://example.com/appointment/appt-1";
+    const offerAskedTranscript = "Assistant (you, earlier): רוצה שאשלח לך קישור לקביעת תור?";
+    const futureLane = new Date(nowLane + 86_400_000).toISOString();
+    const upcomingLane = [{ id: "appt-1", start_time: futureLane, status: "confirmed", services: { name: "תספורת" } }];
+
+    const rOffer = await runLane({ message: "כן", prevLow: 0, pendingOffer: bookOfferedLane,
+      transcript: offerAskedTranscript, lastAssistantSource: "ai_turn" });
+    check("E2E: offered BOOK + 'כן' → booking link sent once", rOffer.outcome.linkAttached === "booking",
+      `linkAttached=${rOffer.outcome.linkAttached}`);
+
+    const rOfferSoft = await runLane({ message: "סבבה", prevLow: 0, pendingOffer: bookOfferedLane,
+      transcript: offerAskedTranscript, lastAssistantSource: "ai_turn" });
+    check("E2E: offered BOOK + 'סבבה' → booking link sent (open offer is NOT swallowed by the closure gate)",
+      rOfferSoft.outcome.linkAttached === "booking", `linkAttached=${rOfferSoft.outcome.linkAttached}`);
+
+    const rFulfilledYes = await runLane({ message: "כן", prevLow: 0, pendingOffer: bookFulfilledLane,
+      transcript: bookSentTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", reply: "מעולה, אני כאן לכל שאלה 🙂" } });
+    check("E2E core regression: fulfilled BOOK + 'כן' → no resend, no nudge loop, non-empty safe reply",
+      rFulfilledYes.outcome.linkAttached !== "booking"
+      && (rFulfilledYes.outcome.replyText ?? "").trim().length > 0
+      && !(rFulfilledYes.outcome.replyText ?? "").includes("עדיין מחכה לך")
+      && !/https?:\/\//.test(rFulfilledYes.outcome.replyText ?? ""),
+      `linkAttached=${rFulfilledYes.outcome.linkAttached} reply="${rFulfilledYes.outcome.replyText}"`);
+
+    const rFulfilledSoft = await runLane({ message: "סבבה", prevLow: 0, pendingOffer: bookFulfilledLane,
+      transcript: bookSentTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", reply: "מעולה, אני כאן לכל שאלה 🙂" } });
+    check("E2E core regression: fulfilled BOOK + 'סבבה' → no resend, no nudge loop, non-empty safe reply (closure lane can re-engage)",
+      rFulfilledSoft.outcome.linkAttached !== "booking"
+      && (rFulfilledSoft.outcome.replyText ?? "").trim().length > 0
+      && !(rFulfilledSoft.outcome.replyText ?? "").includes("עדיין מחכה לך")
+      && !/https?:\/\//.test(rFulfilledSoft.outcome.replyText ?? ""),
+      `linkAttached=${rFulfilledSoft.outcome.linkAttached} reply="${rFulfilledSoft.outcome.replyText}"`);
+
+    // Bare "תשלח" (single 4-letter token, no mater-lectionis vowel) — proves the precedence fix: it now
+    // reaches the continuation resolver instead of being suppressed by the pre-Gemini consonant-smash gate.
+    const rExplicitResend = await runLane({ message: "תשלח", prevLow: 0, pendingOffer: bookFulfilledLane,
+      transcript: bookSentTranscript, lastAssistantSource: "ai_turn" });
+    check("E2E: fulfilled BOOK + explicit bare 'תשלח' → booking link resent (not suppressed as gibberish)",
+      rExplicitResend.outcome.linkAttached === "booking", `linkAttached=${rExplicitResend.outcome.linkAttached}`);
+
+    const rManageSoft = await runLane({ message: "סבבה", prevLow: 0, pendingOffer: manageFulfilledLane,
+      transcript: manageSentTranscript, lastAssistantSource: "ai_turn", upcoming: upcomingLane });
+    check("E2E: fulfilled MANAGE + 'סבבה' → no switch to booking",
+      rManageSoft.outcome.linkAttached !== "booking", `linkAttached=${rManageSoft.outcome.linkAttached}`);
+
+    const rManageResend = await runLane({ message: "תשלח", prevLow: 0, pendingOffer: manageFulfilledLane,
+      transcript: manageSentTranscript, lastAssistantSource: "ai_turn", upcoming: upcomingLane });
+    check("E2E: fulfilled MANAGE + explicit bare 'תשלח' → manage link resent, never booking",
+      rManageResend.outcome.linkAttached === "manage", `linkAttached=${rManageResend.outcome.linkAttached}`);
+
+    const rDecline = await runLane({ message: "לא תודה", prevLow: 0, pendingOffer: bookOfferedLane,
+      transcript: offerAskedTranscript, lastAssistantSource: "ai_turn" });
+    check("E2E: decline clears the persisted pendingOffer (no link this turn, and the write is cleared)",
+      rDecline.outcome.linkAttached === null && !rDecline.pendingOfferAfter,
+      `linkAttached=${rDecline.outcome.linkAttached} pendingOfferAfter=${JSON.stringify(rDecline.pendingOfferAfter)}`);
+
+    const rProactiveReminder = await runLane({ message: "כן", prevLow: 0, pendingOffer: bookFulfilledLane,
+      transcript: "Assistant (you, earlier): תזכורת: התור שלך מחר ב-10:00. לניהול: https://example.com/appointment/appt-1",
+      lastAssistantSource: "job_reminder" });
+    check("E2E: pendingOffer exists but last outbound was a proactive reminder + 'כן' → no continuation into the old offer",
+      rProactiveReminder.outcome.linkAttached !== "booking" && rProactiveReminder.outcome.linkAttached !== "manage",
+      `linkAttached=${rProactiveReminder.outcome.linkAttached}`);
+
+    const rProactiveWaitlist = await runLane({ message: "סבבה", prevLow: 0, pendingOffer: manageFulfilledLane,
+      transcript: "Assistant (you, earlier): התפנה תור! לקביעה: https://example.com/book/biz?p=972500000000",
+      lastAssistantSource: "job_waitlist" });
+    check("E2E: pendingOffer exists but last outbound was a proactive waitlist notice + 'סבבה' → no continuation into the old offer",
+      rProactiveWaitlist.outcome.linkAttached !== "booking" && rProactiveWaitlist.outcome.linkAttached !== "manage",
+      `linkAttached=${rProactiveWaitlist.outcome.linkAttached}`);
+
+    const rNewBooking = await runLane({ message: "אני רוצה לקבוע תור חדש", prevLow: 0, pendingOffer: bookFulfilledLane,
+      transcript: bookSentTranscript, lastAssistantSource: "ai_turn", model: { intent: "booking", appt: "BOOK", action: true } });
+    check("E2E regression: explicit new booking request after a previous link → still works (resolver not consulted; action route)",
+      rNewBooking.outcome.linkAttached === "booking", `linkAttached=${rNewBooking.outcome.linkAttached}`);
+
+    const rFaqAfterLink = await runLane({ message: "כמה עולה תספורת?", prevLow: 0, pendingOffer: bookFulfilledLane,
+      transcript: bookSentTranscript, lastAssistantSource: "ai_turn", model: { intent: "faq", reply: "80 ש\"ח" } });
+    check("E2E regression: FAQ question after a link → handled normally, not swallowed by continuation logic",
+      rFaqAfterLink.outcome.linkAttached !== "booking" && (rFaqAfterLink.outcome.replyText ?? "").includes("80"),
+      `linkAttached=${rFaqAfterLink.outcome.linkAttached} reply="${rFaqAfterLink.outcome.replyText}"`);
+  })();
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);

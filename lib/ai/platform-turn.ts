@@ -33,6 +33,8 @@ import {
   NO_APPOINTMENT_PROMPT, noAppointmentCtaBody, detectInfoTopic, type MenuState, type MenuNav,
 } from "./continuity-menu";
 import { capInteractiveBody, type WhatsAppInteractive } from "@/lib/whatsapp";
+import type { OutboundSource } from "@/lib/booking/outbound";
+import { isReactiveSource } from "@/lib/booking/outbound-audit";
 
 export type PlatformLink = "booking" | "manage" | null;
 
@@ -199,6 +201,10 @@ const RECOVERY_ACK =
 // asked nor offered anything) — give ONE useful clarification instead of routing a cold action.
 const COLD_YES_CLARIFY =
   "לא בטוח/ה למה התכוונת 🙂 רוצה לקבוע תור, לנהל תור קיים, או לשאול משהו על העסק?";
+// An explicit "send it (again)" ask with NO valid offer to resolve against (no pending offer, expired,
+// or the last outbound was proactive) — never guess which link; ask once, same spirit as COLD_YES_CLARIFY.
+const WHICH_LINK_CLARIFY =
+  "לא בטוח/ה לאיזה קישור התכוונת 🙂 לקביעת תור חדש, או לניהול תור קיים?";
 // Accountability repair: the user references our earlier overload/system message. ACKNOWLEDGE it
 // (never deny, never blame the user), say it was momentary, bridge back to the task.
 const ACCOUNTABILITY_REPAIR =
@@ -661,6 +667,16 @@ export async function runPlatformTurn(
   const latest = latestFragment(messageText);
   const latestSignalRaw = classifyGoodFaithSignal(latest, { serviceNames: activeServiceNames });
   const lastContract = deriveLastAssistantContract(memory.transcript);
+  // Continuation resolver (Slice B) — ONE decision consumed by the closure gate, the affirm/link-
+  // attach block, the cold-yes guard, and the newPending persistence below. `lastWasReactive` is false
+  // only when the last outbound is EXPLICITLY tagged with a non-reactive source (job_reminder,
+  // job_waitlist, booking_platform, dashboard, recovery, unknown) — null (legacy row / no prior
+  // message) fails open to reactive so behavior on unmigrated data never regresses.
+  const lastWasReactive = memory.lastAssistantSource == null
+    || isReactiveSource(memory.lastAssistantSource as OutboundSource);
+  const continuation = resolveContinuation({
+    latest, prevPending, lastWasReactive, fallbackOfferedBooking: lastContract.offeredBooking,
+  });
   // Topic switch (latest wins): a NEW non-manage topic while our recent reply was a
   // manage/cancel/link/help thread → tell the model to answer THIS message, not the thread.
   const topicSwitch =
@@ -702,7 +718,7 @@ export async function runPlatformTurn(
   // no OPEN offer it would confirm (a still-valid pending offer, or our last reply proposing a booking). With
   // such a confirm-context it stays an affirmation (→ acts on the offer downstream). "כן"/"בטח"/… are never
   // soft → always affirmations. Non-affirmation closures ("יופי"/"תודה") are unaffected.
-  const confirmContext = !!prevPending || lastContract.offeredBooking;
+  const confirmContext = continuation.status === "OPEN_OFFER" || continuation.status === "EXPLICIT_RESEND";
   const closureEligible = isTerminalClosure(messageText)
     && !hasBusinessAnchor(messageText, activeServiceNames) && !askedForData
     && (!isBareAffirmation(messageText) || (isSoftCloseAffirmation(messageText) && !confirmContext));
@@ -1045,21 +1061,21 @@ export async function runPlatformTurn(
   //    QUESTION about an operation ("כמה עולה לבטל?") is faq, not action — never forced.
   const escapeOp = inferOperation(latest);
   const affirm = isBareAffirmation(latest);
-  // IMMEDIATE context: our LAST reply offered/sent a booking. DELAYED context: a still-valid
-  // pending offer from earlier (survives intervening turns + a time gap, TTL-bounded) — this is
-  // what makes a later "כן" resolve to the action we discussed instead of arriving cold.
-  const immediateBookCtx = lastContract.sentBookingLink || lastContract.offeredBooking;
-  const pendingBookConfirm = affirm && !immediateBookCtx && prevPending?.kind === "BOOK";
-  const pendingManageConfirm = affirm && !immediateBookCtx && prevPending?.kind === "MANAGE";
-  const confirmIntoBooking = affirm && (immediateBookCtx || pendingBookConfirm);
+  // Continuation resolver (Slice B) already decided whether this is an open offer to fulfill or an
+  // explicit resend — both mean "act on it now"; offerKind says which link. Replaces the previously-
+  // scattered immediateBookCtx/pendingBookConfirm/pendingManageConfirm combination.
+  const confirmIntoBooking = (continuation.status === "OPEN_OFFER" || continuation.status === "EXPLICIT_RESEND")
+    && continuation.offerKind === "BOOK";
+  const confirmIntoManage = (continuation.status === "OPEN_OFFER" || continuation.status === "EXPLICIT_RESEND")
+    && continuation.offerKind === "MANAGE";
   // A "help" signal escapes to MANAGE only with real manage evidence (helpEscapesToManage) — generic
   // confusion / location / access / frustration "help" stays in AI/FAQ (the model's reply is used), never a
-  // manage→booking "no active appointment" reply. The action-op and pending-MANAGE escapes are unchanged.
+  // manage→booking "no active appointment" reply. The action-op and continuation-MANAGE escapes are unchanged.
   const wantsManage = helpEscapesToManage(latestSignal, latest, lastContract, prevPending?.kind ?? null)
     || (latestSignal === "action" && (escapeOp === "CANCEL" || escapeOp === "RESCHEDULE" || escapeOp === "LIST"))
-    || pendingManageConfirm;
+    || confirmIntoManage;
   const wantsBook = (latestSignal === "action" && escapeOp === "BOOK") || confirmIntoBooking;
-  const pendingResolved = pendingBookConfirm || pendingManageConfirm;
+  const pendingResolved = confirmIntoBooking || confirmIntoManage;
   let softIntentLink = false;
   if (decision.ok && !suppressLinkFor(latest) && wantsManage && (latestSignal === "help" || linkAttached === null)) {
     // HELP overrides even an attached link (truth-safe guidance beats a vague model reply);
@@ -1077,9 +1093,9 @@ export async function runPlatformTurn(
     ({ replyText, interactive } = attachPlatformLink(`בטח! ${FENCE_BRIDGE_BOOK}`, BOOK_LINE, url, lastAssistant, messageText));
     linkAttached = "booking";
     platformRoute = "BOOK";
-    platformRouteReason = pendingBookConfirm ? "pending_confirm" : confirmIntoBooking ? "contextual_confirm" : "action_escape";
+    platformRouteReason = continuation.status === "EXPLICIT_RESEND" ? "explicit_resend" : confirmIntoBooking ? "contextual_confirm" : "action_escape";
     logPlatformLink("booking", url);
-    console.log(`[platform-turn] ${pendingBookConfirm ? "pending-confirm: 'כן' resolved a still-open booking offer" : confirmIntoBooking ? "contextual-confirm: 'כן' after a booking offer" : "action-escape: model missed a booking imperative"} → booking link`);
+    console.log(`[platform-turn] ${continuation.status === "EXPLICIT_RESEND" ? "explicit-resend: link re-sent on request" : confirmIntoBooking ? "contextual-confirm: 'כן' resolved a pending/open booking offer" : "action-escape: model missed a booking imperative"} → booking link`);
   } else if (decision.ok && linkAttached === null && latestSignal === "soft_intent" && !suppressLinkFor(latest)) {
     // SOFT SERVICE INTENT ("חשבתי על להסתפר, יש לי טיסה..."): keep the model's WARMTH,
     // strip any in-chat scheduling question / availability promise, and route to the
@@ -1122,17 +1138,27 @@ export async function runPlatformTurn(
     capabilityFenceApplied = true;
   }
 
-  // ── COLD AFFIRMATION GUARD: a bare "כן"/"סבבה" with NO resolvable context (no still-valid
-  //    pending offer, and our last reply neither asked nor offered anything actionable) must
-  //    NOT route to an action — give ONE safe clarification instead of a cold guess. (A pending
-  //    offer, or a last-reply question/offer, is resolved above and never reaches here.)
+  // ── COLD AFFIRMATION GUARD: a bare "כן"/"סבבה" with NO resolvable context (continuation resolver
+  //    says NONE, and our last reply neither asked nor offered anything actionable) must NOT route to
+  //    an action — give ONE safe clarification instead of a cold guess. (An open/fulfilled offer is
+  //    resolved above and never reaches here.) askedQuestion/offeredHelp stay alongside the resolver
+  //    rather than being replaced by it — they're outside the booking/manage-offer concern the
+  //    resolver models, and dropping them would cold-clarify a "כן" that was actually answering a
+  //    genuine business question instead of letting it reach Gemini normally.
+  const hasAnyLastReplyContext = lastContract.askedQuestion || lastContract.offeredHelp
+    || lastContract.offeredBooking || lastContract.sentBookingLink || lastContract.sentManageLink;
   let coldYes = false;
-  if (decision.ok && linkAttached === null && affirm && !prevPending
-      && !(lastContract.askedQuestion || lastContract.offeredHelp || lastContract.offeredBooking
-           || lastContract.sentBookingLink || lastContract.sentManageLink)) {
+  if (decision.ok && linkAttached === null && affirm && continuation.status === "NONE" && !hasAnyLastReplyContext) {
     replyText = COLD_YES_CLARIFY;
     coldYes = true;
     console.log("[platform-turn] cold affirmation with no pending context → safe clarification (no action)");
+  } else if (decision.ok && linkAttached === null && continuation.status === "NONE" && isExplicitLinkRequest(latest)) {
+    // An explicit "תשלח"/"שלח שוב" with no valid offer to resolve against (none persisted, expired, or
+    // the last outbound was proactive) never guesses which link — ask once instead of silently
+    // resending a possibly-stale/irrelevant one.
+    replyText = WHICH_LINK_CLARIFY;
+    coldYes = true;
+    console.log("[platform-turn] explicit resend request with no valid offer context → which-link clarification (no action)");
   }
 
   // ── STALE-TOPIC GUARD (deterministic backstop): the latest message is a clear NEW
@@ -1255,10 +1281,17 @@ export async function runPlatformTurn(
   //    rewritten clarify line) so a deterministic clarification can't fabricate a pending offer.
   const discussedService = (u?.serviceName ?? prevPending?.service) || undefined;
   let newPending: PendingOffer | null | undefined = undefined;
-  if (!coldYes && kind !== "gibberish" && kind !== "unclear" && kind !== "out_of_domain") {
-    if (linkAttached === "booking") newPending = { kind: "BOOK", service: discussedService, at: now };
-    else if (linkAttached === "manage") newPending = { kind: "MANAGE", service: discussedService, at: now };
-    else if (decision.ok && BOOKING_OFFER_RE.test(decision.replyText)) newPending = { kind: "BOOK", service: discussedService, at: now };
+  if (continuation.status === "DECLINED") {
+    // A decline always clears — never left to silently affirm later, regardless of what else this
+    // turn did (Slice B: previously an old pendingOffer survived a decline unchanged for up to 3h).
+    newPending = null;
+  } else if (!coldYes && kind !== "gibberish" && kind !== "unclear" && kind !== "out_of_domain") {
+    // linkAttached this turn means the link was ACTUALLY sent — always "fulfilled", never a fresh
+    // "offered" (Slice B: previously this refreshed pendingOffer to a brand-new "offered" record even
+    // when the attach itself was fulfilling an existing offer, which is what caused the resend loop).
+    if (linkAttached === "booking") newPending = { kind: "BOOK", stage: "fulfilled", service: discussedService, at: now };
+    else if (linkAttached === "manage") newPending = { kind: "MANAGE", stage: "fulfilled", service: discussedService, at: now };
+    else if (decision.ok && BOOKING_OFFER_RE.test(decision.replyText)) newPending = { kind: "BOOK", stage: "offered", service: discussedService, at: now };
   }
 
   // Persist the counters + pending offer (platform state is always idle; merge-safe + supersede-aware).
@@ -1495,6 +1528,12 @@ export function readGreetingCount(context: Record<string, unknown>): number {
 export const PENDING_OFFER_TTL_MS = 3 * 60 * 60 * 1000; // 3h — a booking offer stays warm for hours, not days
 export interface PendingOffer {
   kind: "BOOK" | "MANAGE";
+  /** Lifecycle stage (Slice B): "offered" = we proposed/asked, no link sent yet; "fulfilled" = a link
+   *  was actually attached this-or-an-earlier turn. Set authoritatively by the code that attaches the
+   *  link — never re-derived from message text later (that reverse-engineering caused the duplicate-
+   *  link/nudge-loop bug this field exists to fix). Missing on pre-Slice-B data — readPendingOffer
+   *  defaults that case to "offered" (conservative: never assume "already sent" for old data). */
+  stage: "offered" | "fulfilled";
   service?: string;   // last discussed service name (for warmth), or undefined
   at: number;         // epoch ms when offered
 }
@@ -1505,7 +1544,66 @@ export function readPendingOffer(context: Record<string, unknown>, now: number =
   if (!p || (p.kind !== "BOOK" && p.kind !== "MANAGE")) return null;
   if (typeof p.at !== "number" || !Number.isFinite(p.at)) return null;
   if (now - p.at > PENDING_OFFER_TTL_MS || now - p.at < 0) return null; // expired (or clock skew)
-  return { kind: p.kind, service: typeof p.service === "string" && p.service.trim() ? p.service : undefined, at: p.at };
+  return {
+    kind: p.kind,
+    stage: p.stage === "fulfilled" ? "fulfilled" : "offered", // legacy/missing shape → conservative default
+    service: typeof p.service === "string" && p.service.trim() ? p.service : undefined,
+    at: p.at,
+  };
+}
+
+// ── CONTINUATION RESOLVER (Slice B) ───────────────────────────────────────────────────
+// ONE typed decision for what a bare affirmation, an explicit "send it (again)" ask, or a decline
+// means THIS turn — replaces four previously-scattered, independently-recombined booleans (the
+// closure gate, the affirm/link-attach block, the cold-yes guard, and the newPending persistence all
+// used to derive their own version of "is there an open offer?"). Every input is passed in explicitly
+// (no closure over surrounding turn state, no internal transcript/DB access) so this stays a pure,
+// truth-table-testable function: same inputs always produce the same verdict.
+export type ContinuationStatus = "NONE" | "OPEN_OFFER" | "FULFILLED" | "EXPLICIT_RESEND" | "DECLINED";
+export interface ContinuationVerdict {
+  status: ContinuationStatus;
+  offerKind: "BOOK" | "MANAGE" | null;
+}
+export interface ContinuationInput {
+  /** The latest customer fragment — same value isBareAffirmation/isBareDecline/isExplicitLinkRequest see. */
+  latest: string;
+  /** A still-VALID (TTL-checked, via readPendingOffer) pending offer, or null. */
+  prevPending: PendingOffer | null;
+  /** Was the LAST outbound message a live reactive reply (ai_turn/deterministic), as opposed to a
+   *  proactive/system send (reminder/waitlist/booking-platform/dashboard/recovery/unknown, or no prior
+   *  message at all)? Computed by the caller from ConversationContext.lastAssistantSource. */
+  lastWasReactive: boolean;
+  /** A fallback "our last reply (already in history) offered booking" signal — i.e.
+   *  deriveLastAssistantContract(transcript).offeredBooking, computed by the CALLER. Consulted ONLY
+   *  when there is no persisted `prevPending` at all; never overrides a persisted offer's stage. */
+  fallbackOfferedBooking: boolean;
+}
+/**
+ * Precedence (top to bottom): a bare DECLINE always clears first, regardless of any other signal. A
+ * still-valid persisted offer is consulted ONLY when the last outbound was reactive — a proactive
+ * interruption (reminder/waitlist/booking-platform confirmation) suppresses resolution against it for
+ * a vague affirmation AND for an explicit resend alike (the safe default after any such interruption
+ * is "ask which link", never a guess). Within a reactive, still-valid offer: an explicit resend
+ * ("תשלח") always wins and can resend even a FULFILLED offer's link; a bare/soft affirmation resolves
+ * to OPEN_OFFER (send the link) when the offer hasn't been fulfilled yet, or FULFILLED (natural close,
+ * no resend) when it has. With no persisted offer at all, a fresh same-turn "we just offered" signal
+ * (fallbackOfferedBooking) can still open a new offer. Everything else is NONE.
+ */
+export function resolveContinuation(input: ContinuationInput): ContinuationVerdict {
+  const { latest, prevPending, lastWasReactive, fallbackOfferedBooking } = input;
+  if (isBareDecline(latest)) return { status: "DECLINED", offerKind: prevPending?.kind ?? null };
+  if (prevPending && lastWasReactive) {
+    if (isExplicitLinkRequest(latest)) return { status: "EXPLICIT_RESEND", offerKind: prevPending.kind };
+    if (isBareAffirmation(latest)) {
+      return prevPending.stage === "fulfilled"
+        ? { status: "FULFILLED", offerKind: prevPending.kind }
+        : { status: "OPEN_OFFER", offerKind: prevPending.kind };
+    }
+  }
+  if (lastWasReactive && fallbackOfferedBooking && isBareAffirmation(latest)) {
+    return { status: "OPEN_OFFER", offerKind: "BOOK" };
+  }
+  return { status: "NONE", offerKind: null };
 }
 
 // ── DEGRADED-NOTICE RATE LIMIT (degraded = state, not per-inbound spam) ──────────
@@ -1707,7 +1805,13 @@ const isHebrewChar = (c: string): boolean => {
 export function looksLikeNoise(message: string, serviceNames: string[] = []): boolean {
   const t = (message ?? "").trim();
   if (!t) return false;
-  if (hasBookingSignal(t, serviceNames)) return false;     // productive → never noise
+  // "Productive → never noise": a message carrying ANY trusted deterministic platform signal must not be
+  // suppressed as gibberish before the router/resolver can see it. hasBookingSignal was the original
+  // exemption; isExplicitLinkRequest ("תשלח"/"שלח לי את הקישור") and isManageHelpTopic ("מבטל"/"מסתבך"/
+  // link-help) are the same class of high-confidence signal the platform turn already routes on — without
+  // them a bare 4-letter no-mater-lectionis token (e.g. "תשלח", "מבטל", "מסתבך") tripped the consonant-smash
+  // rule below and skipped Gemini entirely, never reaching the deterministic continuation resolver.
+  if (hasBookingSignal(t, serviceNames) || isExplicitLinkRequest(t) || isManageHelpTopic(t)) return false;
   if (t.length <= 1) return true;                           // single character
   if (/^[^\p{L}\p{N}]+$/u.test(t)) return true;             // punctuation/symbols only
   if (t.includes("?") || t.includes("؟")) return false;     // a question → let Gemini decide
@@ -2052,6 +2156,16 @@ const BARE_AFFIRMATION_RE = /^(כן|כן\s+בבקשה|כן\s+תודה|כן\s+כ�
 export function isBareAffirmation(message: string): boolean {
   const t = (message ?? "").trim().replace(/[!?.…\s]+$/g, "");
   return BARE_AFFIRMATION_RE.test(t);
+}
+
+// Slice B: a bare "no" with no content of its own, symmetric to isBareAffirmation — small, exact-match
+// set (bare-only; a multi-word decline like "לא, אני אחשוב על זה" carries its own content and reaches
+// Gemini normally, same boundary the affirmation set already draws). Used to clear a pending offer so
+// it can't be silently affirmed later by an unrelated bare "כן" within its TTL.
+const BARE_DECLINE_RE = /^(לא|לא\s+תודה|לא\s+צריך|לא\s+צריכה|לא\s+רוצה|עזוב|עזבי|לא\s+משנה|לא\s+עכשיו|תשכח\s+מזה|תשכחי\s+מזה)$/;
+export function isBareDecline(message: string): boolean {
+  const t = (message ?? "").trim().replace(/[!?.…\s]+$/g, "");
+  return BARE_DECLINE_RE.test(t);
 }
 
 // Short POSITIVE-CLOSURE / satisfaction reactions that aren't "thanks/ok" acks but play the SAME terminal-
