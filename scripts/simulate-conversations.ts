@@ -2114,6 +2114,34 @@ async function main() {
         ? "PASS ✓" : "FAIL ✗");
   }
 
+  console.log("\n================ SCENARIO 60: soft-conversion progression — exploration → service desire → booking link (Slice E2) ================");
+  // Live WhatsApp QA incident: after the assistant listed services / asked which one, the customer said
+  // "אשמח להסתפר" (a service expressed as a VERB) and the bot replied "קבע באתר ונתראה" WITHOUT a link.
+  // Fix (E2): a DETERMINISTIC exploration-progression signal attaches the booking link (model-independent),
+  // while generic contact/inquiry desires never do. The link attaches in runPlatformTurn (proven
+  // deterministically in reliability-eval §64); here we assert the E2 predicates fire on the real incident
+  // transcript + live-check that the model's raw reply to the desire is warm and claims no completed booking.
+  {
+    const pt = await import("../lib/ai/platform-turn");
+    const serviceNames = SERVICES.map((s) => s.name);
+    const listedReply = "יש פן, צבע ותספורת. מה בא לך לעשות?";
+    console.log("  [pure] exploration context detected from the assistant's listed-services / which-service reply:",
+      pt.serviceExplorationContext(listedReply, serviceNames) === true ? "PASS ✓" : "FAIL ✗");
+    console.log("  [pure] service desire/pick progresses ('אשמח להסתפר','בא לי צבע'); contact/inquiry does NOT ('אשמח לדבר','אשמח לקבל מידע'):",
+      pt.isServiceDesireOrPick("אשמח להסתפר", serviceNames) === true &&
+      pt.isServiceDesireOrPick("בא לי צבע", serviceNames) === true &&
+      pt.isServiceDesireOrPick("אשמח לדבר עם מישהו", serviceNames) === false &&
+      pt.isServiceDesireOrPick("אשמח לקבל מידע", serviceNames) === false
+        ? "PASS ✓" : "FAIL ✗");
+
+    const d60 = await runReceptionistTurn(ctx, {
+      conversationContext: "לקוח: איזה שירותים יש?\nעוזר: יש פן, צבע ותספורת. מה בא לך לעשות?",
+      message: "אשמח להסתפר", bookingBlock: "", platformMode: true,
+    });
+    console.log(`  [live] raw model reply to the desire is warm, non-empty, and claims no completed booking: ${
+      (d60.replyText ?? "").trim().length > 0 && !claimsBookingCompleted(d60.replyText) ? "PASS ✓" : `FAIL ✗ ("${d60.replyText}")`}`);
+  }
+
   console.log("\nDONE.");
 }
 

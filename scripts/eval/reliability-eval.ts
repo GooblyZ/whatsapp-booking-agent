@@ -26,6 +26,7 @@ import {
   inferOperation, isManageHelpTopic, isBareAffirmation, buildManageHelpReply,
   deriveLastAssistantContract, replyLooksStaleManage, helpEscapesToManage, type LastAssistantContract,
   hasSoftServiceIntent, mentionsCapabilityPromise, defuseCapabilityPromise,
+  serviceExplorationContext, isServiceDesireOrPick,
   looksLikeGreetingOrMeta, collapseElongation,
   looksLikePresenceCheck, looksLikeSocialOpener, isRecoveryFollowup, wasDegradedReply, preGeminiAction,
   readPendingOffer, PENDING_OFFER_TTL_MS,
@@ -4762,6 +4763,67 @@ async function main(): Promise<void> {
     check("E2E #19: repeated 'אפשר לקבוע תור?' → turn-2 reply differs from turn-1 (short/nudge form, no robotic repeat)",
       r19a.outcome.linkAttached === "booking" && (r19b.outcome.replyText ?? "") !== (r19a.outcome.replyText ?? ""),
       `t1="${r19a.outcome.replyText}" t2="${r19b.outcome.replyText}"`);
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // 64. SOFT-CONVERSION PROGRESSION (Slice E2) — after service exploration, a customer service
+  //     desire/preference/pick progresses to a booking link (PRIMARY, deterministic, model-INDEPENDENT);
+  //     a model "book on the site" pointer without a link is the backstop net; generic contact/inquiry/
+  //     meta desires never attach a link (even after exploration); a COLD desire gets no forced link.
+  section("64. Soft-conversion progression (Slice E2) — exploration→desire link, backstop fence, false-positive + cold protection");
+  {
+    // ── Tier 1 — pure predicates ──
+    const EXPLORED_64 = "יש פן, צבע ותספורת. מה בא לך לעשות?";
+    check("§64 serviceExplorationContext: assistant listed services / asked which → true",
+      serviceExplorationContext(EXPLORED_64, SERVICES) === true);
+    check("§64 serviceExplorationContext: plain answer (no services, no which-ask) → false",
+      serviceExplorationContext("אנחנו פתוחים ראשון עד חמישי, 9 עד 19", SERVICES) === false);
+    check("§64 serviceExplorationContext: active booking offer alone → true",
+      serviceExplorationContext("", SERVICES, { offeredBooking: true }) === true);
+    check("§64 isServiceDesireOrPick: service desires/picks → true",
+      isServiceDesireOrPick("אשמח להסתפר", SERVICES) === true
+      && isServiceDesireOrPick("בא לי צבע", SERVICES) === true
+      && isServiceDesireOrPick("יאללה תספורת", SERVICES) === true
+      && isServiceDesireOrPick("נשמע טוב, תספורת", SERVICES) === true);
+    check("§64 isServiceDesireOrPick: contact/inquiry/meta desires → false (false-positive guard)",
+      isServiceDesireOrPick("אשמח לדבר עם מישהו", SERVICES) === false
+      && isServiceDesireOrPick("רוצה לשאול שאלה", SERVICES) === false
+      && isServiceDesireOrPick("אשמח לקבל מידע", SERVICES) === false
+      && isServiceDesireOrPick("רוצה לשלוח תמונה", SERVICES) === false
+      && isServiceDesireOrPick("רוצה להבין מחירים", SERVICES) === false
+      && isServiceDesireOrPick("אשמח לדעת מה האפשרויות", SERVICES) === false);
+  }
+  await (async () => {
+    const explored = "Assistant (you, earlier): יש פן, צבע ותספורת. מה בא לך לעשות?";
+    // ── Tier 2 — PRIMARY exploration-progression (scripted model reply does NOT point to the site,
+    //    proving Layer B is model-independent) ──
+    const p1 = await runLane({ message: "אשמח להסתפר", prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "אחלה!" } });
+    check("§64 E2E: exploration → 'אשמח להסתפר' (model reply has NO booking pointer) → booking link (model-independent)",
+      p1.outcome.linkAttached === "booking", `link=${p1.outcome.linkAttached} reply="${p1.outcome.replyText}"`);
+    const p2 = await runLane({ message: "בא לי צבע", prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "יאמי" } });
+    check("§64 E2E: exploration → 'בא לי צבע' → booking link",
+      p2.outcome.linkAttached === "booking", `link=${p2.outcome.linkAttached} reply="${p2.outcome.replyText}"`);
+    const p3 = await runLane({ message: "יאללה תספורת", prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "מעולה" } });
+    check("§64 E2E: exploration → 'יאללה תספורת' → booking link",
+      p3.outcome.linkAttached === "booking", `link=${p3.outcome.linkAttached} reply="${p3.outcome.replyText}"`);
+
+    // ── Cold (no exploration): no forced link when the model doesn't point to the site (stated intent) ──
+    const cold = await runLane({ message: "אשמח להסתפר", prevLow: 0, model: { intent: "unclear", action: false, reply: "אחלה!" } });
+    check("§64 E2E: COLD 'אשמח להסתפר' (no exploration, model no pointer) → NO link (deliberate)",
+      cold.outcome.linkAttached == null, `link=${cold.outcome.linkAttached} reply="${cold.outcome.replyText}"`);
+
+    // ── Layer C backstop: cold desire, but the model DID point to the site → attach link ──
+    const back = await runLane({ message: "אשמח להסתפר", prevLow: 0, model: { intent: "unclear", action: false, reply: "קבע תור באתר ונתראה" } });
+    check("§64 E2E: backstop — model 'קבע תור באתר' without link + desire context → booking link",
+      back.outcome.linkAttached === "booking", `link=${back.outcome.linkAttached} reply="${back.outcome.replyText}"`);
+
+    // ── False positives — even AFTER exploration, contact/inquiry/meta desires never attach a link ──
+    const fpMsgs = ["אשמח לדבר עם מישהו", "רוצה לשאול שאלה", "אשמח לקבל מידע", "רוצה לשלוח תמונה", "רוצה להבין מחירים", "אשמח לדעת מה האפשרויות"];
+    for (const m of fpMsgs) {
+      const fp = await runLane({ message: m, prevLow: 0, transcript: explored, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "בטח, נשמח לעזור" } });
+      check(`§64 E2E false-positive: exploration → '${m}' → NO booking link`,
+        fp.outcome.linkAttached == null, `link=${fp.outcome.linkAttached} reply="${fp.outcome.replyText}"`);
+    }
   })();
 
   // ── summary ────────────────────────────────────────────────────────────────────

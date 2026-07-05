@@ -1215,6 +1215,34 @@ export async function runPlatformTurn(
     softIntentLink = true;
     logPlatformLink("booking", url);
     console.log("[platform-turn] soft-intent: indirect service intent → booking link (warmth kept)");
+  } else if (
+    decision.ok && !guidanceHandled && linkAttached === null && !suppressLinkFor(latest)
+    && escapeOp !== "CANCEL" && escapeOp !== "RESCHEDULE" && escapeOp !== "LIST"
+    && serviceExplorationContext(lastAssistant, activeServiceNames, {
+      offeredBooking: lastContract.offeredBooking, sentBookingLink: lastContract.sentBookingLink, prevPendingKind: prevPending?.kind ?? null,
+    })
+    && isServiceDesireOrPick(latest, activeServiceNames)
+  ) {
+    // ── EXPLORATION-PROGRESSION (Slice E2, PRIMARY): after the assistant listed services / asked which
+    //    service (or an active booking context), a customer service desire/preference/pick ("אשמח
+    //    להסתפר", "בא לי צבע", "יאללה תספורת") IS booking progression → attach the booking link. Fully
+    //    deterministic and model-INDEPENDENT (it does NOT need the model to say "book on the site").
+    //    Keeps the model's warmth; strips any in-chat scheduling question / availability promise / false
+    //    refusal. The gate already excluded plain questions and generic contact/inquiry/meta desires
+    //    ("אשמח לדבר", "אשמח לקבל מידע"). NOTE: when a per-tenant appointments-capability flag exists,
+    //    gate this (like the wantsBook / soft-intent branches) on it too.
+    let warm = defuseSchedulingQuestion(replyText).text;
+    warm = defuseCapabilityPromise(warm).text;
+    const refused = defuseActionRefusal(warm, "BOOK");
+    if (refused.defused) warm = refused.text;
+    const url = buildBookingLink(ctx.business.slug, customerPhone);
+    ({ replyText, interactive } = attachPlatformLink(warm, BOOK_LINE, url, lastAssistant, messageText));
+    linkAttached = "booking";
+    platformRoute = "BOOK";
+    platformRouteReason = "exploration_progression";
+    softIntentLink = true;
+    logPlatformLink("booking", url);
+    console.log("[platform-turn] exploration-progression: service desire/pick in exploration context → booking link (warmth kept)");
   }
 
   // ── CAPABILITY-PROMISE FENCE (route-agnostic backstop): the model promised an in-chat
@@ -1260,6 +1288,28 @@ export async function runPlatformTurn(
     } else {
       replyText = META_FALLBACK; // no booking context → don't dangle a phantom link; safe neutral line
       console.log("[platform-turn] link-denial fence: neutralized false 'can't send links' (no link)");
+    }
+  }
+
+  // ── BOOKING-PROGRESSION BACKSTOP FENCE (Slice E2, SAFETY NET): the model told the customer to
+  //    "book on the site" but the deterministic layer attached no link. With clear booking context,
+  //    attach the booking link so the pointer isn't a dead-end. SECONDARY to the exploration-
+  //    progression branch above (the primary, model-independent path); requires a booking WORD next to
+  //    a site/link noun (BOOK_ON_SITE_RE, not a bare "אתר"), so a casual site mention never triggers it.
+  if (decision.ok && !guidanceHandled && linkAttached === null && BOOK_ON_SITE_RE.test(replyText)
+      && escapeOp !== "CANCEL" && escapeOp !== "RESCHEDULE" && escapeOp !== "LIST") {
+    const bookingContext = latestSignal === "soft_intent"
+      || hasBookingSignal(latest, activeServiceNames)
+      || lastContract.offeredBooking || lastContract.sentBookingLink || prevPending?.kind === "BOOK"
+      || (SOFT_DESIRE_RE.test(latest) && !CONTACT_INQUIRY_RE.test(latest));
+    if (bookingContext && !suppressLinkFor(latest)) {
+      const url = buildBookingLink(ctx.business.slug, customerPhone);
+      ({ replyText, interactive } = attachPlatformLink(replyText, BOOK_LINE, url, lastAssistant, messageText));
+      linkAttached = "booking";
+      platformRoute = "BOOK";
+      platformRouteReason = "progression_fence";
+      logPlatformLink("booking", url);
+      console.log("[platform-turn] progression fence: 'book on the site' without link + booking context → booking link");
     }
   }
 
@@ -2165,6 +2215,60 @@ export function hasSoftServiceIntent(message: string, serviceNames: string[] = [
   const t = (message ?? "").trim();
   if (!t || !SOFT_DESIRE_RE.test(t)) return false;
   return hasBookingSignal(t, serviceNames) || SOFT_CONTEXT_RE.test(t);
+}
+
+// ── EXPLORATION-PROGRESSION (Slice E2) ────────────────────────────────────────────
+// After service EXPLORATION (the assistant listed services / asked which service, or an active booking
+// context), a customer's service DESIRE / PREFERENCE / PICK is a booking progression — even when it
+// carries no service NOUN the signal lists recognize ("אשמח להסתפר" is a service VERB). This is a
+// CONVERSATION-STATE signal, not a lexical one: it needs recent exploration context, so a COLD desire
+// or a generic contact/inquiry/meta desire never fires it. Business-AGNOSTIC — keys on the tenant's own
+// configured services + generic desire/ask SHAPES, never on industry verbs.
+
+// "which service / what would you like" — the assistant steering toward a pick (extends ASKED_WHICH_RE).
+const SERVICE_ASK_RE = /מה\s+(בא\s+לך|תרצ|מעוניין|מעניין|לעשות|נעשה|כדאי)|איזה\s+(שירות|טיפול|תור)|לאיזה\s+(שירות|טיפול|תור)/;
+// Generic contact / inquiry / meta desires that are NOT a service pick — a desire cue followed by one of
+// these stays exploration/help, never booking progression ("אשמח לדבר", "אשמח לקבל מידע", "רוצה לדעת").
+const CONTACT_INQUIRY_RE = /לדבר|לשאול|לשלוח|לקבל\s+מידע|לדעת|להבין|מידע/;
+// The model told the customer to "book on the site" — a booking WORD next to a site/link noun (NOT a
+// bare "אתר" mention). Used only by the OUTPUT backstop fence.
+const BOOK_ON_SITE_RE = /(?:קבע|לקבוע|תקבע|תזמין|להזמין|תור)[^.\n]{0,24}(?:אתר|קישור|לינק)|(?:אתר|קישור|לינק)[^.\n]{0,24}(?:קבע|לקבוע|תור|להזמין)/;
+
+/** How many of the business's configured services the text mentions (full name OR colloquial short-form,
+ *  via the business-agnostic name matcher). ≥2 ⇒ the reply LISTED services (an exploration turn). */
+function countServiceMentions(message: string, serviceNames: string[] = []): number {
+  const t = (message ?? "").trim();
+  if (!t) return 0;
+  let n = 0;
+  for (const name of serviceNames) {
+    if ((name ?? "").trim().length >= 2 && matchesServiceWord(t, name)) n += 1;
+  }
+  return n;
+}
+
+/** True when the PRIOR turn put the conversation in service-exploration state: our last reply listed
+ *  ≥2 services or asked which service, OR there is an active/pending booking context. Deterministic,
+ *  from already-available context (no new stored state). */
+export function serviceExplorationContext(
+  lastAssistant: string | null | undefined,
+  serviceNames: string[] = [],
+  opts: { offeredBooking?: boolean; sentBookingLink?: boolean; prevPendingKind?: "BOOK" | "MANAGE" | null } = {},
+): boolean {
+  if (opts.offeredBooking || opts.sentBookingLink || opts.prevPendingKind === "BOOK") return true;
+  const la = (lastAssistant ?? "").trim();
+  if (!la) return false;
+  return SERVICE_ASK_RE.test(la) || countServiceMentions(la, serviceNames) >= 2;
+}
+
+/** True when the customer's latest message is a service DESIRE / PREFERENCE / PICK — a desire cue or a
+ *  service reference that is NOT a question and NOT a generic contact/inquiry/meta desire. The caller
+ *  gates this on serviceExplorationContext so a cold ambiguous desire never forces a link. */
+export function isServiceDesireOrPick(message: string, serviceNames: string[] = []): boolean {
+  const t = (message ?? "").trim();
+  if (!t) return false;
+  if (isQuestionLike(t)) return false;
+  if (CONTACT_INQUIRY_RE.test(t)) return false;
+  return SOFT_DESIRE_RE.test(t) || hasBookingSignal(t, serviceNames);
 }
 
 export type GoodFaithSignal = "action" | "help" | "presence" | "soft_intent" | "faq" | "contextual_ref" | "none";
