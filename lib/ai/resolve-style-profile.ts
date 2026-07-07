@@ -15,9 +15,14 @@
 import { createHash } from "crypto";
 import type { AISettings, AISettingsEmojiUsage, AISettingsResponseLength } from "@/types/database";
 import { PERSONA_PRESETS } from "./persona-presets";
+import type { PersonaPack } from "./persona-packs";
 import { emojiCapFor } from "./prompt-profile";
 
-export type StylePreset = "warm" | "professional" | "casual" | "premium" | "concise" | "custom" | "default";
+// Includes the two rich pack ids (Rev.3): when a pack is selected the resolved style IS the pack.
+export type StylePreset =
+  | "warm" | "professional" | "casual" | "premium" | "concise"
+  | "warm_casual" | "professional_elegant"
+  | "custom" | "default";
 export type RegisterLevel = "refined" | "formal" | "plain" | "casual";
 
 /** 1–5 style dimensions (1 = low, 5 = high). */
@@ -66,7 +71,10 @@ export interface PresetStyleDefault {
 // Structured vectors for the shipped presets (keys = persona-presets.ts ids). These are the DEFAULTS a
 // preset implies; the explicit emoji/length controls can still override them (recorded in `overrides`).
 // Vertical-neutral and STYLE-ONLY — they describe tone, never business behavior.
-export const PRESET_STYLE_DEFAULTS: Record<Exclude<StylePreset, "custom" | "default">, PresetStyleDefault> = {
+export const PRESET_STYLE_DEFAULTS: Record<
+  Exclude<StylePreset, "custom" | "default" | "warm_casual" | "professional_elegant">,
+  PresetStyleDefault
+> = {
   warm:         { formality: 3, warmth: 5, energy: 3, emoji: "low",  length: "medium", register: "plain"   }, // חמים ומזמין
   professional: { formality: 4, warmth: 3, energy: 2, emoji: "none", length: "medium", register: "formal"  }, // מקצועי ורגוע
   casual:       { formality: 2, warmth: 4, energy: 4, emoji: "low",  length: "medium", register: "casual"  }, // צעיר וקליל
@@ -110,7 +118,11 @@ export function resolveStyleProfile(
 ): ResolvedStyleProfile {
   const customInstructions = ai?.custom_instructions?.trim() || null;
   const preset = detectPreset(customInstructions);
-  const def = preset === "custom" || preset === "default" ? NEUTRAL_DEFAULT : PRESET_STYLE_DEFAULTS[preset];
+  // detectPreset only ever returns a legacy preset id or custom/default; the `in` guard keeps TS happy
+  // now that StylePreset also includes the rich-pack ids (which never flow through this custom path).
+  const def = preset in PRESET_STYLE_DEFAULTS
+    ? PRESET_STYLE_DEFAULTS[preset as keyof typeof PRESET_STYLE_DEFAULTS]
+    : NEUTRAL_DEFAULT;
 
   const emojiUsage = VALID_EMOJI.includes(ai?.emoji_usage as AISettingsEmojiUsage)
     ? (ai!.emoji_usage as AISettingsEmojiUsage)
@@ -156,6 +168,34 @@ export function resolveStyleProfile(
     styleNotes,
     overrides,
     warnings,
+  };
+  return { ...profile, resolvedHash: hashResolvedStyle(profile) };
+}
+
+/**
+ * Resolves a rich persona PACK into a ResolvedStyleProfile (Rev.3). The pack — not custom_instructions —
+ * is authoritative: preset = pack id, vector/register/emoji/length from the pack. styleNotes stays null
+ * (the pack's voiceText is rendered separately by persona.ts). PURE.
+ */
+export function resolvePackStyle(pack: PersonaPack): ResolvedStyleProfile {
+  const vector: StyleVector = {
+    formality: pack.styleVector.formality,
+    warmth: pack.styleVector.warmth,
+    energy: pack.styleVector.energy,
+    brevity: brevityForLength(pack.defaults.responseLength),
+  };
+  const profile: Omit<ResolvedStyleProfile, "resolvedHash"> = {
+    preset: pack.id,
+    vector,
+    emojiUsage: pack.defaults.emojiUsage,
+    emojiCap: emojiCapFor(pack.defaults.emojiUsage),
+    responseLength: pack.defaults.responseLength,
+    register: pack.register,
+    addressing: "neutral",
+    language: "he",
+    styleNotes: null,
+    overrides: { emoji: false, length: false },
+    warnings: [],
   };
   return { ...profile, resolvedHash: hashResolvedStyle(profile) };
 }

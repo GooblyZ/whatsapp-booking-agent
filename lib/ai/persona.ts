@@ -17,7 +17,8 @@ import type { Capabilities } from "./facts";
 import { todayInTZ } from "@/lib/booking/availability";
 import { dayNameHe } from "./booking-session";
 import { buildPromptProfile, type PromptProfile } from "./prompt-profile";
-import { resolveStyleProfile, type ResolvedStyleProfile } from "./resolve-style-profile";
+import { resolveStyleProfile, resolvePackStyle, type ResolvedStyleProfile } from "./resolve-style-profile";
+import { getPersonaPack } from "./persona-packs";
 
 export interface PersonaInput {
   factsBlock: string;
@@ -78,6 +79,10 @@ function effectivePersonality(ai: BusinessAIContext["aiSettings"]): string | und
  *  SAME legacy personality fallback chain the prompt renders, so the resolved style (and the
  *  styleHash logged per turn) always describes the character text Gemini actually sees. PURE. */
 export function resolveStyleForSettings(ai: BusinessAIContext["aiSettings"]): ResolvedStyleProfile {
+  // Rev.3: a selected rich pack is authoritative — resolve its structured style. Custom (default) keeps
+  // the exact legacy chain (custom_instructions → persona_voice → tone), so no existing tenant changes.
+  const pack = getPersonaPack(ai?.persona_pack);
+  if (pack) return resolvePackStyle(pack);
   return resolveStyleProfile({ ...(ai ?? {}), custom_instructions: effectivePersonality(ai) ?? null });
 }
 
@@ -129,20 +134,23 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
   const profile = p.profile ?? buildPromptProfile(ai, ctx.business.id);
   const language = profile.language;
   const name = profile.assistantName;
-  // PERSONALITY — ONE natural-language description is the entire voice authority.
-  // The owner describes the receptionist in their own words; this scaffold turns
-  // that into behavior. The profile's customInstructions is the primary source; the
-  // back-compat fallbacks (persona_voice pre-009, retired tone preset) live in
-  // effectivePersonality so the brain's style resolution uses the SAME chain.
-  const personality = profile.customInstructions || effectivePersonality(ai);
+  // Rev.3: a selected rich pack (Warm & Casual / Professional & Elegant) is the voice authority — its
+  // structured voiceText + rules render below. "custom" (default) keeps the EXACT legacy chain, so no
+  // existing tenant changes and the default prompt shell stays byte-identical.
+  const pack = getPersonaPack(profile.personaPack);
+  // PERSONALITY — for Custom, ONE natural-language description is the entire voice authority (owner's
+  // words → behavior; back-compat fallbacks live in effectivePersonality). For a rich pack, the pack's
+  // voiceText is the character.
+  const personality = pack ? pack.voiceText : (profile.customInstructions || effectivePersonality(ai));
   // Phase B2: the resolved presentation-style profile (structured preset vector). Passed in by the
   // brain (which logs its styleHash); self-resolved for script callers via the same chain.
   const style = p.styleProfile ?? resolveStyleForSettings(ai);
   // Structured reinforcement — ONLY when the owner's text is a recognized (unedited) preset: the
   // resolver's vector restates the character numerically. An edited/own description gets no derived
   // line (the text itself is the authority, and §53.A's only-delta property stays clean).
-  const voiceTargets =
-    style.preset !== "custom" && style.preset !== "default"
+  const voiceTargets = pack
+    ? `Voice targets: formality ${pack.styleVector.formality}/5 · warmth ${pack.styleVector.warmth}/5 · energy ${pack.styleVector.energy}/5 · register: ${pack.register}.`
+    : style.preset !== "custom" && style.preset !== "default"
       ? `Voice targets: formality ${style.vector.formality}/5 · warmth ${style.vector.warmth}/5 · energy ${style.vector.energy}/5 · register: ${style.register}.`
       : ``;
   // Assistant SELF-reference gender (Hebrew is gendered); default neutral. This is
@@ -212,9 +220,14 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     `=== WHO YOU ARE & HOW YOU WRITE (owner style — presentation ONLY; every rule below outranks it) ===`,
     personality
       ? [
-          `Your character, in the owner's own words — live it in EVERY reply through behavior, never as a sprinkled catch-word:`,
+          pack
+            ? `Your character — live it in EVERY reply through behavior, never as a sprinkled catch-word:`
+            : `Your character, in the owner's own words — live it in EVERY reply through behavior, never as a sprinkled catch-word:`,
           `"${personality}"`,
           ...(voiceTargets ? [voiceTargets] : []),
+          // Rev.3 rich-pack STYLE lines (rendered ONLY when a pack is selected — the Custom shell stays
+          // byte-identical). Bounded per the Gate-A token budget: emoji policy + a few persona rules.
+          ...(pack ? [`Emoji: ${pack.emoji.guidance}`, ...pack.promptRules.map((r) => `• ${r}`)] : []),
           // VOICE-COMMITMENT ANCHOR (Slice 2) — kept VERBATIM: a positive, STYLE-SCOPED nudge so the
           // owner persona is actually felt on the Gemini path, without forcing greetings/sign-offs or
           // inflating length. Persona-present only.

@@ -402,7 +402,15 @@ CREATE TABLE IF NOT EXISTS ai_settings (
     CHECK (emoji_usage IN ('none', 'low', 'medium')),
   language            TEXT NOT NULL DEFAULT 'en',
 
-  -- PERSONALITY: ONE natural-language description is the entire voice authority.
+  -- PERSONA SELECTION (migration 013). 'custom' (default) = advanced settings below drive the voice,
+  -- exactly as before. A rich pack id → lib/ai/persona-packs.ts is authoritative for voice/style/emoji.
+  -- Existing rows backfill to 'custom' (behavior-preserving). custom_base_pack_id is UI/audit only.
+  persona_pack        TEXT NOT NULL DEFAULT 'custom'
+    CHECK (persona_pack IN ('warm_casual', 'professional_elegant', 'custom')),
+  custom_base_pack_id TEXT
+    CHECK (custom_base_pack_id IN ('warm_casual', 'professional_elegant')),
+
+  -- PERSONALITY: ONE natural-language description is the entire voice authority (Custom mode).
   -- The owner describes the receptionist; the persona scaffold translates it into
   -- behavior. Loses only to format limits (length/emoji) and to things_to_avoid.
   custom_instructions TEXT,

@@ -14,13 +14,18 @@
 
 import { createHash } from "crypto";
 import type { AISettings, AISettingsGender, AISettingsResponseLength, AISettingsEmojiUsage } from "@/types/database";
+import { getPersonaPack, type PersonaSelection } from "./persona-packs";
 
 export interface PromptProfile {
   assistantName: string;
   assistantGender: AISettingsGender;           // "male" | "female" | "neutral"
+  /** Which persona the business selected. "custom" → advanced settings below drive the voice (default,
+   *  behavior-preserving); a rich pack id → lib/ai/persona-packs.ts is authoritative for voice/style/emoji. */
+  personaPack: PersonaSelection;
   responseLength: AISettingsResponseLength;    // "short" | "medium" | "long"
-  emojiUsage: AISettingsEmojiUsage;            // "none" | "low" | "medium"
-  /** Max emojis allowed in an outbound message (none=0, low=1, medium=2). */
+  emojiUsage: AISettingsEmojiUsage;            // effective: a rich pack's default overrides the raw setting
+  /** Max emojis allowed in an outbound message in NORMAL context (none=0, low=1, medium=2). Under
+   *  serious/guard context the chokepoint may lower this to the pack's guardCap — see the restraint step. */
   emojiCap: number;
   customInstructions: string | null;           // style input only — never a hard behavior override
   thingsToAvoid: string[];                      // normalized owner "avoid" phrases (forbidden-phrase fence)
@@ -61,17 +66,27 @@ export function buildPromptProfile(ai: Partial<AISettings> | null | undefined, b
   const assistantName = ai?.assistant_name?.trim() || DEFAULT_NAME;
   const assistantGender = GENDERS.includes(ai?.assistant_gender as AISettingsGender)
     ? (ai!.assistant_gender as AISettingsGender) : DEFAULT_GENDER;
-  const responseLength = LENGTHS.includes(ai?.response_length as AISettingsResponseLength)
-    ? (ai!.response_length as AISettingsResponseLength) : DEFAULT_LENGTH;
-  const emojiUsage = EMOJIS.includes(ai?.emoji_usage as AISettingsEmojiUsage)
-    ? (ai!.emoji_usage as AISettingsEmojiUsage) : DEFAULT_EMOJI;
+  // Persona selection (migration 013). Unknown/missing → "custom" (behavior-preserving). A rich pack is
+  // AUTHORITATIVE for presentation STYLE (emoji + length); Custom keeps the raw owner settings exactly.
+  const personaPack: PersonaSelection =
+    ai?.persona_pack === "warm_casual" || ai?.persona_pack === "professional_elegant" ? ai.persona_pack : "custom";
+  const pack = getPersonaPack(personaPack);
+
+  const responseLength = pack
+    ? pack.defaults.responseLength
+    : LENGTHS.includes(ai?.response_length as AISettingsResponseLength)
+      ? (ai!.response_length as AISettingsResponseLength) : DEFAULT_LENGTH;
+  const emojiUsage = pack
+    ? pack.defaults.emojiUsage
+    : EMOJIS.includes(ai?.emoji_usage as AISettingsEmojiUsage)
+      ? (ai!.emoji_usage as AISettingsEmojiUsage) : DEFAULT_EMOJI;
   const customInstructions = ai?.custom_instructions?.trim() || null;
   const thingsToAvoid = parseThingsToAvoid(ai?.things_to_avoid);
   const language = ai?.language?.trim() || DEFAULT_LANGUAGE;
   const settingsVersion = (typeof ai?.updated_at === "string" && ai.updated_at) || null;
 
   const profile: Omit<PromptProfile, "promptProfileHash"> = {
-    assistantName, assistantGender, responseLength, emojiUsage,
+    assistantName, assistantGender, personaPack, responseLength, emojiUsage,
     emojiCap: emojiCapFor(emojiUsage),
     customInstructions, thingsToAvoid, language, settingsVersion,
   };
@@ -89,6 +104,7 @@ export function hashProfile(p: Omit<PromptProfile, "promptProfileHash">, busines
     businessId ?? "",
     p.assistantName,
     p.assistantGender,
+    p.personaPack,
     p.responseLength,
     p.emojiUsage,
     p.customInstructions ?? "",

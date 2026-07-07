@@ -185,6 +185,10 @@ export type AISettingsResponseLength = "short" | "medium" | "long";
 export type AISettingsEmojiUsage = "none" | "low" | "medium";
 /** Assistant's own grammatical gender for Hebrew self-reference. Default neutral. */
 export type AISettingsGender = "neutral" | "female" | "male";
+/** Predefined persona selection (Rev.3). "custom" = advanced settings drive the voice (today's path);
+ *  a rich pack id = the structured pack in lib/ai/persona-packs.ts is authoritative for voice/style/emoji.
+ *  Migration 013; older rows without the column are treated as "custom" (behavior-preserving). */
+export type AISettingsPersonaPack = "warm_casual" | "professional_elegant" | "custom";
 
 export interface AISettings {
   id: string;
@@ -197,7 +201,14 @@ export interface AISettings {
   response_length: AISettingsResponseLength;
   emoji_usage: AISettingsEmojiUsage;
   language: string;
-  // PERSONALITY — ONE natural-language description is the entire voice authority.
+  // PERSONA SELECTION (migration 013). "custom" (default) → advanced settings below drive the voice
+  // exactly as before. A rich pack id → lib/ai/persona-packs.ts is authoritative for voice/style/emoji.
+  // Optional until the migration is applied; absent → treated as "custom".
+  persona_pack?: AISettingsPersonaPack;
+  /** UI/AUDIT ONLY — which rich pack a Custom persona was seeded from ("Start from a pack"). Never a
+   *  behavioral authority (persona_pack decides that). Null for from-scratch Custom / rich packs. */
+  custom_base_pack_id?: AISettingsPersonaPack | null;
+  // PERSONALITY — ONE natural-language description is the entire voice authority (Custom mode).
   // The owner describes the receptionist; the persona scaffold translates it into
   // behavior. No competing personality control, so precedence is never ambiguous.
   custom_instructions: string | null;

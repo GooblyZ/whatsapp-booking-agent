@@ -27,13 +27,29 @@ export function formatOutboundTrace(t: OutboundTrace): string {
 }
 
 // The owner-settings columns the chokepoint needs to build the PromptProfile. One read, fail-open.
-const PROFILE_COLUMNS =
+// PROFILE_COLUMNS_BASE is the pre-013 set; PROFILE_COLUMNS adds persona_pack. We try the full set and,
+// on a "column not found" rejection (migration 013 not applied yet), retry with the base set — so an
+// un-migrated DB keeps ALL its existing fences (name/gender/emoji) instead of silently falling back to
+// product defaults. persona_pack absent → buildPromptProfile treats it as "custom" (prior behavior).
+const PROFILE_COLUMNS_BASE =
   "assistant_name, assistant_gender, response_length, emoji_usage, custom_instructions, things_to_avoid, language, updated_at";
+const PROFILE_COLUMNS = `assistant_name, assistant_gender, persona_pack, response_length, emoji_usage, custom_instructions, things_to_avoid, language, updated_at`;
+
+/** True for a Postgres/PostgREST "unknown column" rejection (a not-yet-applied migration). */
+function isMissingColumnError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  if (error.code === "PGRST204" || error.code === "42703") return true;
+  const msg = error.message ?? "";
+  return /column/i.test(msg) && /(schema cache|does not exist)/i.test(msg);
+}
 
 /** Reads ai_settings and builds the normalized owner PromptProfile (a missing row → safe defaults). */
 async function loadProfile(db: DB, businessId: string): Promise<PromptProfile> {
-  const { data } = await db.from("ai_settings").select(PROFILE_COLUMNS).eq("business_id", businessId).maybeSingle();
-  return buildPromptProfile(data as Partial<AISettings> | null, businessId);
+  let res = await db.from("ai_settings").select(PROFILE_COLUMNS).eq("business_id", businessId).maybeSingle();
+  if (isMissingColumnError(res.error)) {
+    res = await db.from("ai_settings").select(PROFILE_COLUMNS_BASE).eq("business_id", businessId).maybeSingle();
+  }
+  return buildPromptProfile(res.data as Partial<AISettings> | null, businessId);
 }
 
 /** Assistant SELF-gender enforcement: male/female rewrite, or neutral-voice avoidance. */
@@ -117,7 +133,7 @@ async function auditOutbound(db: DB, businessId: string, customerId: string, toP
 function logProfile(businessId: string, profile: PromptProfile, where: string): void {
   console.log(
     `[outbound] ${where} business=${businessId} profileHash=${profile.promptProfileHash}` +
-    ` settingsVersion=${profile.settingsVersion ?? "-"} gender=${profile.assistantGender}` +
+    ` settingsVersion=${profile.settingsVersion ?? "-"} persona=${profile.personaPack} gender=${profile.assistantGender}` +
     ` emoji=${profile.emojiUsage}(cap${profile.emojiCap}) length=${profile.responseLength}`
   );
 }

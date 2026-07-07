@@ -4,6 +4,7 @@ import type {
   AISettingsResponseLength,
   AISettingsEmojiUsage,
   AISettingsGender,
+  AISettingsPersonaPack,
 } from "@/types/database";
 
 export async function getAISettings(businessId: string): Promise<AISettings | null> {
@@ -17,6 +18,10 @@ export async function getAISettings(businessId: string): Promise<AISettings | nu
 }
 
 export interface UpdateAISettingsInput {
+  // PERSONA SELECTION (migration 013). "custom" (default) → advanced settings drive the voice; a rich
+  // pack id → lib/ai/persona-packs.ts is authoritative. custom_base_pack_id is UI/audit metadata only.
+  persona_pack?: AISettingsPersonaPack;
+  custom_base_pack_id?: AISettingsPersonaPack | null;
   // IDENTITY
   assistant_name?: string;
   assistant_gender?: AISettingsGender;
