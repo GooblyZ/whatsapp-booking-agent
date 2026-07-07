@@ -15,8 +15,9 @@ import { getDefaultBusinessId } from "@/lib/config";
 import { supabaseServer } from "@/lib/supabase/server";
 import { getBusinessAIContext } from "@/lib/ai/context";
 import { runReceptionistTurn } from "@/lib/ai/brain";
-import { auditBusinessContext, buildFacts, formatFacts, type ContextAudit, type Capabilities } from "@/lib/ai/facts";
+import { auditBusinessContext, buildFacts, formatFacts, kbTierForMessage, type ContextAudit, type Capabilities } from "@/lib/ai/facts";
 import { buildReceptionistInstruction } from "@/lib/ai/persona";
+import { buildPromptProfile } from "@/lib/ai/prompt-profile";
 import {
   emptySession, probeMessage, mergeUnderstanding, missingFields, renderSession,
   type ServiceLite,
@@ -54,12 +55,24 @@ export interface AIDebugState {
   audit?: ContextAudit;
   factsPreview?: string;
   systemPrompt?: string;
+  // Persona observability (Gate D): the RESOLVED selection the runtime uses — a rich pack id makes the
+  // pack authoritative (its emoji/length override the raw columns); "custom" keeps the advanced settings.
+  personaPack?: string;           // "warm_casual" | "professional_elegant" | "custom"
+  personaMode?: string;           // "rich-pack" | "custom"
+  customBasePackId?: string | null; // UI/audit metadata only (which pack a Custom was seeded from)
+  // KB payload observability (Gate A): what the tiering ACTUALLY sends for THIS message.
+  kbTier?: string;                // "none" | "scoped" | "broad"
+  kbItemCount?: number;           // KB items in the facts block after tiering + cap
+  kbActiveCount?: number;         // total active KB items (contrast: how many were available)
+  factsChars?: number;            // char footprint of the FACTS block Gemini receives
+  factsTokensEst?: number;        // ~chars/4 token estimate (repo heuristic)
   appliedSettings?: {
     assistantName: string;
     gender: string;
     language: string;
     responseLength: string;
     emojiUsage: string;
+    emojiCap: number;
     hasCustomInstructions: boolean;
     aiEnabled: boolean;
     faqEnabled: boolean;
@@ -122,8 +135,16 @@ export async function runAIDebug(_prev: AIDebugState, formData: FormData): Promi
       newFields = merged.newFields;
     }
 
-    const facts = buildFacts(ctx);
+    // AI-Lab honesty: build facts WITH the message so Gate A KB tiering is exercised here exactly like the
+    // live runtime (the deterministic-menu path passes no message → full KB; the customer/AI path passes it).
+    const facts = buildFacts(ctx, { message });
+    const factsBlock = formatFacts(facts);
     const ai = ctx.aiSettings;
+    // The normalized profile the OUTBOUND chokepoint resolves — a rich persona_pack makes its emoji/length
+    // authoritative, so showing these (not the raw columns) is what actually gets enforced.
+    const profile = buildPromptProfile(ai ?? null, businessId);
+    const kbTier = kbTierForMessage(message, services.map((s) => s.name));
+    const activeKbCount = ctx.knowledgeBaseItems.filter((k) => k.active).length;
     const caps: Capabilities = {
       canAnswer: ai?.faq_enabled !== false,
       canStartBooking: ai?.intent_detection_enabled !== false && facts.bookingEnabled,
@@ -172,9 +193,17 @@ export async function runAIDebug(_prev: AIDebugState, formData: FormData): Promi
         : "(Gemini לא נקרא — הוחלט לפי כללים דטרמיניסטיים)",
       reply: d.replyText,
       audit: auditBusinessContext(ctx),
-      factsPreview: formatFacts(facts),
+      factsPreview: factsBlock,
+      personaPack: profile.personaPack,
+      personaMode: profile.personaPack === "custom" ? "custom" : "rich-pack",
+      customBasePackId: ai?.custom_base_pack_id ?? null,
+      kbTier,
+      kbItemCount: facts.knowledge.length,
+      kbActiveCount: activeKbCount,
+      factsChars: factsBlock.length,
+      factsTokensEst: Math.ceil(factsBlock.length / 4),
       systemPrompt: buildReceptionistInstruction(ctx, {
-        factsBlock: formatFacts(facts),
+        factsBlock,
         caps,
         availabilityBlock: renderAvailabilityInfo(availability, pendingTimeNoDate),
         bookingBlock: renderSession(session0),
@@ -184,11 +213,13 @@ export async function runAIDebug(_prev: AIDebugState, formData: FormData): Promi
         platformMode: true,
       }),
       appliedSettings: {
-        assistantName: ai?.assistant_name?.trim() || "Assistant",
-        gender: ai?.assistant_gender || "neutral",
-        language: ai?.language?.trim() || "he",
-        responseLength: ai?.response_length || "medium",
-        emojiUsage: ai?.emoji_usage || "low",
+        // RESOLVED profile values (a rich pack overrides emoji/length) — the truth the chokepoint enforces.
+        assistantName: profile.assistantName,
+        gender: profile.assistantGender,
+        language: profile.language,
+        responseLength: profile.responseLength,
+        emojiUsage: profile.emojiUsage,
+        emojiCap: profile.emojiCap,
         hasCustomInstructions: !!ai?.custom_instructions?.trim(),
         aiEnabled: ai?.ai_enabled !== false,
         faqEnabled: ai?.faq_enabled !== false,

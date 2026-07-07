@@ -207,6 +207,7 @@ export function AIDebugForm() {
                 <div>מין הדמות: <strong>{state.appliedSettings.gender}</strong></div>
                 <div>אורך: <strong>{state.appliedSettings.responseLength}</strong></div>
                 <div>אמוג&#39;י: <strong>{state.appliedSettings.emojiUsage}</strong></div>
+                <div>מגבלת אמוג&#39;י (cap): <strong>{state.appliedSettings.emojiCap}</strong></div>
                 <div>הוראות מיוחדות: <strong>{state.appliedSettings.hasCustomInstructions ? "כן" : "לא"}</strong></div>
                 <div>AI פעיל: <strong>{state.appliedSettings.aiEnabled ? "כן" : "לא"}</strong></div>
                 <div>FAQ: <strong>{state.appliedSettings.faqEnabled ? "כן" : "לא"}</strong></div>
@@ -219,6 +220,34 @@ export function AIDebugForm() {
               )}
             </div>
           )}
+
+          {/* Persona pack + KB payload observability (Gate A/D) */}
+          <div style={box}>
+            <div style={{ ...labelStyle, marginBottom: "6px" }}>פרסונה ומטען ה‑KB (Gate A/D)</div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                gap: "8px",
+                fontSize: "13px",
+              }}
+            >
+              <div>ערכת פרסונה: <strong>{state.personaPack ?? "—"}</strong></div>
+              <div>מצב סמכות: <strong>{state.personaMode === "rich-pack" ? "ערכה (סמכותית)" : state.personaMode === "custom" ? "מותאם אישית" : "—"}</strong></div>
+              <div>נגזר מערכה (מטא): <strong>{state.customBasePackId ?? "—"}</strong></div>
+              <div>KB tier: <strong>{state.kbTier ?? "—"}</strong></div>
+              <div>
+                פריטי KB שנשלחו: <strong>{state.kbItemCount ?? "—"}{typeof state.kbActiveCount === "number" ? ` / ${state.kbActiveCount}` : ""}</strong>
+              </div>
+              <div>
+                מטען עובדות: <strong>{typeof state.factsChars === "number" ? `${state.factsChars} תווים ≈ ${state.factsTokensEst} טוקן` : "—"}</strong>
+              </div>
+            </div>
+            <div style={{ fontSize: "12px", color: "#888", marginTop: "8px", lineHeight: 1.5 }}>
+              KB tier נגזר מההודעה (none = ללא KB · scoped = קטגוריה יחידה · broad = KB מלא). ערכת הפרסונה נקראת מ‑
+              <code>ai_settings.persona_pack</code> (דורש מיגרציה 013); &quot;custom&quot; = התנהגות קיימת ללא ערכה.
+            </div>
+          </div>
 
           {/* Final customer-facing reply */}
           <div style={box}>
