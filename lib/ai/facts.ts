@@ -13,6 +13,9 @@
 import type { BusinessAIContext } from "@/types/database";
 import { DAY_NAMES } from "@/lib/services/business-hours";
 import { detectInfoTopic, type InfoTopic } from "./continuity-menu"; // type-only there → no runtime cycle
+import {
+  classifyKbNeed, messageNamesService, isBookingImperative, isNonInfoAck, type KbTier,
+} from "./kb-relevance";
 
 const MAX_KB_ITEM_CHARS = 400;
 const MAX_KB_ITEMS = 25;
@@ -45,6 +48,24 @@ export function scopeKnowledge<T extends { category: string; content: string }>(
   const kept = items.filter((k) => ALWAYS_KEEP_KB_CATEGORIES.has(k.category) || k.category === cat);
   if (kept.length === 0 || kept.length === items.length) return { kept: items, scoped: false }; // no real shrink → full
   return { kept, scoped: true };
+}
+
+// ── KB RELEVANCE TIER (Gate A) ───────────────────────────────────────────────────
+// Decides how much KB a Gemini-bound turn actually needs (see lib/ai/kb-relevance.ts). The pure classifier
+// lives there; here we supply the one signal it can't compute without imports — whether the message maps to
+// a SCOPABLE KB topic (parking/policy/contact/about). CONSERVATIVE: any info shape/topic keeps KB; only a
+// high-confidence non-info turn (pure link/ack/greeting, or booking with a known service and no question)
+// returns "none". Fail-open: a blank/odd message → "broad" via the classifier's default.
+export function kbTierForMessage(message: string, serviceNames: string[]): KbTier {
+  const topic = detectInfoTopic(message ?? "");
+  const scopableCat = topic ? TOPIC_KB_CATEGORY[topic] : undefined;
+  return classifyKbNeed({
+    message: message ?? "",
+    serviceKnown: messageNamesService(message ?? "", serviceNames),
+    bookingImperative: isBookingImperative(message ?? ""),
+    nonInfoAck: isNonInfoAck(message ?? ""),
+    infoTopicRecognized: scopableCat != null,
+  });
 }
 
 export interface BusinessFacts {
@@ -92,9 +113,13 @@ export function buildFacts(ctx: BusinessAIContext, opts: { message?: string } = 
     }));
 
   const activeKb = ctx.knowledgeBaseItems.filter((k) => k.active);
-  // Scope only on the AI path (opts.message present); the deterministic menu passes no message → full KB.
-  const scopedKb = opts.message ? scopeKnowledge(activeKb, opts.message).kept : activeKb;
-  const knowledge = scopedKb
+  // KB RELEVANCE (Gate A): on the AI path (opts.message present) send only the KB the turn needs — "none"
+  // for high-confidence non-info turns, "scoped" for a single recognized info topic, else "broad" (full)
+  // and on any doubt. The deterministic-menu path (no message) keeps the FULL KB, exactly as before.
+  const kbTier: KbTier = opts.message ? kbTierForMessage(opts.message, services.map((s) => s.name)) : "broad";
+  const tieredKb =
+    kbTier === "none" ? [] : kbTier === "scoped" ? scopeKnowledge(activeKb, opts.message ?? "").kept : activeKb;
+  const knowledge = tieredKb
     .sort((a, z) => (a.category === "about" ? -1 : 0) - (z.category === "about" ? -1 : 0))
     .slice(0, MAX_KB_ITEMS)
     .map((k) => ({

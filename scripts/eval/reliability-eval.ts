@@ -111,7 +111,8 @@ import { saveOutboundMessage, buildOutboundRow, isMissingColumnError } from "../
 import { buildHistoryTurns, DEFLECTED_REASONS, OFF_TOPIC_REASON, type ConversationContext } from "../../lib/ai/conversation";
 import { FALLBACK, isLowValueAck, type ReceptionistTurn, type ReceptionistDecision } from "../../lib/ai/brain";
 import type { DB } from "../../lib/booking/helpers";
-import { buildFacts, formatFacts, scopeKnowledge, type FactIndex, type BusinessFacts, type Capabilities } from "../../lib/ai/facts";
+import { buildFacts, formatFacts, scopeKnowledge, kbTierForMessage, type FactIndex, type BusinessFacts, type Capabilities } from "../../lib/ai/facts";
+import { classifyKbNeed, hasInfoQuestionShape, isNonInfoAck, isBookingImperative, messageNamesService } from "../../lib/ai/kb-relevance";
 
 // ── tiny harness ────────────────────────────────────────────────────────────────
 let pass = 0;
@@ -5101,6 +5102,110 @@ async function main(): Promise<void> {
     check("§68 INV-2 E2E no-regression: uncovered policy still defers (class F), never invents an amenity",
       !(unknown.outcome.replyText ?? "").includes("פינת עישון"), `reply="${unknown.outcome.replyText}"`);
   })();
+
+  // ── 69. KB Relevance (Gate A) — kbTierForMessage + buildFacts tiering + token/payload ─────────────
+  // Conservative 3-tier KB injection: "none" ONLY for high-confidence non-info turns; any info shape/topic
+  // keeps KB (scoped/broad); any doubt → broad. Structured facts (services/hours/address) are ALWAYS sent,
+  // so grounding is never weakened. platform-turn.ts is NOT involved — this is facts.ts-only.
+  section("69. KB Relevance (Gate A)");
+  {
+    // A realistic, heavy KB across categories (structured facts are separate and always present).
+    const KB69: Array<{ category: string; title: string; content: string }> = [
+      { category: "about",   title: "על העסק",       content: "אנחנו עסק ותיק עם צוות מנוסה ויחס אישי חם. ".repeat(9) },
+      { category: "faq",     title: "שאלות נפוצות",   content: "אפשר לשלם במזומן, אשראי או ביט. מומלץ להגיע כמה דקות לפני. ".repeat(7) },
+      { category: "pricing", title: "מחירים",         content: "המחירים מתעדכנים מעת לעת; יש חבילות והטבות לחיילים ולסטודנטים. ".repeat(7) },
+      { category: "parking", title: "חניה",           content: "יש חניון ציבורי בתשלום במרחק דקה, וכן חניה כחול-לבן ברחוב. ".repeat(7) },
+      { category: "policy",  title: "מדיניות ביטול",  content: "ביטול עד 24 שעות מראש ללא חיוב; ביטול מאוחר עשוי לחייב דמי ביטול. ".repeat(7) },
+      { category: "contact", title: "יצירת קשר",      content: "אפשר להתקשר או לשלוח הודעה בשעות הפעילות. ".repeat(6) },
+    ];
+    const ctx69 = harnessCtx({}, KB69);
+    const tier = (m: string) => kbTierForMessage(m, SERVICES);
+    const kbCount = (m: string) => buildFacts(ctx69, { message: m }).knowledge.length;
+    const fullKbCount = buildFacts(ctx69).knowledge.length; // no message → full-KB baseline
+
+    // (1) INFO turns MUST keep KB (never "none") — the required cases.
+    check("§69 info: 'רוצה תספורת, כמה עולה?' (mixed booking+price) → not none, KB kept",
+      tier("רוצה תספורת, כמה עולה?") !== "none" && kbCount("רוצה תספורת, כמה עולה?") > 0);
+    check("§69 info: 'כמה עולה החלקה?' → not none, KB kept",
+      tier("כמה עולה החלקה?") !== "none" && kbCount("כמה עולה החלקה?") > 0);
+    check("§69 info: 'מה השירותים שלכם?' → not none (broad/scoped), KB kept",
+      tier("מה השירותים שלכם?") !== "none" && kbCount("מה השירותים שלכם?") > 0);
+    check("§69 info: 'כמה זמן זה לוקח?' → not none, KB kept",
+      tier("כמה זמן זה לוקח?") !== "none" && kbCount("כמה זמן זה לוקח?") > 0);
+    check("§69 info: 'זה מתאים למתחילים?' (suitability) → not none, KB kept",
+      tier("זה מתאים למתחילים?") !== "none" && kbCount("זה מתאים למתחילים?") > 0);
+    check("§69 info: 'מה מדיניות הביטול?' → scoped (policy topic), KB kept",
+      tier("מה מדיניות הביטול?") === "scoped" && kbCount("מה מדיניות הביטול?") > 0);
+    check("§69 info: scoped policy question TRIMS a large KB (keeps about/faq/policy, fewer than full)",
+      kbCount("מה מדיניות הביטול?") > 0 && kbCount("מה מדיניות הביטול?") < fullKbCount);
+    check("§69 info: ambiguous business question 'ספרו לי קצת על המקום' → not none",
+      tier("ספרו לי קצת על המקום") !== "none");
+
+    // (2) HIGH-CONFIDENCE non-info turns → "none" (KB dropped) — the required cases.
+    check("§69 none: 'אני רוצה לקבוע תור לתספורת' (booking + KNOWN service, no info) → none, 0 KB",
+      tier("אני רוצה לקבוע תור לתספורת") === "none" && kbCount("אני רוצה לקבוע תור לתספורת") === 0);
+    check("§69 none: 'שלח קישור' (link resend) → none, 0 KB",
+      tier("שלח קישור") === "none" && kbCount("שלח קישור") === 0);
+    check("§69 none: acks 'אש' / 'סבבה' / 'תודה' → none",
+      tier("אש") === "none" && tier("סבבה") === "none" && tier("תודה") === "none");
+    check("§69 none: bare greeting 'היי' → none",
+      tier("היי") === "none");
+
+    // (3) CONSERVATIVE fallback — any doubt keeps KB (never starve).
+    check("§69 fallback: 'אני רוצה לקבוע תור' (booking, NO known service) → not none (discovery may need KB)",
+      tier("אני רוצה לקבוע תור") !== "none");
+    check("§69 fallback: bare service word 'תספורת' (no booking verb, no question) → not none",
+      tier("תספורת") !== "none");
+    check("§69 fallback: name-game with '?' ('איך קוראים לי?') → not none (a '?' is treated as doubt → keep KB)",
+      tier("איך קוראים לי?") !== "none");
+
+    // (4) PURE helper coverage.
+    check("§69 pure: hasInfoQuestionShape catches '?' and info cues; a plain booking has neither",
+      hasInfoQuestionShape("כמה עולה?") && hasInfoQuestionShape("מדיניות ביטול") && !hasInfoQuestionShape("אני רוצה לקבוע תור לתספורת"));
+    check("§69 pure: isNonInfoAck catches link/ack/greeting, not an info question",
+      isNonInfoAck("שלח קישור") && isNonInfoAck("אש") && isNonInfoAck("היי") && !isNonInfoAck("כמה עולה?"));
+    check("§69 pure: isBookingImperative + messageNamesService detect a known-service booking",
+      isBookingImperative("אני רוצה לקבוע תור לתספורת") && messageNamesService("אני רוצה לקבוע תור לתספורת", SERVICES));
+    check("§69 pure: classifyKbNeed — INFO wins over a booking imperative (mixed) → not none",
+      classifyKbNeed({ message: "רוצה לקבוע תספורת, כמה עולה?", serviceKnown: true, bookingImperative: true, nonInfoAck: false, infoTopicRecognized: false }) === "broad");
+    check("§69 pure: classifyKbNeed — booking imperative WITHOUT known service → broad (not none)",
+      classifyKbNeed({ message: "אני רוצה לקבוע תור", serviceKnown: false, bookingImperative: true, nonInfoAck: false, infoTopicRecognized: false }) === "broad");
+
+    // (5) GROUNDING NOT WEAKENED — structured facts always present, even on a "none" turn.
+    check("§69 grounding: structured facts (services + 'Services:' header) present even on a 'none' turn",
+      (() => {
+        const block = formatFacts(buildFacts(ctx69, { message: "אני רוצה לקבוע תור לתספורת" }));
+        return block.includes("תספורת") && block.includes("Services:");
+      })());
+
+    // (6) TOKEN / PAYLOAD before/after (report + assertions). "before" = full KB (pre-Gate-A behavior).
+    const beforeFacts = formatFacts(buildFacts(ctx69)); // full KB (same for every message before Gate A)
+    const beforeTok = estimateTokens(beforeFacts.length);
+    const samples: Array<[string, string]> = [
+      ["greeting/social opener", "היי"],
+      ["pure booking known service", "אני רוצה לקבוע תור לתספורת"],
+      ["mixed booking + price/info", "רוצה תספורת, כמה עולה?"],
+      ["open services question", "מה השירותים שלכם?"],
+      ["policy/parking/contact/about", "מה מדיניות הביטול?"],
+      ["link resend", "שלח קישור"],
+      ["name-game", "איך קוראים לי?"],
+    ];
+    console.log(`\n  [§69 KB payload] BEFORE (full KB): items=${fullKbCount} factsTok≈${beforeTok} (${beforeFacts.length} chars)`);
+    console.log(`  ${"turn type".padEnd(30)} ${"tier".padEnd(7)} ${"kb".padStart(2)} ${"factsTok".padStart(8)} ${"Δtok".padStart(6)}`);
+    for (const [label, msg] of samples) {
+      const t = tier(msg);
+      const afterFacts = formatFacts(buildFacts(ctx69, { message: msg }));
+      const tok = estimateTokens(afterFacts.length);
+      const dtok = tok - beforeTok;
+      console.log(`  ${label.padEnd(30)} ${t.padEnd(7)} ${String(kbCount(msg)).padStart(2)} ${String(tok).padStart(8)} ${(dtok > 0 ? "+" : "") + dtok}`.padEnd(4));
+    }
+    check("§69 payload: greeting + pure-booking + link-resend drop KB to 0 items",
+      kbCount("היי") === 0 && kbCount("אני רוצה לקבוע תור לתספורת") === 0 && kbCount("שלח קישור") === 0);
+    check("§69 payload: info turns keep KB (price / services / policy all > 0 items)",
+      kbCount("רוצה תספורת, כמה עולה?") > 0 && kbCount("מה השירותים שלכם?") > 0 && kbCount("מה מדיניות הביטול?") > 0);
+    check("§69 payload: a 'none' turn's facts block is meaningfully smaller than the full-KB baseline",
+      formatFacts(buildFacts(ctx69, { message: "היי" })).length < beforeFacts.length);
+  }
 
   // ── summary ────────────────────────────────────────────────────────────────────
   console.log(`\n=== ${pass}/${pass + fail} deterministic checks passed${fail ? ` — ${fail} FAILED: ${failed.join(", ")}` : ""} ===`);
