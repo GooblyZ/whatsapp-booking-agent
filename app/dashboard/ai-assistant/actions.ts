@@ -7,6 +7,7 @@ import type {
   AISettingsResponseLength,
   AISettingsEmojiUsage,
   AISettingsGender,
+  AISettingsPersonaPack,
 } from "@/types/database";
 import { redirect } from "next/navigation";
 
@@ -24,6 +25,15 @@ function safeGender(raw: unknown): AISettingsGender {
   return GENDERS.includes(raw as AISettingsGender) ? (raw as AISettingsGender) : "neutral";
 }
 
+const PERSONA_PACK_VALUES = ["warm_casual", "professional_elegant", "custom"] as const;
+function safePersonaPack(raw: unknown): AISettingsPersonaPack {
+  return PERSONA_PACK_VALUES.includes(raw as AISettingsPersonaPack) ? (raw as AISettingsPersonaPack) : "custom";
+}
+/** custom_base_pack_id is UI/audit metadata only — a rich pack id, or null (never "custom"). */
+function safeBasePack(raw: unknown): AISettingsPersonaPack | null {
+  return raw === "warm_casual" || raw === "professional_elegant" ? raw : null;
+}
+
 function cleanText(raw: unknown, max: number): string | null {
   const s = (raw as string | null)?.trim();
   return s && s.length ? s.slice(0, max) : null;
@@ -39,6 +49,11 @@ export async function saveAISettingsAction(formData: FormData) {
   // only the keys it receives). ai_enabled is the ONE field always written: the switch is always
   // enabled, and an unchecked checkbox is legitimately absent → false.
   const data: UpdateAISettingsInput = { ai_enabled: formData.get("ai_enabled") === "on" };
+  // PERSONA SELECTION — authority. Present unless the assistant is off (then preserved). A rich pack
+  // makes lib/ai/persona-packs.ts authoritative; "custom" keeps the free-text + advanced fields. This is
+  // exactly what the runtime reads (dashboard writes == runtime model).
+  if (formData.has("persona_pack"))        data.persona_pack        = safePersonaPack(formData.get("persona_pack"));
+  if (formData.has("custom_base_pack_id")) data.custom_base_pack_id = safeBasePack(formData.get("custom_base_pack_id"));
   // IDENTITY
   if (formData.has("assistant_name"))   data.assistant_name   = (formData.get("assistant_name") as string)?.trim() || "עוזר";
   if (formData.has("assistant_gender")) data.assistant_gender = safeGender(formData.get("assistant_gender"));

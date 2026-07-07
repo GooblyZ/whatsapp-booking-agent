@@ -1,33 +1,28 @@
 "use client";
 
 // app/dashboard/ai-assistant/PersonaFields.tsx
-// AI Settings v1 — "בוחרים איך העוזר מתנהג ומדבר": a master switch + style PACKAGES, not raw
-// prompt controls. Page structure (two conceptual areas, one single-save form):
+// AI Settings Gate D — persona chooser with UNAMBIGUOUS authority. A business picks one of three:
+//   • חם וקליל / מקצועי ואלגנטי (RICH packs) → the pack defines voice/style/emoji; advanced STYLE
+//     fields are hidden (pack-defined). Identity (name/gender/language) + guardrails stay editable.
+//   • מותאם אישית (Custom) → the free-text description + advanced settings define the voice.
+// "Start from a pack" is an edit-time SEEDING action: it copies a pack's defaults into the Custom
+// fields and sets persona_pack='custom' (custom_base_pack_id is UI/audit metadata only). There is NO
+// blended runtime state — the STORED persona_pack alone decides authority, matching the runtime.
 //
-//   אזור 1 · תפעול   — ONE master switch (העוזר פעיל). FAQ/intent are core behavior, not settings.
-//   אזור 2 · סגנון   — identity → style packages (5 presets + התאמה אישית) → style-at-a-glance →
-//                      advanced overrides (length/emoji/language, collapsed) → boundaries.
+// The retired 5 lightweight presets are no longer exposed as the primary chooser.
 //
-// Key mechanics:
-//   • TRUTHFUL SAVE STATES — every field is controlled; a snapshot of the loaded values drives an
-//     isDirty flag, so unsaved local edits can never masquerade as persisted ("עודכן עכשיו" yields
-//     to "יש שינויים שלא נשמרו"). Everything (incl. the master switch) is local-until-Save.
-//   • STRICT AI-OFF — when the LOCAL switch is off, every style control is `disabled` (values
-//     visible, dimmed, not editable); only the switch + Save stay active. Disabled fields are
-//     absent from FormData, and the save action writes ONLY present fields — so a save-while-off
-//     can never wipe style columns.
-//   • PACKAGES — a preset card applies text + its resolved length/emoji defaults TOGETHER; raw
-//     preset text is hidden behind a read-only collapsible. Custom mode is a first-class card
-//     (owner's words used as-is; ✨ enhance offered there only).
+// Mechanics preserved from v1: TRUTHFUL SAVE STATES (dirty snapshot), STRICT AI-OFF (disabled fields are
+// absent from FormData → the partial-payload action never wipes columns), single-save form.
 
 import { useEffect, useState, useTransition } from "react";
 import type { AISettings, AISettingsEmojiUsage, AISettingsResponseLength } from "@/types/database";
-import { PERSONA_PRESETS, type PersonaPreset } from "@/lib/ai/persona-presets";
+import { PERSONA_PRESETS } from "@/lib/ai/persona-presets";
+import { PERSONA_PACKS, getPersonaPack, type PersonaPackId, type PersonaSelection } from "@/lib/ai/persona-packs";
 import { flagsBusinessPolicy } from "./policy-lint";
 import { enhancePersonaAction } from "./actions";
 import { type PreviewPresetId, type StyleDimsData } from "./voice-preview";
 import { StylePanel } from "./StylePanel";
-import { PresetCards } from "./PresetCards";
+import { PersonaPackChooser } from "./PersonaPackChooser";
 
 type Gender = "neutral" | "female" | "male";
 
@@ -40,6 +35,9 @@ const LANGUAGES = [
   { code: "fr", label: "Français" },
 ] as const;
 
+const LENGTH_HE: Record<AISettingsResponseLength, string> = { short: "קצר", medium: "בינוני", long: "ארוך" };
+const EMOJI_HE: Record<AISettingsEmojiUsage, string> = { none: "ללא", low: "מועט", medium: "בינוני" };
+
 const inputStyle: React.CSSProperties = {
   width: "100%", padding: "8px", borderRadius: "4px", border: "1px solid #ccc",
   boxSizing: "border-box", fontSize: "14px",
@@ -47,8 +45,6 @@ const inputStyle: React.CSSProperties = {
 const fieldWrap: React.CSSProperties = { display: "flex", flexDirection: "column", gap: "4px" };
 const fieldLabel: React.CSSProperties = { fontWeight: 500, fontSize: "14px" };
 const hint: React.CSSProperties = { fontSize: "12px", color: "#888", lineHeight: "1.4" };
-// Each section reads as a distinct dashboard MODULE (card + shadow); hierarchy is typographic —
-// deliberately no emoji in headers.
 const fieldset: React.CSSProperties = {
   border: "1px solid #e2e8f0", borderRadius: "12px", padding: "18px 20px", margin: 0,
   display: "flex", flexDirection: "column", gap: "12px",
@@ -59,6 +55,8 @@ const legend: React.CSSProperties = { fontWeight: 700, fontSize: "15px", color: 
 /** All owner-editable values, snapshotted once from the loaded row to drive the dirty flag. */
 interface FieldsSnapshot {
   aiEnabled: boolean;
+  personaPack: PersonaSelection;
+  customBasePackId: PersonaPackId | null;
   assistantName: string;
   gender: Gender;
   personality: string;
@@ -68,9 +66,18 @@ interface FieldsSnapshot {
   language: string;
 }
 
+function normPack(v: string | null | undefined): PersonaSelection {
+  return v === "warm_casual" || v === "professional_elegant" || v === "custom" ? v : "custom";
+}
+function normBasePack(v: string | null | undefined): PersonaPackId | null {
+  return v === "warm_casual" || v === "professional_elegant" ? v : null;
+}
+
 function snapshotFrom(initial: AISettings | null): FieldsSnapshot {
   return {
     aiEnabled: initial?.ai_enabled !== false,
+    personaPack: normPack(initial?.persona_pack),
+    customBasePackId: normBasePack(initial?.custom_base_pack_id),
     assistantName: initial?.assistant_name ?? "עוזר",
     gender: (initial?.assistant_gender as Gender) ?? "neutral",
     // Back-compat: show a legacy persona_voice value if custom_instructions is empty.
@@ -90,11 +97,11 @@ export function PersonaFields({
   updatedAt: string | null;
   saved?: string;
 }) {
-  // Snapshot of the LOADED values (stable across re-renders) — the dirty-state baseline. After a
-  // successful save the page re-renders server-side with fresh props, so the baseline resets.
   const [snapshot] = useState<FieldsSnapshot>(() => snapshotFrom(initial));
 
   const [aiEnabled, setAiEnabled] = useState(snapshot.aiEnabled);
+  const [personaPack, setPersonaPack] = useState<PersonaSelection>(snapshot.personaPack);
+  const [customBasePackId, setCustomBasePackId] = useState<PersonaPackId | null>(snapshot.customBasePackId);
   const [assistantName, setAssistantName] = useState(snapshot.assistantName);
   const [gender, setGender] = useState<Gender>(snapshot.gender);
   const [personality, setPersonality] = useState(snapshot.personality);
@@ -102,57 +109,55 @@ export function PersonaFields({
   const [responseLength, setResponseLength] = useState<AISettingsResponseLength>(snapshot.responseLength);
   const [emojiUsage, setEmojiUsage] = useState<AISettingsEmojiUsage>(snapshot.emojiUsage);
   const [language, setLanguage] = useState(snapshot.language);
-  // Custom mode is an explicit CHOICE (a card), not only a text-detection result — so opening the
-  // custom card with preset-matching text still shows the editor.
-  const [forcedCustom, setForcedCustom] = useState(
-    () => snapshot.personality.trim().length > 0
-      && !PERSONA_PRESETS.some((p) => p.text.trim() === snapshot.personality.trim())
-  );
   const [enhanceMsg, setEnhanceMsg] = useState<string | null>(null);
   const [enhanceOk, setEnhanceOk] = useState(false);
   const [pending, startTransition] = useTransition();
 
   const off = !aiEnabled;
+  const richPack = getPersonaPack(personaPack); // PersonaPack | null (null ⇒ Custom)
+  const isCustom = richPack === null;
+
   const isDirty =
     aiEnabled !== snapshot.aiEnabled
+    || personaPack !== snapshot.personaPack
+    || customBasePackId !== snapshot.customBasePackId
     || assistantName !== snapshot.assistantName
     || gender !== snapshot.gender
-    || personality !== snapshot.personality
+    || (isCustom && personality !== snapshot.personality)
     || avoid !== snapshot.avoid
-    || responseLength !== snapshot.responseLength
-    || emojiUsage !== snapshot.emojiUsage
+    || (isCustom && responseLength !== snapshot.responseLength)
+    || (isCustom && emojiUsage !== snapshot.emojiUsage)
     || language !== snapshot.language;
 
-  // Which voice the RUNTIME would resolve for the current text (mirrors detectPreset's
-  // exact-match rule) — drives the dims/sample truthfully, independent of the editing mode.
+  // For the Custom style-at-a-glance: which shipped-preset (if any) the text resolves to. Only the
+  // free-text Custom path uses this; a rich pack renders its own read-only summary instead.
   const detectedId: PreviewPresetId =
     (PERSONA_PRESETS.find((p) => p.text.trim() === personality.trim())?.id as PreviewPresetId | undefined)
     ?? (personality.trim().length > 0 ? "custom" : "default");
-  const customActive = forcedCustom || detectedId === "custom";
-  const activePresetDims = customActive ? null : styleData.presets[detectedId] ?? null;
+  const activePresetDims = detectedId === "custom" || detectedId === "default" ? null : styleData.presets[detectedId] ?? null;
 
-  // Advisory (non-blocking): does the free-text read like a business RULE/FACT rather than style?
   const personalityPolicyHits = flagsBusinessPolicy(personality);
   const avoidPolicyHits = flagsBusinessPolicy(avoid);
 
-  /** A preset card applies the FULL PACKAGE: text + the preset's resolved length/emoji defaults.
-   *  OVERWRITE SAFETY: existing different text is never silently replaced — explicit confirm. */
-  function applyPresetPackage(preset: PersonaPreset) {
-    const hasDifferentText = personality.trim().length > 0 && personality.trim() !== preset.text.trim();
-    if (hasDifferentText && !window.confirm("יש כבר תיאור אישיות. להחליף אותו בחבילת הסגנון שנבחרה?")) return;
-    const dims = styleData.presets[preset.id];
-    setPersonality(preset.text);
-    if (dims) {
-      setResponseLength(dims.lengthDefault);
-      setEmojiUsage(dims.emojiDefault);
-    }
-    setForcedCustom(false);
+  /** Chooser click: a rich pack becomes authoritative; Custom hands authority to the advanced fields. */
+  function selectPersona(sel: PersonaSelection) {
+    setPersonaPack(sel);
+    if (sel !== "custom") setCustomBasePackId(null); // choosing a rich pack clears any "started-from" tag
     setEnhanceMsg(null);
     setEnhanceOk(false);
   }
 
-  function openCustomMode() {
-    setForcedCustom(true);
+  /** "Start from a pack" — edit-time SEEDING: copy the pack's voice + defaults into the Custom fields and
+   *  switch authority to Custom. custom_base_pack_id is metadata only (never a runtime authority). */
+  function startFromPack(packId: PersonaPackId) {
+    const pack = PERSONA_PACKS[packId];
+    const hasDifferentText = personality.trim().length > 0 && personality.trim() !== pack.voiceText.trim();
+    if (hasDifferentText && !window.confirm("יש כבר תיאור אישיות. להחליף אותו בנוסח של הערכה שנבחרה?")) return;
+    setPersonality(pack.voiceText);
+    setResponseLength(pack.defaults.responseLength);
+    setEmojiUsage(pack.defaults.emojiUsage);
+    setPersonaPack("custom");
+    setCustomBasePackId(packId);
     setEnhanceMsg(null);
     setEnhanceOk(false);
   }
@@ -201,7 +206,7 @@ export function PersonaFields({
       <AreaHeader
         eyebrow="אזור 2 · סגנון"
         title="סגנון ואישיות — איך העוזר מדבר"
-        explainer="כל ההגדרות מכאן ומטה משפיעות רק על הניסוח והטון. הן לעולם לא משנות מחירים, שירותים, כללי תורים, אמינות או עובדות עסקיות."
+        explainer="בוחרים ערכת סגנון מוכנה או התאמה אישית. כל ההגדרות כאן משפיעות רק על הניסוח והטון — לעולם לא על מחירים, שירותים, כללי תורים, אמינות או עובדות."
       />
 
       {off && (
@@ -216,7 +221,7 @@ export function PersonaFields({
 
       {/* Everything below is DISABLED while the assistant is off (values visible, not editable). */}
       <div style={{ display: "flex", flexDirection: "column", gap: "22px", opacity: off ? 0.55 : 1 }}>
-        {/* IDENTITY */}
+        {/* IDENTITY — editable regardless of the persona choice. */}
         <fieldset style={fieldset}>
           <legend style={legend}>מי הוא</legend>
           <label style={fieldWrap}>
@@ -243,132 +248,146 @@ export function PersonaFields({
           </label>
         </fieldset>
 
-        {/* STYLE PACKAGES — the voice authority, chosen as a package or written custom. */}
+        {/* PERSONA CHOOSER — the voice authority: a rich pack OR Custom. */}
         <fieldset style={fieldset}>
-          <legend style={legend}>סגנון ואישיות</legend>
+          <legend style={legend}>ערכת סגנון</legend>
           <p style={{ ...hint, margin: 0 }}>
-            בוחרים חבילת סגנון מוכנה — או מתארים את העוזר במילים שלכם, כמו עובד אמיתי: איך מדבר, איך מתייחס ללקוחות, מה האופי.
+            בוחרים ערכה מוכנה — <strong>חם וקליל</strong> או <strong>מקצועי ואלגנטי</strong> — או <strong>מותאם אישית</strong> ומתארים את העוזר במילים שלכם.
           </p>
-          {/* The persisted personality text always travels via this hidden input (disabled while
-              off → absent → preserved by the partial-payload action). The visible textarea below
-              (custom mode only) edits the same state and carries NO name. */}
-          <input type="hidden" name="custom_instructions" value={personality} disabled={off} />
-          <PresetCards
-            presets={PERSONA_PRESETS}
-            styleData={styleData}
-            activeId={detectedId}
-            customActive={customActive}
-            disabled={off}
-            onPreset={applyPresetPackage}
-            onCustom={openCustomMode}
-          />
-          {customActive ? (
-            <label style={fieldWrap}>
-              <span style={fieldLabel}>תיאור העוזר במילים שלך</span>
-              {/* EMPTY-CUSTOM GUARD: saving an empty custom style is blocked with a clear Hebrew
-                  message (native constraint validation — the textarea participates even without a
-                  `name`; disabled fields are exempt, so AI-off saves are unaffected). */}
-              <textarea
-                value={personality} disabled={off} required
-                onChange={(e) => { e.currentTarget.setCustomValidity(""); setPersonality(e.target.value); }}
-                onInvalid={(e) => e.currentTarget.setCustomValidity("כתבו תיאור סגנון, או בחרו סגנון מוכן — אי אפשר לשמור התאמה אישית ריקה.")}
-                rows={5} maxLength={2000}
-                placeholder="לדוגמה: הסגנון צריך להיות חם, אישי ומקצועי, עם נגיעה של הומור — אנושי וזורם, אף פעם לא רובוטי."
-                style={{ ...inputStyle, resize: "vertical" }}
-              />
-              {personality.trim().length === 0 && (
-                <span style={{
-                  fontSize: "12px", lineHeight: 1.4, color: "#9a3412",
-                  background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "6px", padding: "8px 10px",
-                }}>
-                  אין עדיין תיאור — התאמה אישית ריקה לא נשמרת. כתבו תיאור במילים שלכם, או בחרו סגנון מוכן.
-                </span>
-              )}
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-                <button
-                  type="button"
-                  onClick={handleEnhance}
-                  disabled={off || pending || personality.trim().length === 0}
-                  style={{
-                    padding: "7px 14px", borderRadius: "999px", fontSize: "13px",
-                    border: "1px solid #0070f3", background: pending ? "#eef5ff" : "#fff",
-                    color: "#0070f3", cursor: off || pending || !personality.trim() ? "default" : "pointer",
-                    opacity: personality.trim().length === 0 ? 0.5 : 1, fontWeight: 600,
-                  }}
-                >
-                  {pending ? "משפר…" : "✨ שפר עם AI"}
-                </button>
-                <span style={hint}>ה-AI ינסח מחדש את התיאור — תמיד אפשר לערוך לפני שמירה. הטקסט שלך משמש כפי שהוא.</span>
+
+          {/* Authority is carried by these two hidden inputs — dashboard writes EXACTLY what the runtime
+              reads. Disabled while off → absent from FormData → preserved (never wiped). */}
+          <input type="hidden" name="persona_pack" value={personaPack} disabled={off} />
+          <input type="hidden" name="custom_base_pack_id" value={customBasePackId ?? ""} disabled={off} />
+
+          <PersonaPackChooser value={personaPack} disabled={off} onSelect={selectPersona} />
+
+          {richPack ? (
+            <RichPackSummary
+              pack={richPack}
+              disabled={off}
+              onCustomize={() => startFromPack(richPack.id)}
+            />
+          ) : (
+            <div style={fieldWrap}>
+              {/* Custom text travels via this hidden input ONLY in Custom mode — a rich pack must not write
+                  custom_instructions (the pack is authoritative). Disabled while off → preserved. */}
+              <input type="hidden" name="custom_instructions" value={personality} disabled={off} />
+
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ ...hint, margin: 0 }}>התחלה מהירה:</span>
+                {(Object.keys(PERSONA_PACKS) as PersonaPackId[]).map((id) => (
+                  <button
+                    key={id} type="button" disabled={off}
+                    onClick={() => startFromPack(id)}
+                    style={{
+                      padding: "5px 12px", borderRadius: "999px", fontSize: "12px", fontWeight: 600,
+                      border: "1px solid #cbd5e1", background: "#f8fafc", color: "#334155",
+                      cursor: off ? "default" : "pointer",
+                    }}
+                  >
+                    התחל מ&quot;{PERSONA_PACKS[id].label}&quot;
+                  </button>
+                ))}
               </div>
-              {enhanceMsg && (
-                <span style={{ ...hint, color: enhanceOk ? "#0070f3" : "#9a3412" }}>{enhanceMsg}</span>
-              )}
-              <PolicyHint hits={personalityPolicyHits} />
-            </label>
-          ) : personality.trim().length > 0 ? (
-            // PRESET MODE — the raw package text stays out of the way; readable on demand.
-            <details style={{ fontSize: "13px", color: "#475569" }}>
-              <summary style={{ cursor: "pointer", color: "#64748b" }}>נוסח הסגנון (לקריאה)</summary>
-              <p style={{
-                margin: "8px 0 0", background: "#f8fafc", border: "1px solid #e2e8f0",
-                borderRadius: "8px", padding: "10px 12px", lineHeight: 1.6,
-              }}>
-                {personality}
-              </p>
-            </details>
-          ) : null}
+
+              <label style={fieldWrap}>
+                <span style={fieldLabel}>תיאור העוזר במילים שלך</span>
+                <textarea
+                  value={personality} disabled={off} required
+                  onChange={(e) => { e.currentTarget.setCustomValidity(""); setPersonality(e.target.value); }}
+                  onInvalid={(e) => e.currentTarget.setCustomValidity("כתבו תיאור סגנון, או בחרו ערכה מוכנה — אי אפשר לשמור התאמה אישית ריקה.")}
+                  rows={5} maxLength={2000}
+                  placeholder="לדוגמה: הסגנון צריך להיות חם, אישי ומקצועי, עם נגיעה של הומור — אנושי וזורם, אף פעם לא רובוטי."
+                  style={{ ...inputStyle, resize: "vertical" }}
+                />
+                {personality.trim().length === 0 && (
+                  <span style={{
+                    fontSize: "12px", lineHeight: 1.4, color: "#9a3412",
+                    background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: "6px", padding: "8px 10px",
+                  }}>
+                    אין עדיין תיאור — התאמה אישית ריקה לא נשמרת. כתבו תיאור במילים שלכם, או בחרו ערכה מוכנה.
+                  </span>
+                )}
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    onClick={handleEnhance}
+                    disabled={off || pending || personality.trim().length === 0}
+                    style={{
+                      padding: "7px 14px", borderRadius: "999px", fontSize: "13px",
+                      border: "1px solid #0070f3", background: pending ? "#eef5ff" : "#fff",
+                      color: "#0070f3", cursor: off || pending || !personality.trim() ? "default" : "pointer",
+                      opacity: personality.trim().length === 0 ? 0.5 : 1, fontWeight: 600,
+                    }}
+                  >
+                    {pending ? "משפר…" : "✨ שפר עם AI"}
+                  </button>
+                  <span style={hint}>ה-AI ינסח מחדש את התיאור — תמיד אפשר לערוך לפני שמירה. הטקסט שלך משמש כפי שהוא.</span>
+                </div>
+                {enhanceMsg && (
+                  <span style={{ ...hint, color: enhanceOk ? "#0070f3" : "#9a3412" }}>{enhanceMsg}</span>
+                )}
+                <PolicyHint hits={personalityPolicyHits} />
+              </label>
+            </div>
+          )}
         </fieldset>
 
-        {/* STYLE AT A GLANCE — resolved dimensions + the static sample (mock-framed). */}
-        <fieldset style={fieldset}>
-          <legend style={legend}>הסגנון שנבחר — במבט אחד</legend>
-          <StylePanel
-            activePresetId={detectedId}
-            customActive={customActive}
-            styleData={styleData}
-            emojiUsage={emojiUsage}
-            responseLength={responseLength}
-            language={language}
-          />
-        </fieldset>
+        {/* STYLE AT A GLANCE — Custom only; a rich pack's read-only summary already shows its style. */}
+        {isCustom && (
+          <fieldset style={fieldset}>
+            <legend style={legend}>הסגנון שנבחר — במבט אחד</legend>
+            <StylePanel
+              activePresetId={detectedId}
+              customActive={true}
+              styleData={styleData}
+              emojiUsage={emojiUsage}
+              responseLength={responseLength}
+              language={language}
+            />
+          </fieldset>
+        )}
 
-        {/* ADVANCED — overrides on top of the package. Collapsed by default. */}
+        {/* ADVANCED — language always; length/emoji are pack-defined for a rich pack (shown read-only). */}
         <details style={{ ...fieldset, gap: 0 }}>
           <summary style={{ ...legend, cursor: "pointer", padding: 0 }}>הגדרות מתקדמות</summary>
           <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginTop: "12px" }}>
-            <p style={{ ...hint, margin: 0 }}>
-              {customActive
-                ? "כוונון ידני. בהתאמה אישית הערכים כאן נקבעים ישירות — אין ברירות מחדל של חבילה."
-                : "כוונון ידני מעל חבילת הסגנון. ברירות המחדל מגיעות מהחבילה שנבחרה — שינוי כאן גובר עליהן."}
-            </p>
-            <label style={fieldWrap}>
-              <span style={fieldLabel}>
-                אורך תשובות
-                <OverrideTag show={!!activePresetDims && responseLength !== activePresetDims.lengthDefault} />
-              </span>
-              <select
-                name="response_length" value={responseLength} disabled={off}
-                onChange={(e) => setResponseLength(e.target.value as AISettingsResponseLength)} style={inputStyle}
-              >
-                <option value="short">קצר — משפט אחד</option>
-                <option value="medium">בינוני — 1-3 משפטים</option>
-                <option value="long">ארוך — 3-5 משפטים</option>
-              </select>
-            </label>
-            <label style={fieldWrap}>
-              <span style={fieldLabel}>
-                שימוש באמוג&#39;י
-                <OverrideTag show={!!activePresetDims && emojiUsage !== activePresetDims.emojiDefault} />
-              </span>
-              <select
-                name="emoji_usage" value={emojiUsage} disabled={off}
-                onChange={(e) => setEmojiUsage(e.target.value as AISettingsEmojiUsage)} style={inputStyle}
-              >
-                <option value="none">ללא</option>
-                <option value="low">מועט</option>
-                <option value="medium">בינוני</option>
-              </select>
-            </label>
+            {isCustom ? (
+              <>
+                <p style={{ ...hint, margin: 0 }}>כוונון ידני. בהתאמה אישית הערכים כאן נקבעים ישירות.</p>
+                <label style={fieldWrap}>
+                  <span style={fieldLabel}>
+                    אורך תשובות
+                    <OverrideTag show={!!activePresetDims && responseLength !== activePresetDims.lengthDefault} />
+                  </span>
+                  <select
+                    name="response_length" value={responseLength} disabled={off}
+                    onChange={(e) => setResponseLength(e.target.value as AISettingsResponseLength)} style={inputStyle}
+                  >
+                    <option value="short">קצר — משפט אחד</option>
+                    <option value="medium">בינוני — 1-3 משפטים</option>
+                    <option value="long">ארוך — 3-5 משפטים</option>
+                  </select>
+                </label>
+                <label style={fieldWrap}>
+                  <span style={fieldLabel}>
+                    שימוש באמוג&#39;י
+                    <OverrideTag show={!!activePresetDims && emojiUsage !== activePresetDims.emojiDefault} />
+                  </span>
+                  <select
+                    name="emoji_usage" value={emojiUsage} disabled={off}
+                    onChange={(e) => setEmojiUsage(e.target.value as AISettingsEmojiUsage)} style={inputStyle}
+                  >
+                    <option value="none">ללא</option>
+                    <option value="low">מועט</option>
+                    <option value="medium">בינוני</option>
+                  </select>
+                </label>
+              </>
+            ) : (
+              <PackDefinedStyleNote pack={richPack!} />
+            )}
             <label style={fieldWrap}>
               <span style={fieldLabel}>שפת תקשורת עם לקוחות</span>
               <select
@@ -386,7 +405,7 @@ export function PersonaFields({
           </div>
         </details>
 
-        {/* STYLE GUIDANCE — soft wording/topics to avoid; applied through the assistant, never a system override. */}
+        {/* STYLE GUIDANCE — soft wording/topics to avoid; a guardrail applied through the assistant. */}
         <fieldset style={fieldset}>
           <legend style={legend}>הנחיות סגנון נוספות</legend>
           <label style={fieldWrap}>
@@ -413,8 +432,52 @@ export function PersonaFields({
   );
 }
 
-// Conceptual AREA header: operational capabilities vs. style/persona — pure typography
-// (eyebrow + title + one-liner), so the split is obvious to an owner. Presentation only.
+// ── Rich-pack read-only summary — shown when a rich pack is the authority. ──────────────────────────
+function RichPackSummary({
+  pack, disabled, onCustomize,
+}: {
+  pack: (typeof PERSONA_PACKS)[PersonaPackId];
+  disabled: boolean;
+  onCustomize: () => void;
+}) {
+  return (
+    <div style={{
+      background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "10px", padding: "12px 14px",
+      display: "flex", flexDirection: "column", gap: "8px",
+    }}>
+      <span style={{ fontSize: "14px", fontWeight: 700, color: "#0f172a" }}>{pack.label}</span>
+      <span style={{ fontSize: "13px", color: "#475569", lineHeight: 1.5 }}>{pack.tagline}</span>
+      <span style={{ fontSize: "12px", color: "#64748b" }}>
+        הטון, האורך והאימוג׳ים מוגדרים על ידי הערכה (אימוג׳י: {EMOJI_HE[pack.defaults.emojiUsage]} · אורך: {LENGTH_HE[pack.defaults.responseLength]}).
+        אפשר לשנות רק את השם, מין הדמות והשפה למעלה.
+      </span>
+      <div>
+        <button
+          type="button" disabled={disabled} onClick={onCustomize}
+          style={{
+            padding: "6px 14px", borderRadius: "999px", fontSize: "12px", fontWeight: 600,
+            border: "1px solid #0070f3", background: "#fff", color: "#0070f3",
+            cursor: disabled ? "default" : "pointer",
+          }}
+        >
+          התחל מערכה זו והתאם אישית
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Advanced-section note when a rich pack is authoritative (length/emoji are pack-defined, not editable). */
+function PackDefinedStyleNote({ pack }: { pack: (typeof PERSONA_PACKS)[PersonaPackId] }) {
+  return (
+    <p style={{ ...hint, margin: 0 }}>
+      אורך התשובות והאימוג׳י מוגדרים על ידי הערכה שנבחרה (אורך: {LENGTH_HE[pack.defaults.responseLength]} · אימוג׳י: {EMOJI_HE[pack.defaults.emojiUsage]}).
+      כדי לכוונן אותם ידנית, בחרו &quot;מותאם אישית&quot; או &quot;התחל מערכה זו והתאם אישית&quot;.
+    </p>
+  );
+}
+
+// Conceptual AREA header — pure typography (eyebrow + title + one-liner). Presentation only.
 function AreaHeader({ eyebrow, title, explainer }: { eyebrow: string; title: string; explainer: string }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "3px", marginTop: "6px" }}>
@@ -425,7 +488,7 @@ function AreaHeader({ eyebrow, title, explainer }: { eyebrow: string; title: str
   );
 }
 
-/** Small "differs from the package default" tag for advanced overrides. */
+/** Small "differs from the package default" tag for advanced overrides (Custom mode). */
 function OverrideTag({ show }: { show: boolean }) {
   if (!show) return null;
   return (
@@ -438,12 +501,7 @@ function OverrideTag({ show }: { show: boolean }) {
   );
 }
 
-/** The truthful save-status line — the SINGLE source of truth for save state on this page:
- *  dirty → transient success → quiet last-saved. Rendered client-side so unsaved local edits can
- *  never show as persisted. Success is TRANSIENT (auto-dismisses after a few seconds into the
- *  last-saved line) and is checked AFTER dirty, so a new edit dismisses it instantly — the page
- *  can never say "נשמרו בהצלחה" and "שינויים שלא נשמרו" at once. Fixed timezone avoids SSR/CSR
- *  hydration mismatch. */
+/** The truthful save-status line — dirty → transient success → quiet last-saved. */
 const SUCCESS_DISMISS_MS = 4000;
 
 function SaveStatusLine({ isDirty, saved, updatedAt }: { isDirty: boolean; saved?: string; updatedAt: string | null }) {
@@ -483,9 +541,7 @@ function SaveStatusLine({ isDirty, saved, updatedAt }: { isDirty: boolean; saved
   return null;
 }
 
-// Non-blocking advisory: shown when a STYLE field contains text that reads like a business
-// rule/fact. It NEVER blocks saving and NEVER edits the text — it only nudges the owner toward
-// the Knowledge Base. Renders nothing when there are no flagged terms.
+// Non-blocking advisory: shown when a STYLE field reads like a business rule/fact.
 function PolicyHint({ hits }: { hits: string[] }) {
   if (hits.length === 0) return null;
   return (

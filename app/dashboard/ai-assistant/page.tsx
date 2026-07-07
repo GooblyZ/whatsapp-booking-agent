@@ -113,8 +113,9 @@ export default async function AIAssistantPage({
           background: "#fff7ed", border: "1px solid #fed7aa", color: "#9a3412",
           borderRadius: "8px", padding: "10px 14px", marginBottom: "16px", fontSize: "13px",
         }}>
-          ההגדרות נשמרו, אך חלקן (למשל מין הדמות) ייכנסו לתוקף רק לאחר הרצת מיגרציה{" "}
-          <code>010_ai_settings_assistant_gender.sql</code> ב-Supabase.
+          ההגדרות נשמרו, אך חלקן (למשל בחירת ערכת הסגנון או מין הדמות) ייכנסו לתוקף רק לאחר הרצת המיגרציה
+          הרלוונטית ב-Supabase (למשל <code>013_ai_settings_persona_pack.sql</code> או{" "}
+          <code>010_ai_settings_assistant_gender.sql</code>).
         </div>
       )}
 
