@@ -19,7 +19,7 @@ import { isGeminiCoolingDown, geminiCooldownRemainingMs, isGeminiConfigured, get
 import {
   runReceptionistTurn, FALLBACK, isLowValueAck, type ReceptionistDecision, type ReceptionistTurn,
 } from "./brain";
-import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording, mentionsSelectionOrBookingClaim } from "./reply-polish";
+import { stripEmojis, sameOutboundText, claimsBookingCompleted, stripDuplicateCtaWording, mentionsSelectionOrBookingClaim, capVocative, userGreeted } from "./reply-polish";
 import { resolveRoute, linkKindForRoute, messageOperation, isNegatedOperation, type Route } from "./routing";
 import { resolveBookingGuidance, type BookingGuidanceVerdict } from "./booking-guidance";
 import { logAIEvent } from "./events";
@@ -333,6 +333,41 @@ const POLICY_DEFER_RE = /אין\s+לי\s+(את\s+)?ה?מידע|לא\s+בטוח|�
 /** True when the reply already honestly defers — the F fence must NOT re-replace an honest answer. */
 export function alreadyDefers(reply: string): boolean { return POLICY_DEFER_RE.test(reply ?? ""); }
 
+// ── INV-2 (S1) KB GROUNDING-TIGHTNESS backstop ──────────────────────────────────────
+// Covered facts may be answered, but the customer-visible reply must not CONTRADICT the KB. Live failure:
+// KB "אין עישון בתוך הסטודיו" → reply "כן, יש לנו פינת עישון נוחה" (a stale-history echo of an old answer).
+// GENERIC across every policy topic + HIGH-PRECISION: only a clear POLARITY FLIP on a COVERED topic fires a
+// grounded correction. (Additive SAME-polarity embellishment — "יש חניה חינם" — is governed by the persona
+// grounding rule, not this fence, to avoid false positives.)
+/** The content of the first active KB item that covers a policy topic, or null. */
+export function kbFactForPolicyTopic(
+  topic: PolicyTopic, kbItems: { title?: string; content?: string; active?: boolean }[] = []
+): string | null {
+  const entry = POLICY_TOPICS.find((x) => x.topic === topic);
+  if (!entry) return null;
+  const hit = kbItems.find((k) => (k.active ?? true) && entry.kw.test(`${k.title ?? ""} ${k.content ?? ""}`));
+  return hit?.content?.trim() || null;
+}
+// NOTE: JS \b does NOT work after Hebrew letters — bound with an explicit separator/end lookahead.
+const NEG_POLARITY_RE = /(?:^|[\s,.;])(?:אין|אסור|לא\s+ניתן|לא\s+מתאפשר|אי[- ]?אפשר|לא\s+מאפשר|לא)(?=[\s,.;!?…]|$)/;
+const AFF_POLARITY_RE = /(?:^|[\s,.;])(?:כן|יש\s+לנו|יש|אפשר|מותר|בטח|בהחלט|ניתן|מאפשר)(?=[\s,.;!?…]|$)/;
+/** True when the reply's polarity CONTRADICTS the covered KB fact (KB negates → reply affirms, or vice-versa).
+ *  Requires an UNAMBIGUOUS flip: the reply carries the opposite polarity and NOT the fact's own polarity. */
+export function contradictsCoveredFact(reply: string, kbFact: string): boolean {
+  const r = reply ?? "";
+  const factNeg = NEG_POLARITY_RE.test(kbFact);
+  const replyNeg = NEG_POLARITY_RE.test(r);
+  const replyAff = AFF_POLARITY_RE.test(r);
+  const factAff = !factNeg && AFF_POLARITY_RE.test(kbFact);
+  if (factNeg && replyAff && !replyNeg) return true; // KB says NO, reply says YES
+  if (factAff && replyNeg && !replyAff) return true; // KB says YES, reply says NO
+  return false;
+}
+/** A natural, grounded correction that states EXACTLY the KB fact — no invented specifics. */
+export function groundedFactReply(kbFact: string): string {
+  return `לפי המידע שיש לי, ${kbFact.trim().replace(/[.!]+$/, "")}.`;
+}
+
 // ── REPEAT-ANSWER TONE GUARD ─────────────────────────────────────────────────────
 // Even when the customer asks something already answered, the receptionist must NOT sound
 // annoyed/corrective. Strips a scolding lead-in ("כבר אמרתי לך ש…", "כמו שאמרתי", "שוב…") while
@@ -456,6 +491,9 @@ export async function runPlatformTurn(
   // ("הסתדר?"/"זמין?") and accountability repair ("כי כתבת שיש עומס").
   const lastReplyWasDegraded = recentlyDegraded(memory.transcript);
   const bookingBlock = [customerBlock, upcomingBlock].filter(Boolean).join("\n\n");
+  // INV-1 (S1): the customer's KNOWN name (parsed from the CUSTOMER block) for the vocative cap — or
+  // undefined when unknown. Used only to cap repeated name mentions; never to re-ask or assume.
+  const customerName = (customerBlock.match(/Name:\s*([^\n(]+?)\s*\(use it naturally/)?.[1] ?? "").trim() || undefined;
   // A booking link was sent earlier iff our transcript already carries a URL — only
   // we ever send links. Lets the reply legitimately reference "the link I sent".
   const previousBookingLinkSent = /https?:\/\/\S+/.test(memory.transcript);
@@ -847,7 +885,11 @@ export async function runPlatformTurn(
     && (!isBareAffirmation(messageText) || (isSoftCloseAffirmation(messageText) && !confirmContext));
   if (!deterministicMenu && closureEligible) {
     const repeatedAck = memory.lastAssistantReason === ACK_REASON; // our last reply was already a closure
-    const ackSuppress = repeatedAck || prevLowSignal >= LOW_VALUE_DEEP_AT;
+    // INV-4 (S1): context-aware ack — THANKS gets a warm "בכיף"; a bare understanding/positive closure
+    // ("הבנתי"/"אוקיי"/"מעולה") gets SILENCE instead of a templated "בשמחה 🙂". A repeated/deep closure
+    // stays suppressed regardless (existing loop break).
+    const ack = ackReplyFor(latest);
+    const ackSuppress = repeatedAck || prevLowSignal >= LOW_VALUE_DEEP_AT || ack.suppress;
     await persist(prevLowSignal, 0); // neutral: carry low-signal (no escalate/rescue), break the greeting run
     const decision = errorDecision(ACK_REASON, true);
     await safeLog(businessId, customerId, decision);
@@ -855,9 +897,9 @@ export async function runPlatformTurn(
       `[platform-turn] ai_called=false pre_gemini_guard=true pre_gemini_action=acknowledgement` +
       ` gemini_skipped_reason=acknowledgement low_signal=false low_signal_kind=ack route=NONE link=-` +
       ` low_signal_count_before=${prevLowSignal} low_signal_count_after=${prevLowSignal}` +
-      ` repeated_ack=${repeatedAck} reply_suppressed=${ackSuppress}`
+      ` repeated_ack=${repeatedAck} ack_kind=${ack.suppress ? "silent" : "thanks"} reply_suppressed=${ackSuppress}`
     );
-    return { replyText: ackSuppress ? "" : ACK_CLOSE, decision, linkAttached: null, suppressReply: ackSuppress };
+    return { replyText: ackSuppress ? "" : ack.text, decision, linkAttached: null, suppressReply: ackSuppress };
   }
 
   // ── REPEATED OFF-TOPIC CAP (cost control for a SUSTAINED off-topic streak). Once the customer is already
@@ -1038,6 +1080,18 @@ export async function runPlatformTurn(
   //    invented) so the final message carries AT MOST the one deterministic link.
   replyText = stripModelUrls(replyText);
 
+  // ── INV-1 (S1) VOCATIVE / GREETING CADENCE: strip a LEADING greeting ("היי קובי, …") from an ONGOING
+  //    business reply the customer didn't open with a greeting, and cap the customer's name to ≤1 use.
+  //    Applied to the MODEL reply so every downstream fence/link operates on the capped text. A first
+  //    contact / long-idle reopen has empty history (memory.turns) → ongoing=false → the greeting is kept.
+  if (decision.ok) {
+    replyText = capVocative(replyText, {
+      ongoing: memory.turns.length > 0,
+      userGreeted: userGreeted(latest),
+      customerName,
+    });
+  }
+
   // ── EVIDENCE GATE (BUG-004): never trust a model-claimed operation without
   //    supporting evidence in the USER message. Gemini hallucinates BOOK on
   //    gibberish; this downgrades it to non-actionable IN PLACE, so the corrected
@@ -1135,6 +1189,14 @@ export async function runPlatformTurn(
       // the message is not trusted to attach a link (the evidence gate normally already
       // downgraded it). A message_verb route is self-evidenced and never lands here.
       console.log(`[platform-turn] link suppressed: route=${route} (model_intent) but no booking signal in message`);
+    } else if (linkKind === "booking" && reason === "model_intent"
+               && latestSignal === "soft_intent" && !isExplicitLinkRequest(latest)) {
+      // ── INV-3 (S1) LINK SIDE-EFFECT DISCIPLINE: a MODEL-derived BOOK route on bare SOFT service-interest
+      //    ("מעניין אותי פן") is NOT explicit booking intent — even though a service NAME makes bookingSignal
+      //    true. Attach NO link here; fall through (linkAttached stays null) to the SERVICE-INTEREST → OFFER
+      //    lane below, which offers the link and records a soft-interest pending. Explicit operation verbs
+      //    (reason=message_verb) and explicit link requests are unaffected → real bookings still link.
+      console.log("[platform-turn] booking link suppressed: soft service-interest (model_intent) → OFFER lane");
     } else if (linkKind === "manage") {
       // Route is fixed; only WHICH manage page varies, decided by real data (never the
       // model): 0 upcoming → booking link (nothing to manage; offer to book) · 1 → that
@@ -1572,6 +1634,23 @@ export async function runPlatformTurn(
   //    KB/facts, where the model didn't already defer, must not ship an invented yes/no. Replace with an
   //    honest, human "I don't have that" and log the missed topic (fail-open) for a future owner KB
   //    suggestion. Runs only on a non-action, no-link FAQ turn.
+  // ── INV-2 (S1) GROUNDING-TIGHTNESS backstop (COVERED-topic contradiction): a policy answer that
+  //    CONTRADICTS the KB (polarity flip — KB "אין עישון" but the reply affirms a smoking area, echoed
+  //    from stale history) is replaced with the grounded KB fact. Runs BEFORE the class-F (uncovered)
+  //    fence; the two are mutually exclusive by coverage. Generic across topics; high-precision.
+  if (decision.ok && !behaviorHandled && linkAttached === null) {
+    const covTopic = policyTopicOf(latest);
+    if (covTopic && !alreadyDefers(replyText)) {
+      const kbFact = kbFactForPolicyTopic(covTopic, ctx.knowledgeBaseItems ?? []);
+      if (kbFact && contradictsCoveredFact(replyText, kbFact)) {
+        replyText = groundedFactReply(kbFact);
+        behaviorHandled = true;
+        platformRoute = "NONE"; platformRouteReason = "grounding_contradiction";
+        console.log(`[platform-turn] INV-2: reply contradicted KB on '${covTopic}' → grounded correction`);
+      }
+    }
+  }
+
   if (decision.ok && !behaviorHandled && linkAttached === null) {
     const policyTopic = policyTopicOf(latest);
     if (policyTopic
@@ -1810,6 +1889,21 @@ export const LOW_VALUE_BOUNDARY = "אני כאן לעזור עם תורים וש
 // Post-CTA / post-answer ACKNOWLEDGEMENT close (מעולה/תודה/מגניב …) — a natural, short close, never an
 // "I didn't understand" clarify and never a CTA.
 export const ACK_CLOSE = "בשמחה 🙂";
+// INV-4 (S1): warm response reserved for THANKS ("תודה"). "בשמחה"/"בכיף" only fit a thank-you.
+export const ACK_THANKS = "בכיף 🙂";
+const THANKS_RE = /תודה|תנקס|מעריך|יישר\s*כוח|thank/i;
+/**
+ * INV-4 (S1) — context-aware acknowledgement copy. A bare closure token is NOT one-size-fits-all:
+ *   • THANKS ("תודה", "תודה רבה") → a warm thank-you response ("בכיף").
+ *   • a bare UNDERSTANDING / OK / positive-reaction closure ("הבנתי", "אוקיי", "סבבה", "מעולה") → SILENCE:
+ *     nothing more is needed, and a templated "בשמחה 🙂" after "הבנתי" reads like a bot. Sometimes no reply
+ *     is the human answer. (Repeated / deep-streak closures are ALSO suppressed by the caller's loop break.)
+ * PURE. The emoji is capped downstream by the outbound settings chokepoint (emoji_usage), so only the TEXT
+ * choice lives here.
+ */
+export function ackReplyFor(message: string): { text: string; suppress: boolean } {
+  return THANKS_RE.test(message ?? "") ? { text: ACK_THANKS, suppress: false } : { text: "", suppress: true };
+}
 // Durable outbound `reason` for an acknowledgement close. Persisted via decision.branch at the chokepoint, so
 // the NEXT turn can read memory.lastAssistantReason and suppress a repeated ack (terminal-ack loop break).
 export const ACK_REASON = "acknowledgement";
@@ -2372,8 +2466,11 @@ export function isGenuineQuestion(message: string, serviceNames: string[] = []):
 // NOTE: Hebrew final forms — masc "צריך"/"מתכנן"/"מעוניין" end in a FINAL letter (ך/ן),
 // so the stems must allow both the regular and final glyph ([כך]/[נן]) or they silently
 // miss the masculine ("אני צריך" was the live eval miss).
+// INV-3 (S1): "מעניין אותי X" / "מסקרן אותי" (it INTERESTS me) is a soft, information-seeking interest —
+// a DISTINCT word from "מעוניין" (interested/wanting) already listed; it must be recognized as soft
+// interest so it OFFERS a link instead of auto-attaching one. Business-agnostic; a bare curiosity shape.
 const SOFT_DESIRE_RE =
-  /חשבתי\s+(על|ל|לבוא|לקפוץ)|בא\s+לי|מתחשק\s+לי|מעוניי[נן]|הייתי\s+רוצ|רוצה\s+ל|אני\s+צרי[כך]|מתלבט|מתכנ[נן]|שוקל(ת)?|אשמח\s+ל|נראה\s+לי\s+ש?אני/;
+  /חשבתי\s+(על|ל|לבוא|לקפוץ)|בא\s+לי|מתחשק\s+לי|מעוניי[נן]|מעניי?ן\s+אותי|מסקרן\s+אותי|הייתי\s+רוצ|רוצה\s+ל|אני\s+צרי[כך]|מתלבט|מתכנ[נן]|שוקל(ת)?|אשמח\s+ל|נראה\s+לי\s+ש?אני/;
 const SOFT_CONTEXT_RE =
   /לפני\s+ה|יש\s+לי\s+(אירוע|חתונה|טיסה|חג|משחק|פגישה|ראיון|תאריך|בר\s*מצווה)|השבוע|השבת|עוד\s+מעט|בקרוב|לבוא\s+אליכם|להגיע\s+אליכם|לבוא\s+אצלכם|לקפוץ\s+אליכם/;
 /**

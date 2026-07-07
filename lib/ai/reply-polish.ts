@@ -322,3 +322,58 @@ export function stripDuplicateCtaWording(reply: string): string {
   const out = kept.join(" ").replace(/ {2,}/g, " ").replace(/\s+([,.!?…])/g, "$1").trim();
   return out.replace(/\s/g, "").length >= 2 ? out : reply;   // over-trim guard → keep the original
 }
+
+// ── INV-1 (S1) VOCATIVE / GREETING CADENCE ────────────────────────────────────────
+// Greeting LIFECYCLE: a greeting ("היי", "שלום", "היי {name}") belongs at the START of a conversation, when
+// the customer just greeted, or on a long-idle reopen — NOT at the top of every ongoing business reply.
+// VOCATIVE policy: the customer's name is used sparingly — at most once per reply. PURE + conservative:
+// strips only a LEADING greeting (and its trailing vocative name), caps repeated name vocatives, and keeps
+// the ORIGINAL text if a strip would empty/over-trim it. The caller decides "ongoing" (recent history exists)
+// and "userGreeted" (the customer opened with a greeting) — so a first-turn / idle-reopen greeting is kept.
+// NOTE: JS \b word boundaries do NOT work after Hebrew letters (they aren't \w), so greeting tokens are
+// bounded with an explicit "followed by a separator or end" lookahead instead. "היי+" (2+ yods) is used
+// for the anywhere-check so it can't match "היום"/"היה".
+const GREETING_ANYWHERE_RE = /(?:^|[\s,])(?:היי+|שלום|אהלן|הולו|בוקר טוב|צהריים טובים|ערב טוב|לילה טוב|מה נשמע|מה קורה|מה המצב|מה שלומ)/;
+const LEADING_GREETING_RE = /^(?:היי+|הי|שלום|אהלן|הולו|יו|בוקר טוב|צהריים טובים|ערב טוב|מה נשמע|מה קורה|מה המצב)(?=[\s,!.…\-–]|$)\s*[,!.…\-–]*\s*/;
+
+/** True when the customer's message opens with / contains a greeting — so the assistant may greet back. */
+export function userGreeted(message: string): boolean {
+  return GREETING_ANYWHERE_RE.test((message ?? "").slice(0, 48));
+}
+
+function escapeReLocal(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function capVocative(
+  reply: string,
+  opts: { ongoing: boolean; userGreeted: boolean; customerName?: string | null }
+): string {
+  const original = reply ?? "";
+  const nm = (opts.customerName ?? "").trim();
+  let out = original;
+  // 1) Leading greeting (+ a leading vocative that is the customer's OWN known name), only in an ongoing
+  //    convo the customer didn't open with a greeting. Empty history (first contact OR post-idle reopen)
+  //    → ongoing=false → the greeting is kept. Precise: the vocative is stripped only when it matches the
+  //    known name, so a real content word is never removed.
+  if (opts.ongoing && !opts.userGreeted) {
+    let s = out.replace(LEADING_GREETING_RE, "");
+    if (nm.length >= 2) s = s.replace(new RegExp(`^${escapeReLocal(nm)}\\s*[,!.…،\\-–]*\\s+`), "");
+    s = s.replace(/^\s*[,،.!…\-–]\s*/, "").trimStart();
+    if (s !== out && s.replace(/\s/g, "").length >= 2) out = s;
+  }
+  // 2) Name-frequency cap: keep at most the FIRST standalone use of the customer's name; drop later ones.
+  if (nm.length >= 2) {
+    let seen = 0;
+    const re = new RegExp(`(^|[\\s(,])${escapeReLocal(nm)}(?=$|[\\s,.!?…)])`, "g");
+    const capped = out
+      .replace(re, (full, pre) => (++seen > 1 ? (pre === "(" ? pre : "") : full))
+      .replace(/\s{2,}/g, " ")
+      .replace(/\s+([,.!?…])/g, "$1")
+      .replace(/,\s*,/g, ",")
+      .replace(/^[,\s]+/, "")
+      .trim();
+    if (capped.replace(/\s/g, "").length >= 2) out = capped;
+  }
+  return out.trim() || original;
+}

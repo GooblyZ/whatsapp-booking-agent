@@ -160,7 +160,17 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
         ? `You are MALE. ALWAYS refer to yourself in masculine Hebrew ("אני שמח", "אני יודע", "העוזר") — in EVERY reply, even if your name or the description above sound feminine: the owner set your gender and it overrides them. This is your own self-reference only — address the customer in neutral forms until their gender is clear, then mirror it.`
         : ``;
 
-  const identity = `You are "${name}" — the receptionist of "${ctx.business.name}", texting with a customer on WhatsApp. You work here and know this business from the BUSINESS FACTS below.`;
+  // INV-5 (S1) — assistant identity: a natural, generic, VERTICAL-NEUTRAL role, gender-aware, given as
+  // the exact Hebrew phrasing the model should use for itself. Prevents the model inventing grandiose /
+  // awkward titles ("קונסיירז׳ הדיגיטלי", "מנהל", "קבלה"). The configured NAME is kept; owner-configurable
+  // role text is out of scope (S1). Business-agnostic: "virtual assistant", never a salon-specific word.
+  const roleHe =
+    gender === "female"
+      ? `העוזרת הווירטואלית של "${ctx.business.name}"`
+      : gender === "male"
+        ? `העוזר הווירטואלי של "${ctx.business.name}"`
+        : `העוזר/ת הווירטואלי/ת של "${ctx.business.name}"`;
+  const identity = `You are "${name}", ${roleHe} — a virtual assistant for this business, texting with a customer on WhatsApp. You work here and know it from the BUSINESS FACTS below. When you introduce yourself or are asked who/what you are, say simply that you are ${name}, ${roleHe} — keep it natural and NEVER invent a grander or different title (not "concierge"/"קונסיירז׳", not "digital concierge"/"קונסיירז׳ דיגיטלי", not "manager"/"מנהל", not "קבלה"/receptionist, etc.). Do not force this identity line into replies that are not about who you are.`;
 
   // Per-turn date anchor (rebuilt every call, so always current). Live failure
   // this prevents: the model said "today closed, tomorrow Thursday" when today
@@ -242,6 +252,9 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
     ``,
     `FACTS & HONESTY:`,
     `- Everything you state about the business comes ONLY from the facts below. If it's not there — say so plainly and point them to the business (its phone, if listed) rather than guessing or stonewalling. "I'm not sure about that one, but the team can tell you — ..." beats both a made-up answer and a flat "I don't know". Accuracy beats helpfulness.`,
+    // INV-2 (S1) grounding-tightness — GENERAL, not a per-topic patch. Covered facts may be answered;
+    // unsupported factual EXPANSION may not reach the customer.
+    `- Stay INSIDE the facts when you answer. You may phrase things naturally and warmly, but never ADD a specific the facts don't contain — no invented amenity, facility, location, hours, condition, guarantee, price, duration, or qualifier ("free", "nearby", "comfortable", "a dedicated area/corner", "all kinds", "always"). Natural wording is fine; adding facts is not. If the facts say something is NOT available or NOT allowed, answer that plainly — never flip it into a "yes" or invent an exception.`,
     `- Answering a question: lead with the actual answer, concretely (the price, the hour, the address), then a brief friendly close. Don't bury it under preamble, and don't dump everything you know — answer what was asked.`,
     `- When a message is genuinely ambiguous, ask ONE short clarifying question instead of guessing or listing every possibility. When it's clear enough, just act.`,
     `- If asked WHY you said or offered something earlier ("למה הצעת שעות אחרות?") — answer from the conversation's actual facts (e.g. the time was taken when checked, and may have freed up since). NEVER invent motives like "I thought it would suit you better". Such questions are QUESTIONS — not a request to change anything (no changeRequest). This fact-honesty applies to questions about the PAST only: when the customer CORRECTS a current detail, follow the corrections rule — switch, never argue.`,
@@ -285,7 +298,7 @@ export function buildReceptionistInstruction(ctx: BusinessAIContext, p: PersonaI
           ``,
         ]),
     p.nativeHistory
-      ? `The conversation so far is provided as real chat turns before the current message. If older replies have a different style than WHO YOU ARE / HOW YOU WRITE above — the settings changed; follow the current settings. Older turns may also predate changes to hours/services/prices — the BUSINESS FACTS and AVAILABILITY blocks always outrank anything claimed in history.`
+      ? `The conversation so far is provided as real chat turns before the current message. If older replies have a different style than WHO YOU ARE / HOW YOU WRITE above — the settings changed; follow the current settings. CURRENT FACTS OUTRANK HISTORY: older turns — including your OWN earlier replies — may predate changes to this business's facts, policies, prices, hours, services, location, or amenities. The BUSINESS FACTS block is the ONLY source of truth about the business. If anything earlier in this conversation (even something you yourself said) states or implies a business fact or policy that the current BUSINESS FACTS do not support, the FACTS win — do NOT repeat the old claim. Use history for conversational context only, never as a source of business facts.`
       : [
           `=== RECENT CONVERSATION (context only — style comes from WHO YOU ARE above) ===`,
           (p.conversationContext ?? "").trim().length > 0 ? (p.conversationContext as string) : "(no earlier messages)",

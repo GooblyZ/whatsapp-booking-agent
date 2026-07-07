@@ -50,6 +50,7 @@ import {
   hasBusinessAnchor, ACK_REASON, isTerminalClosure, DETERMINISTIC_NONANSWER_REASONS, isSoftCloseAffirmation,
   resolveContinuation, isBareDecline,
   mentionsLinkCapabilityDenial, defuseLinkCapabilityDenial,
+  ackReplyFor, ACK_THANKS, kbFactForPolicyTopic, contradictsCoveredFact, groundedFactReply,
 } from "../../lib/ai/platform-turn";
 import {
   resolveBookingGuidance, isBookingHowTo, isSiteRequest, isLinkTrouble, isBookingStatusQuestion,
@@ -92,7 +93,7 @@ import { authorizeJobRequest } from "../../lib/jobs/auth";
 import {
   isActiveAppointment, isHistoryAppointment, filterAppointmentsForView, ACTIVE_GRACE_MS,
 } from "../../lib/booking/appointment-views";
-import { claimsBookingCompleted, sameOutboundText, nearDuplicateText, revealsInternalInstructions, stripDuplicateCtaWording, stripEmojis } from "../../lib/ai/reply-polish";
+import { claimsBookingCompleted, sameOutboundText, nearDuplicateText, revealsInternalInstructions, stripDuplicateCtaWording, stripEmojis, capVocative, userGreeted } from "../../lib/ai/reply-polish";
 import { enforceAssistantGender, countWrongGenderForms, enforceNeutralVoice, countGenderedFirstPerson } from "../../lib/ai/gender";
 import { enforceEmojiCap, enforceLength, enforceForbiddenPhrases } from "../../lib/ai/style-fences";
 import { buildPromptProfile, emojiCapFor, parseThingsToAvoid } from "../../lib/ai/prompt-profile";
@@ -2822,14 +2823,14 @@ async function main(): Promise<void> {
   // (42.1) POST-CTA ACK fires the ack lane: short close, no Gemini, no CTA, NOT the single-token clarify, streak carried.
   {
     const r = await runLane({ message: "מעולה", prevLow: 2 });
-    check("ack lane (runtime): post-CTA 'מעולה' → ACK_CLOSE; no Gemini, no CTA, not single-token-unclear, streak carried (low stays 2)",
-      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false
-      && r.outcome.linkAttached === null && r.outcome.suppressReply !== true
+    check("ack lane (runtime): INV-4 positive-reaction 'מעולה' → SILENCE (not templated 'בשמחה'); no Gemini/CTA, streak carried (low 2)",
+      r.outcome.replyText === "" && r.outcome.suppressReply === true && r.modelCalled === false
+      && r.outcome.linkAttached === null
       && r.outcome.decision.branch === "acknowledgement" && r.low === 2,
-      `reply=${JSON.stringify(r.outcome.replyText)} branch=${r.outcome.decision.branch} model=${r.modelCalled} low=${r.low}`);
+      `reply=${JSON.stringify(r.outcome.replyText)} suppress=${r.outcome.suppressReply} branch=${r.outcome.decision.branch} low=${r.low}`);
     const t = await runLane({ message: "תודה", prevLow: 1 });
-    check("ack lane (runtime): 'תודה' → ACK_CLOSE, never 'לא הצלחתי להבין', no Gemini",
-      t.outcome.replyText === ACK_CLOSE && !/לא הצלחתי להבין/.test(t.outcome.replyText) && t.modelCalled === false);
+    check("ack lane (runtime): INV-4 'תודה' → warm ACK_THANKS ('בכיף'), no Gemini",
+      t.outcome.replyText === ACK_THANKS && t.outcome.suppressReply !== true && t.modelCalled === false);
   }
 
   // (42.2) FAST-LANE VISIBLE BOUNDARY before silence — machine-noise: turn1 clarify → turn2 boundary → turn3 quiet.
@@ -3030,8 +3031,8 @@ async function main(): Promise<void> {
   // (2) FIRST ack after a useful answer → one short close, no Gemini, streak carried (not reset/escalated).
   {
     const r = await runLane({ message: "מעולה", prevLow: 0, lastAssistantReason: "gemini_reply" });
-    check("ack (runtime): FIRST 'מעולה' after a real answer → ACK_CLOSE, no Gemini, not suppressed, low stays 0",
-      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false && r.outcome.suppressReply !== true
+    check("ack (runtime): INV-4 FIRST positive-reaction 'מעולה' → SILENCE (not templated 'בשמחה'), no Gemini, streak carried (low 0)",
+      r.outcome.replyText === "" && r.outcome.suppressReply === true && r.modelCalled === false
       && r.outcome.decision.branch === ACK_REASON && r.low === 0,
       `reply=${JSON.stringify(r.outcome.replyText)} branch=${r.outcome.decision.branch} sup=${r.outcome.suppressReply} low=${r.low}`);
   }
@@ -3078,8 +3079,8 @@ async function main(): Promise<void> {
   // (2) 'יופי' after useful help → terminal close, no Gemini, never "לא הצלחתי להבין".
   {
     const r = await runLane({ message: "יופי", prevLow: 0, transcript: usefulFaq, lastAssistantReason: "gemini_reply" });
-    check("closure (runtime): 'יופי' after a useful answer → short close (ACK_CLOSE, not the clarify), no Gemini, low stays 0",
-      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false && r.outcome.suppressReply !== true
+    check("closure (runtime): INV-4 'יופי' after a useful answer → SILENCE (never the clarify, never 'בשמחה'), no Gemini, low 0",
+      r.outcome.replyText === "" && r.outcome.suppressReply === true && r.modelCalled === false
       && r.outcome.decision.branch === ACK_REASON && r.low === 0,
       `reply=${JSON.stringify(r.outcome.replyText)} model=${r.modelCalled} branch=${r.outcome.decision.branch} low=${r.low}`);
   }
@@ -3142,8 +3143,8 @@ async function main(): Promise<void> {
   // (1) 'סבבה' after a useful FAQ answer (no open offer) → terminal closure, no Gemini.
   {
     const r = await runLane({ message: "סבבה", prevLow: 0, transcript: usefulFaq46, lastAssistantReason: "gemini_reply" });
-    check("soft-affirm (runtime): 'סבבה' after a useful answer → closure (ACK_CLOSE), no Gemini, low stays 0",
-      r.outcome.replyText === ACK_CLOSE && r.modelCalled === false && r.outcome.decision.branch === ACK_REASON && r.low === 0,
+    check("soft-affirm (runtime): INV-4 'סבבה' after a useful answer → SILENCE (closure, not 'בשמחה'), no Gemini, low 0",
+      r.outcome.replyText === "" && r.outcome.suppressReply === true && r.modelCalled === false && r.outcome.decision.branch === ACK_REASON && r.low === 0,
       `reply=${JSON.stringify(r.outcome.replyText)} model=${r.modelCalled} branch=${r.outcome.decision.branch} low=${r.low}`);
   }
   // (2) 'סבבה' after a closure already given → suppressed, no loop.
@@ -3191,7 +3192,7 @@ async function main(): Promise<void> {
   section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
   // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
   // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
-  const SHELL_BASELINE_HASH = "e8dceaf56d"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-06-28 in Phase B2 (consolidated the WHO-YOU-ARE/HOW-YOU-WRITE/OWNER-STYLE-GUIDANCE zones into ONE resolved STYLE block — intended; shell shrank 10336→10128 chars). Prior: da19d1cf33 (Phase 5 RELEVANCE wording).
+  const SHELL_BASELINE_HASH = "1ad4113227"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-06 for Slice S1 (INV-5 natural virtual-assistant identity role + no-invented-titles; INV-2 current-facts-priority & grounding-tightness prompt lines — intended). Prior: e8dceaf56d (Phase B2 consolidated STYLE block).
   {
     const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
     const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
@@ -4592,12 +4593,12 @@ async function main(): Promise<void> {
 
     const rFulfilledSoft = await runLane({ message: "סבבה", prevLow: 0, pendingOffer: bookFulfilledLane,
       transcript: bookSentTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", reply: "מעולה, אני כאן לכל שאלה 🙂" } });
-    check("E2E core regression: fulfilled BOOK + 'סבבה' → no resend, no nudge loop, non-empty safe reply (closure lane can re-engage)",
+    check("E2E core regression: fulfilled BOOK + 'סבבה' → INV-4 SILENCE (no resend, no nudge loop, no link)",
       rFulfilledSoft.outcome.linkAttached !== "booking"
-      && (rFulfilledSoft.outcome.replyText ?? "").trim().length > 0
+      && rFulfilledSoft.outcome.suppressReply === true
       && !(rFulfilledSoft.outcome.replyText ?? "").includes("עדיין מחכה לך")
       && !/https?:\/\//.test(rFulfilledSoft.outcome.replyText ?? ""),
-      `linkAttached=${rFulfilledSoft.outcome.linkAttached} reply="${rFulfilledSoft.outcome.replyText}"`);
+      `linkAttached=${rFulfilledSoft.outcome.linkAttached} sup=${rFulfilledSoft.outcome.suppressReply} reply="${rFulfilledSoft.outcome.replyText}"`);
 
     // Bare "תשלח" (single 4-letter token, no mater-lectionis vowel) — proves the precedence fix: it now
     // reaches the continuation resolver instead of being suppressed by the pre-Gemini consonant-smash gate.
@@ -5013,6 +5014,92 @@ async function main(): Promise<void> {
     const price = await runLane({ message: "כמה עולה תספורת?", prevLow: 0, model: { intent: "faq", action: false, reply: "תספורת עולה 80 שקל" } });
     check("§67 no-regression: non-policy FAQ 'כמה עולה?' → model answer kept (not policy-fenced)",
       (price.outcome.replyText ?? "").includes("80"), `reply="${price.outcome.replyText}"`);
+  })();
+
+  // ── 68. Conversation Integrity Invariants (Slice S1) — INV-1..5 ────────────────
+  section("68. Conversation Integrity Invariants (Slice S1)");
+  // INV-5 — natural assistant identity (persona, pure): a gender-aware natural default; no invented titles.
+  {
+    const caps = { canStartBooking: true, canAnswer: true } as Capabilities;
+    const male = buildReceptionistInstruction(harnessCtx({ assistant_name: "אלי", assistant_gender: "male" }),
+      { factsBlock: "", caps, platformMode: true });
+    const female = buildReceptionistInstruction(harnessCtx({ assistant_name: "מיה", assistant_gender: "female" }),
+      { factsBlock: "", caps, platformMode: true });
+    check("§68 INV-5: identity uses a natural gender-aware role, forbids invented titles, drops the old 'the receptionist of'",
+      male.includes("העוזר הווירטואלי") && female.includes("העוזרת הווירטואלית")
+      && /never invent/i.test(male) && !male.includes("the receptionist of"),
+      `maleRole=${male.includes("העוזר הווירטואלי")} femaleRole=${female.includes("העוזרת הווירטואלית")}`);
+  }
+  // INV-1 — vocative/greeting cadence (pure): strip a leading greeting in an ongoing convo; keep first-turn/greeted; cap name.
+  check("§68 INV-1 pure: ongoing reply strips a leading 'היי {name}'; first-turn & user-greeted keep the greeting",
+    !/^היי/.test(capVocative("היי קובי, יש לך תור מחר", { ongoing: true, userGreeted: false, customerName: "קובי" }))
+    && capVocative("היי קובי, יש לך תור מחר", { ongoing: true, userGreeted: false, customerName: "קובי" }).includes("יש לך תור")
+    && /^היי/.test(capVocative("היי! נעים להכיר, אני אלי", { ongoing: false, userGreeted: false }))
+    && /^היי/.test(capVocative("היי! שמח לעזור", { ongoing: true, userGreeted: true })));
+  check("§68 INV-1 pure: userGreeted detects an opening greeting; the customer name is capped to ≤1 per reply",
+    userGreeted("היי, אפשר תור?") === true && userGreeted("כמה עולה תספורת?") === false
+    && (capVocative("קובי, יש לך תור, נתראה קובי", { ongoing: true, userGreeted: false, customerName: "קובי" }).match(/קובי/g) ?? []).length <= 1);
+  // INV-4 — context-aware acknowledgement (pure).
+  check("§68 INV-4 pure: THANKS → warm ACK_THANKS; understanding/positive ack → silence (never templated 'בשמחה')",
+    ackReplyFor("תודה").text === ACK_THANKS && ackReplyFor("תודה").suppress === false
+    && ackReplyFor("תודה רבה").text === ACK_THANKS
+    && ackReplyFor("הבנתי").suppress === true && ackReplyFor("הבנתי").text === ""
+    && ackReplyFor("אוקיי").suppress === true && ackReplyFor("מעולה").suppress === true);
+  // INV-2 — grounding-tightness (pure): polarity-contradiction backstop + FP guard.
+  check("§68 INV-2 pure: contradictsCoveredFact catches a polarity flip; same-polarity / additive kept",
+    contradictsCoveredFact("כן, יש לנו פינת עישון נוחה", "אין עישון בתוך הסטודיו") === true
+    && contradictsCoveredFact("לא, אסור לעשן כאן", "אפשר לעשן במספרה") === true
+    && contradictsCoveredFact("כן, אפשר לעשן במספרה", "אפשר לעשן במספרה") === false
+    && contradictsCoveredFact("כן, יש חניה חינם ממש מול הכניסה", "יש חניה") === false
+    && kbFactForPolicyTopic("smoking", [{ title: "עישון", content: "אין עישון בתוך הסטודיו" }]) === "אין עישון בתוך הסטודיו"
+    && groundedFactReply("אין עישון בתוך הסטודיו").includes("לפי המידע שיש לי"));
+  // Runtime lane E2E (real runPlatformTurn through the test seam).
+  await (async () => {
+    // INV-1 E2E — an ONGOING business reply must not open with a greeting; a FIRST-turn greeting is kept.
+    const ongoing = await runLane({ message: "כמה עולה צביעת שיער?", prevLow: 0,
+      historyTurns: [{ role: "user", text: "היי" }, { role: "model", text: "היי, איך אפשר לעזור?" }],
+      model: { intent: "faq", action: false, reply: "היי, צביעת שיער עולה 250 שקל." } });
+    check("§68 INV-1 E2E: an ongoing reply no longer opens with 'היי'",
+      !/^היי/.test(ongoing.outcome.replyText ?? "") && (ongoing.outcome.replyText ?? "").includes("250"),
+      `reply="${ongoing.outcome.replyText}"`);
+    const firstTurn = await runLane({ message: "כמה עולה תספורת?", prevLow: 0,
+      model: { intent: "faq", action: false, reply: "היי! תספורת עולה 80 שקל." } });
+    check("§68 INV-1 E2E no-regression: a first-turn greeting is kept",
+      /^היי/.test(firstTurn.outcome.replyText ?? ""), `reply="${firstTurn.outcome.replyText}"`);
+    // INV-4 E2E — 'הבנתי' → silence (never 'בשמחה'); 'תודה' → warm 'בכיף'.
+    const understood = await runLane({ message: "הבנתי", prevLow: 0 });
+    check("§68 INV-4 E2E: 'הבנתי' → silence, never the templated 'בשמחה 🙂', no Gemini",
+      understood.outcome.suppressReply === true && !/בשמחה/.test(understood.outcome.replyText ?? "") && understood.modelCalled === false,
+      `reply="${understood.outcome.replyText}" suppress=${understood.outcome.suppressReply}`);
+    const thanks = await runLane({ message: "תודה", prevLow: 0 });
+    check("§68 INV-4 E2E: 'תודה' → warm ACK_THANKS", thanks.outcome.replyText === ACK_THANKS);
+    // INV-3 E2E — soft interest 'מעניין אותי {service}' → OFFER (no link); explicit booking → link.
+    const interest = await runLane({ message: "מעניין אותי תספורת", prevLow: 0,
+      model: { intent: "booking", appt: "BOOK", action: true, reply: "כיף! תספורת זה תמיד רעיון טוב." } });
+    check("§68 INV-3 E2E: soft interest 'מעניין אותי תספורת' → NO auto booking link (offer instead)",
+      interest.outcome.linkAttached === null,
+      `link=${interest.outcome.linkAttached} reply="${interest.outcome.replyText}"`);
+    const explicit = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0,
+      model: { intent: "booking", appt: "BOOK", action: true, reply: "בשמחה!" } });
+    check("§68 INV-3 E2E no-regression: explicit 'אני רוצה לקבוע תור' → booking link",
+      explicit.outcome.linkAttached === "booking", `link=${explicit.outcome.linkAttached}`);
+    // INV-2 E2E — a covered-KB contradiction is corrected; a matching answer is kept; unknown still defers.
+    const smokingNo = [{ category: "faq", title: "עישון", content: "אין עישון בתוך הסטודיו" }];
+    const contra = await runLane({ message: "אפשר לעשן?", prevLow: 0, kb: smokingNo,
+      model: { intent: "faq", action: false, reply: "כן, יש לנו פינת עישון נוחה במספרה." } });
+    check("§68 INV-2 E2E: KB says NO smoking but reply affirms → grounded correction (drops 'פינת עישון')",
+      (contra.outcome.replyText ?? "").includes("לפי המידע שיש לי") && !(contra.outcome.replyText ?? "").includes("פינת עישון"),
+      `reply="${contra.outcome.replyText}"`);
+    const kept = await runLane({ message: "אפשר לעשן?", prevLow: 0,
+      kb: [{ category: "faq", title: "עישון", content: "אפשר לעשן במספרה" }],
+      model: { intent: "faq", action: false, reply: "כן, אפשר לעשן במספרה." } });
+    check("§68 INV-2 E2E FP: covered KB matches reply polarity → answer KEPT (not over-fenced)",
+      (kept.outcome.replyText ?? "").includes("אפשר לעשן") && !(kept.outcome.replyText ?? "").includes("לפי המידע שיש לי"),
+      `reply="${kept.outcome.replyText}"`);
+    const unknown = await runLane({ message: "אפשר לעשן?", prevLow: 0,
+      model: { intent: "faq", action: false, reply: "בטח, יש פינת עישון." } });
+    check("§68 INV-2 E2E no-regression: uncovered policy still defers (class F), never invents an amenity",
+      !(unknown.outcome.replyText ?? "").includes("פינת עישון"), `reply="${unknown.outcome.replyText}"`);
   })();
 
   // ── summary ────────────────────────────────────────────────────────────────────
