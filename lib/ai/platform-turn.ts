@@ -211,8 +211,9 @@ const WHICH_LINK_CLARIFY =
 // wants to book / asks how / asks for the site — so the link never ships next to a vague model line.
 // No service words, gender-neutral, no emoji baked in (the outbound chokepoint owns emoji, and the CTA
 // label stays emoji-free for consistent rendering). The booking link + label are appended after it.
-// NOTE: deliberately avoids "התור נקבע" (would trip the booked-claim fence — chat never books) and
-// "איזה שירות" (would trip the in-chat scheduling-question fence). Describes the SITE's flow, not a claim.
+// NOTE: deliberately avoids "התור נקבע" (would trip the booked-claim fence — chat never books). Keeps to
+// the SITE's flow rather than a scheduling Q&A; a bounded "איזה שירות?" discovery is now allowed
+// (see SCHEDULING_Q), but this deterministic copy simply invites the customer to ask first if unsure.
 const BOOK_GUIDANCE_FULL =
   "בשמחה. את קביעת התור עושים דרך הקישור — בוחרים שם שירות, יום ושעה ומאשרים, וזה הכול. ואם יש התלבטות מה מתאים, אפשר לשאול אותי קודם.";
 // Short form for the anti-repetition second tier (a customer sending several booking messages in a row
@@ -3271,26 +3272,29 @@ export function reconcileLinkWording(
   return { replyText: `${NO_UPCOMING_MANAGE}\n${bookingUrl}`, interactive: reconciledInteractive, reconciled: true };
 }
 
-// In-chat selection questions the model must never ask in platform mode (the
-// website collects service/day/time AND lets the customer pick which appointment).
-// Covers booking ("איזה שירות/יום/שעה?") and manage ("איזה תור?", "לאיזה תאריך?").
+// In-chat SCHEDULING questions the model must never ask in platform mode — day, time, and which
+// appointment (the website collects day/time and lets the customer pick the appointment).
+// BOUNDED SERVICE-DISCOVERY: a SERVICE-pick question ("לאיזה שירות לקבוע?") is DISCOVERY, not scheduling,
+// and is allowed ONCE (see persona APPOINTMENTS). So "שירות"/"טיפול"/"service" are deliberately NOT matched
+// here — this fence strips day/time/appointment/preference-collection only, never a service clarification.
 const SCHEDULING_Q = new RegExp(
   [
-    "איז[הו]\\s+(שירות|טיפול|יום|תאריך|שעה|תור)",
+    "איז[הו]\\s+(יום|תאריך|שעה|תור)",
     "מתי\\s+(נוח|בא\\s*לך|מתאים|תרצ|תוכל|יתאים|מעדיפ|תעדיפ|נראה|להגיע|לקבוע|לבוא)",
     "מתאים\\s+לך\\s+\\S*\\s*(שעה|יום|תאריך|מועד)",
     "שעה\\s+(מסוימת|מסויימת|ספציפית|שנוחה|שמתאימה)",
     "מה\\s+התאריך",
-    "באיז[הו]\\s+(תאריך|שעה|שירות|יום|תור)",
-    "לאיז[הו]\\s+(שעה|תאריך|יום|שירות|תור)",
+    "באיז[הו]\\s+(תאריך|שעה|יום|תור)",
+    "לאיז[הו]\\s+(שעה|תאריך|יום|תור)",
     "איז[הו]\\s+\\S{1,12}\\s+(את|אתה)\\s+(רוצ|מעוניינ|תרצ)",
-    // Soft preference-collection — the PAGE collects service/day/time, so the chat must
-    // not (live: "יש לך העדפה לגבי יום או שעה...?" slipped through the scheduling fence).
+    // Soft preference-collection — the PAGE collects day/time, so the chat must not (live:
+    // "יש לך העדפה לגבי יום או שעה...?" slipped through). Day/time preference only.
     "יש\\s+לך\\s+העדפ",
-    "העדפ\\S*\\s+(לגבי\\s+)?(יום|שעה|תאריך|מועד|שירות|טיפול)",
-    // English forms — the model occasionally answers in English on thin context.
-    "\\bwhich\\s+(appointment|service|one|day|time|date)",
-    "\\bwhat\\s+(date|time|service)\\b",
+    "העדפ\\S*\\s+(לגבי\\s+)?(יום|שעה|תאריך|מועד)",
+    // English forms — the model occasionally answers in English on thin context. ("which/what service"
+    // is DISCOVERY, allowed — deliberately not matched.)
+    "\\bwhich\\s+(appointment|one|day|time|date)",
+    "\\bwhat\\s+(date|time)\\b",
     "\\bwhen\\s+(would|works|suits)",
   ].join("|"),
   "i"

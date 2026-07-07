@@ -113,6 +113,7 @@ import { FALLBACK, isLowValueAck, type ReceptionistTurn, type ReceptionistDecisi
 import type { DB } from "../../lib/booking/helpers";
 import { buildFacts, formatFacts, scopeKnowledge, kbTierForMessage, type FactIndex, type BusinessFacts, type Capabilities } from "../../lib/ai/facts";
 import { classifyKbNeed, hasInfoQuestionShape, isNonInfoAck, isBookingImperative, messageNamesService } from "../../lib/ai/kb-relevance";
+import { PERSONA_PACKS } from "../../lib/ai/persona-packs";
 
 // ── tiny harness ────────────────────────────────────────────────────────────────
 let pass = 0;
@@ -363,6 +364,14 @@ async function main(): Promise<void> {
       const r = defuseSchedulingQuestion("אני כאן כדי לעזור לך לקבוע תור. יש לך העדפה לגבי יום או שעה מסוימים, או אולי שירות ספציפי שאתה מחפש?");
       return r.defused && !r.text.includes("העדפה") && !r.text.includes("?");
     })());
+  // Bounded service-discovery (2026-07-08): a SERVICE-pick clarification is DISCOVERY, not scheduling → NOT defused.
+  check("§6 bounded discovery: a service-pick question is NOT defused (allowed pre-booking clarification)",
+    defuseSchedulingQuestion("לאיזה שירות לקבוע את התור, או שעדיף שאציג בקצרה את השירותים?").defused === false);
+  check("§6 bounded discovery: a DAY question is STILL defused (scheduling stays on the page)",
+    defuseSchedulingQuestion("לאיזה יום נוח לך?").defused === true);
+  check("§6 bounded discovery: English 'which service' is NOT defused; 'which day' still is",
+    defuseSchedulingQuestion("which service would you like?").defused === false
+    && defuseSchedulingQuestion("which day works for you?").defused === true);
 
   // ── 6b. Action-refusal fence (Phase 5: no false "can't book/reschedule/cancel") ─
   section("6b. Action-refusal fence (platform never falsely refuses an operation)");
@@ -3193,7 +3202,7 @@ async function main(): Promise<void> {
   section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
   // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
   // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
-  const SHELL_BASELINE_HASH = "1ad4113227"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-06 for Slice S1 (INV-5 natural virtual-assistant identity role + no-invented-titles; INV-2 current-facts-priority & grounding-tightness prompt lines — intended). Prior: e8dceaf56d (Phase B2 consolidated STYLE block).
+  const SHELL_BASELINE_HASH = "b182d75008"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-08 for BOUNDED SERVICE-DISCOVERY (platform APPOINTMENTS rewrite: allow ONE service-discovery clarification before the link; keep no in-chat scheduling — intended). Prior: 1ad4113227 (Slice S1 INV-5 identity + INV-2 grounding lines); e8dceaf56d (Phase B2 consolidated STYLE block).
   {
     const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
     const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
@@ -5205,6 +5214,95 @@ async function main(): Promise<void> {
       kbCount("רוצה תספורת, כמה עולה?") > 0 && kbCount("מה השירותים שלכם?") > 0 && kbCount("מה מדיניות הביטול?") > 0);
     check("§69 payload: a 'none' turn's facts block is meaningfully smaller than the full-KB baseline",
       formatFacts(buildFacts(ctx69, { message: "היי" })).length < beforeFacts.length);
+  }
+
+  // ── 70. Persona A/B — Warm & Casual vs Professional & Elegant (rendered prompt; envelope invariant) ──
+  section("70. Persona A/B (rich packs)");
+  {
+    const warm = personaPrompt({ persona_pack: "warm_casual" });
+    const prof = personaPrompt({ persona_pack: "professional_elegant" });
+    const custom = personaPrompt({}); // default → legacy Custom path (migration-safe)
+    const wp = PERSONA_PACKS.warm_casual, pp = PERSONA_PACKS.professional_elegant;
+    const warmMark = "חם, אנושי וזורם", profMark = "רגוע, מכובד ואמין";
+    check("§70 Warm renders its voiceText; Professional does not",
+      warm.includes(warmMark) && !prof.includes(warmMark));
+    check("§70 Professional renders its voiceText; Warm does not",
+      prof.includes(profMark) && !warm.includes(profMark));
+    check("§70 default/custom renders NEITHER pack voiceText (existing tenants stay on the legacy path)",
+      !custom.includes(warmMark) && !custom.includes(profMark));
+    check("§70 the two personas are meaningfully different prompts", warm !== prof);
+    check("§70 emoji: Warm allows contextual emoji, Professional defaults to none",
+      warm.includes("1-2 fitting emojis") && prof.includes("ZERO emojis")
+      && warm.includes("אימוג׳י קונטקסטואלי") && prof.includes("בלי אימוג׳י"));
+    check("§70 emoji policy data: Warm baseCap > Professional baseCap; both guardCap 0 (restraint under guard)",
+      wp.emoji.baseCap > pp.emoji.baseCap && wp.emoji.guardCap === 0 && pp.emoji.guardCap === 0);
+    check("§70 vectors: Warm warmth > Professional warmth; Professional formality > Warm formality",
+      wp.styleVector.warmth > pp.styleVector.warmth && pp.styleVector.formality > wp.styleVector.formality);
+    // ENVELOPE NON-OVERRIDABLE — truth/booking/output/style-only rules are IDENTICAL across the two packs.
+    const envMarks = [
+      "BUSINESS FACTS (source of truth)", "OUTPUT — strict JSON only",
+      "SERVICE DISCOVERY (allowed, ONCE)", "NEVER run a scheduling flow in chat",
+      "That description is your VOICE and personality ONLY",
+    ];
+    check("§70 envelope non-overridable: truth/booking/output/style-only rules identical for both packs",
+      envMarks.every((m) => warm.includes(m) && prof.includes(m)));
+    check("§70 both packs render Voice targets + the style-only subordination fence (persona felt but fenced)",
+      warm.includes("Voice targets:") && prof.includes("Voice targets:")
+      && warm.includes("follow the rules") && prof.includes("follow the rules"));
+  }
+
+  // ── 71. Bounded service-discovery (platform APPOINTMENTS law) ──────────────────────────────────────
+  section("71. Bounded service-discovery");
+  {
+    const p = personaPrompt({});
+    check("§71 prompt ALLOWS one bounded service-discovery clarification",
+      p.includes("SERVICE DISCOVERY (allowed, ONCE)"));
+    check("§71 prompt no longer carries the old blanket 'NEVER run a booking Q&A' prohibition",
+      !p.includes("NEVER run a booking Q&A"));
+    check("§71 prompt still forbids in-chat scheduling (day/time/name/phone/slots)",
+      p.includes("NEVER run a scheduling flow in chat") && p.includes("do not ask the day, the time"));
+    check("§71 fence: a service-discovery question survives; a day/time one is stripped",
+      defuseSchedulingQuestion("לאיזה שירות לקבוע את התור?").defused === false
+      && defuseSchedulingQuestion("באיזו שעה נוח לך?").defused === true);
+    check("§71 Gate A preserved: mixed booking+info keeps KB; pure known-service booking drops it",
+      kbTierForMessage("רוצה תספורת, כמה עולה?", SERVICES) !== "none"
+      && kbTierForMessage("אני רוצה לקבוע תור לתספורת", SERVICES) === "none");
+  }
+  await (async () => {
+    // E2E (robust): a DAY-scheduling reply on a booking turn is still defused/bridged — no in-chat scheduling.
+    const sched = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0,
+      model: { intent: "booking", appt: "BOOK", action: true, reply: "בשמחה! לאיזה יום נוח לך שנקבע?" } });
+    check("§71 E2E: a DAY-scheduling reply stays blocked end-to-end (bridged, not asked in chat)",
+      !(sched.outcome.replyText ?? "").includes("לאיזה יום"), `reply="${sched.outcome.replyText}"`);
+  })();
+
+  // ── 72. Gender-neutral scorer + persona restraint (INITIAL coverage; full system is a later chunk) ──
+  section("72. Gender-neutral + restraint (initial)");
+  {
+    // Customer-address gendering scorer: counts 2nd-person GENDERED verbs/pronouns, NOT the object-marker "את".
+    // JS \b doesn't work on Hebrew; bound with "no Hebrew letter before/after" (aleph–tav) so trailing
+    // punctuation (e.g. "רוצה,") still counts and the object-marker "את " (followed by a noun) never does.
+    const HB = "\\u05d0-\\u05ea";
+    const GENDERED_ADDRESS_RE = new RegExp(
+      `(?<![${HB}])(?:אתה|תוכלי?|תרצ[יה]|מעוניינת)(?![${HB}])` +
+      `|(?<![${HB}])את\\s+(?:יכולה|רוצה|צריכה|מעדיפה|בטוחה|חייבת)(?![${HB}])`,
+      "g");
+    const genderedAddressCount = (t: string) => (t.match(GENDERED_ADDRESS_RE) ?? []).length;
+    check("§72 scorer: the object-marker 'את' is NOT flagged ('את התור והשם ממלאים באתר')",
+      genderedAddressCount("את התור והשם ממלאים באתר") === 0);
+    check("§72 scorer: feminine address IS flagged ('אם את רוצה, אפשר לשלוח קישור')",
+      genderedAddressCount("אם את רוצה, אפשר לשלוח קישור") >= 1);
+    check("§72 scorer: masculine forms flagged ('תוכל להיכנס' / 'אתה רוצה')",
+      genderedAddressCount("תוכל להיכנס מכאן") >= 1 && genderedAddressCount("אתה רוצה לקבוע?") >= 1);
+    check("§72 scorer: a natural NEUTRAL reply scores 0 ('אפשר לשלוח קישור לקביעת תור?')",
+      genderedAddressCount("אפשר לשלוח קישור לקביעת תור?") === 0);
+    check("§72 prompt instructs neutral customer addressing by default",
+      personaPrompt({}).includes("neutral phrasing") || personaPrompt({}).includes("neutral forms"));
+    // Restraint (data-level; the runtime emoji-under-guard coupling is a later chunk): guard collapses emoji.
+    check("§72 restraint data: both packs declare guardCap 0 (emoji removed under serious/guard)",
+      PERSONA_PACKS.warm_casual.emoji.guardCap === 0 && PERSONA_PACKS.professional_elegant.emoji.guardCap === 0);
+    check("§72 Professional pack guards against bureaucratic overuse (ניתן/בהחלט)",
+      PERSONA_PACKS.professional_elegant.promptRules.some((r) => r.includes("ניתן") && r.includes("בהחלט")));
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────
