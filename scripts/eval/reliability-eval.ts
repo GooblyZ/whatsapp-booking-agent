@@ -43,6 +43,7 @@ import {
   forcesDeterministicClarify, LOW_SIGNAL_SHORT, LOW_SIGNAL_QUIET_REMINDER,
   machineNoisePlan, injectionPlan, looksLikeInjection, INJECTION_REFUSAL, OFF_TOPIC_DEFLECTION,
   LOW_VALUE_BOUNDARY, ACK_CLOSE, LOW_VALUE_DEEP_AT, MANAGE_LINE,
+  isVagueContinuation, announcesExistingAppointment,
   planTransientContinuity, TRANSIENT_MICRO_ACK, fallbackTypeForLowSignal,
   shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
   hasPendingAnswerExpectedQuestion,
@@ -3202,7 +3203,7 @@ async function main(): Promise<void> {
   section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
   // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
   // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
-  const SHELL_BASELINE_HASH = "c38d47749a"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-08 for LIVE-QA persona fixes (RELEVANCE faq-vs-meta for business-about #3; firm gender-neutral customer address + slash-gender ban + gender-correction handling #2; explicit no-guess-on-ambiguous #7 — all intended). Prior: b182d75008 (bounded service-discovery); 1ad4113227 (Slice S1 INV-5 identity + INV-2 grounding); e8dceaf56d (Phase B2 STYLE block).
+  const SHELL_BASELINE_HASH = "ca7da1df21"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-08 for PROFESSIONAL LIVE-QA fixes (never volunteer appointment details unless asked #3; answer-only-what-asked + no vague marketing claims #4/#5; neutral-address ALWAYS incl. gender/neutral-correction handling, no mirror-switch #6). Prior: c38d47749a (Warm live-QA persona fixes); b182d75008 (bounded service-discovery); 1ad4113227 (S1 INV-5/INV-2).
   {
     const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
     const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
@@ -4489,8 +4490,8 @@ async function main(): Promise<void> {
     const resolve = (
       latest: string,
       prevPending: { kind: "BOOK" | "MANAGE"; stage: "offered" | "fulfilled"; service?: string; at: number } | null,
-      lastWasReactive = true, fallbackOfferedBooking = false,
-    ) => resolveContinuation({ latest, prevPending, lastWasReactive, fallbackOfferedBooking });
+      lastWasReactive = true, fallbackOfferedBooking = false, lastTurnOfferedPending = true,
+    ) => resolveContinuation({ latest, prevPending, lastWasReactive, fallbackOfferedBooking, lastTurnOfferedPending });
 
     check("no pendingOffer + bare 'כן' → NONE (no invented intent)",
       resolve("כן", null).status === "NONE" && resolve("כן", null).offerKind === null);
@@ -4498,6 +4499,20 @@ async function main(): Promise<void> {
     check("offered BOOK + 'כן'/'סבבה' → OPEN_OFFER/BOOK (send the link)",
       resolve("כן", bookOffered).status === "OPEN_OFFER" && resolve("כן", bookOffered).offerKind === "BOOK"
       && resolve("סבבה", bookOffered).status === "OPEN_OFFER");
+
+    // Live QA (Professional #2): a STALE pending offer must not be hijacked by a bare confirmation after an
+    // unrelated FAQ/parking/complaint turn (lastTurnOfferedPending=false). The offer is only confirmable when
+    // the IMMEDIATELY previous assistant turn actually offered it.
+    check("§62 stale: offered BOOK + 'אוקיי' but last turn did NOT offer → NONE (no link hijack) (Live QA #2)",
+      resolve("אוקיי", bookOffered, true, false, false).status === "NONE"
+      && resolve("כן", bookOffered, true, false, false).status === "NONE"
+      && resolve("סבבה", bookOffered, true, false, false).status === "NONE");
+    check("§62 stale: fulfilled BOOK + 'כן' but last turn did NOT offer → NONE (no phantom resend)",
+      resolve("כן", bookFulfilled, true, false, false).status === "NONE");
+    check("§62 stale: EXPLICIT 'תשלח' still resends even if last turn did not offer (direct request)",
+      resolve("תשלח", bookFulfilled, true, false, false).status === "EXPLICIT_RESEND");
+    check("§62 no-regress: offered BOOK + 'כן' WITH last turn offering → OPEN_OFFER (unchanged)",
+      resolve("כן", bookOffered, true, false, true).status === "OPEN_OFFER");
 
     check("fulfilled BOOK + 'כן'/'סבבה' → FULFILLED/BOOK (core invariant: never reopens the same offer)",
       resolve("כן", bookFulfilled).status === "FULFILLED" && resolve("כן", bookFulfilled).offerKind === "BOOK"
@@ -5341,6 +5356,49 @@ async function main(): Promise<void> {
     const engaged = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, pendingOffer: { kind: "BOOK", stage: "offered", source: "soft_interest_offer", at: Date.now() }, model: { intent: "booking", appt: "BOOK", action: true } });
     check("§73 booking-no-service but booking ALREADY engaged (prior offer) → link attaches, no loop",
       engaged.outcome.linkAttached === "booking", `link=${engaged.outcome.linkAttached}`);
+  }
+
+  section("74. Live QA — Professional failures (stale confirm, appt hallucination, neutral, groundedness)");
+  {
+    // #2 stale contextual-confirm: a pending BOOK offer + an UNRELATED FAQ last turn + bare 'אוקיי' → NO link.
+    const staleConfirm = await runLane({ message: "אוקיי", prevLow: 0,
+      pendingOffer: { kind: "BOOK", stage: "offered", source: "soft_interest_offer", at: Date.now() - 60_000 },
+      transcript: "Assistant (you, earlier): אין עישון בתוך הסטודיו.", lastAssistantSource: "ai_turn",
+      model: { intent: "smalltalk", action: false, reply: "מעולה" } });
+    check("§74 #2 stale-confirm: pending BOOK + unrelated FAQ last turn + 'אוקיי' → NO booking link",
+      staleConfirm.outcome.linkAttached === null, `link=${staleConfirm.outcome.linkAttached}`);
+    // Contrast (no-regress): an OFFER last turn + 'כן' → link still attaches (offer copy is recognized).
+    const freshConfirm = await runLane({ message: "כן", prevLow: 0,
+      pendingOffer: { kind: "BOOK", stage: "offered", source: "soft_interest_offer", at: Date.now() - 60_000 },
+      transcript: "Assistant (you, earlier): רוצה שאשלח לך קישור?", lastAssistantSource: "ai_turn",
+      model: { intent: "unclear", action: false, reply: "סבבה" } });
+    check("§74 #2 no-regress: OFFER last turn + 'כן' → booking link (offer copy recognized)",
+      freshConfirm.outcome.linkAttached === "booking", `link=${freshConfirm.outcome.linkAttached}`);
+
+    // #3 vague continuation: 'אוקיי בוא נמשיך' → neutral clarify, never the model's volunteered appointment.
+    const vague = await runLane({ message: "אוקיי בוא נמשיך", prevLow: 0,
+      model: { intent: "unclear", action: false, reply: "יש לך תור פנוי ב-8/7 בשעה 12:00 לצביעת שיער." } });
+    check("§74 #3 vague-continuation → neutral clarify, no appointment details, no link",
+      vague.outcome.linkAttached === null && /במה להמשיך/.test(vague.outcome.replyText)
+      && !/12:00|צביעת|8\/7/.test(vague.outcome.replyText), `reply="${vague.outcome.replyText}"`);
+    check("§74 #3 detectors: isVagueContinuation + announcesExistingAppointment (object-marker-safe)",
+      isVagueContinuation("בוא נמשיך") && isVagueContinuation("אז מה עכשיו") && !isVagueContinuation("כמה עולה תספורת?")
+      && announcesExistingAppointment("שמתי לב שיש לך תור ל-8/7") && announcesExistingAppointment("יש לך תור פנוי")
+      && !announcesExistingAppointment("תספורת עולה 80 שקל"));
+
+    // #6 neutral address is ALWAYS (no mirror-switch on a stated gender); acknowledges a neutral/gender request.
+    check("§74 #6 prompt: customer address neutral ALWAYS + acknowledges a neutral/gender correction (no switch)",
+      personaPrompt({}).includes("GENDER-NEUTRAL Hebrew ALWAYS")
+      && personaPrompt({}).includes("אמשיך בניסוח ניטרלי")
+      && personaPrompt({}).includes("Do NOT switch to masculine or feminine"));
+    check("§74 #6 prompt: even a MALE-gendered assistant addresses the CUSTOMER neutrally always",
+      personaPrompt({ assistant_gender: "male" }).includes("address the CUSTOMER in gender-neutral forms ALWAYS"));
+
+    // #4/#5 groundedness + answer-only-what-asked.
+    check("§74 #4/#5 prompt: answer ONLY what's asked (no volunteered parking/location) + no vague marketing claims",
+      personaPrompt({}).includes("answer ONLY what was asked") && personaPrompt({}).includes("מותאם אישית לצרכים שלך"));
+    check("§74 #4/#5 pack: professional_elegant forbids over-answering + unsupported marketing claims",
+      PERSONA_PACKS.professional_elegant.promptRules.some((r) => r.includes("שלא נשאלו") && r.includes("מותאם אישית")));
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────

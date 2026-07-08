@@ -206,6 +206,24 @@ const COLD_YES_CLARIFY =
 // or the last outbound was proactive) — never guess which link; ask once, same spirit as COLD_YES_CLARIFY.
 const WHICH_LINK_CLARIFY =
   "לא בטוח/ה לאיזה קישור התכוונת 🙂 לקביעת תור חדש, או לניהול תור קיים?";
+// ── VAGUE-CONTINUATION + UNSOLICITED APPOINTMENT-DETAIL (Live QA Professional #3) ─────────────────
+// A vague continuation ("בוא נמשיך", "אז מה עכשיו") carries no actionable intent → answer with a neutral
+// clarification, never a guess and never volunteered appointment details.
+const CONTINUATION_CLARIFY = "בטח. במה להמשיך — קביעת תור, שינוי תור, או שאלה על העסק?";
+const VAGUE_CONTINUATION_RE =
+  /^(?:אוקיי?\s*|בסדר\s*|טוב\s*|יאללה\s*|סבבה\s*)?(?:בוא[יי]?\s*נמשיך|בוא[יי]?\s*נתקדם|נמשיך|נתקדם|אז\s*מה\s*עכשיו|מה\s*עכשיו|מה\s*הלאה|מה\s*עוד|מה\s*הצעד\s*הבא)\s*[!.?…]*$/;
+// The model announced an EXISTING appointment ("יש לך תור…"/"התור שלך…") — only allowed on an explicit
+// LIST/MANAGE turn. Business-agnostic; matches the announcement PHRASING, not a specific date/service.
+const APPT_ANNOUNCE_RE =
+  /יש\s+ל(?:ך|כם)\s+(?:כבר\s+)?(?:תור|פגיש)|ה?תור\s+שלך|ה?פגיש\S*\s+שלך|תור\s+קיים|תור\s+פנוי|שמתי\s+לב\s+שיש\s+ל(?:ך|כם)/;
+/** True when the WHOLE message is a vague "let's continue / what now" filler with no actionable intent. */
+export function isVagueContinuation(message: string): boolean {
+  return VAGUE_CONTINUATION_RE.test((message ?? "").trim());
+}
+/** True when a reply volunteers an existing-appointment announcement (guarded off non-LIST/MANAGE turns). */
+export function announcesExistingAppointment(reply: string): boolean {
+  return APPT_ANNOUNCE_RE.test(reply ?? "");
+}
 // ── BOOKING-GUIDANCE COPY (Slice E1) ─────────────────────────────────────────────
 // Deterministic, business-agnostic explanation of HOW booking works, used when the customer clearly
 // wants to book / asks how / asks for the site — so the link never ships next to a vague model line.
@@ -842,8 +860,15 @@ export async function runPlatformTurn(
   // message) fails open to reactive so behavior on unmigrated data never regresses.
   const lastWasReactive = memory.lastAssistantSource == null
     || isReactiveSource(memory.lastAssistantSource as OutboundSource);
+  // Live QA (Professional #2): did our IMMEDIATELY previous reply actually offer/send the pending action?
+  // A BOOK pending needs a booking offer or a sent booking link last turn; a MANAGE pending needs a sent
+  // manage link. Unrelated FAQ/parking/complaint turns leave all these false → a stale pending can't confirm.
+  const lastTurnOfferedPending = prevPending?.kind === "MANAGE"
+    ? lastContract.sentManageLink
+    : (lastContract.offeredBooking || lastContract.sentBookingLink || LAST_TURN_BOOKING_OFFER_RE.test(lastAssistant ?? ""));
   const continuation = resolveContinuation({
     latest, prevPending, lastWasReactive, fallbackOfferedBooking: lastContract.offeredBooking,
+    lastTurnOfferedPending,
   });
   // Topic switch (latest wins): a NEW non-manage topic while our recent reply was a
   // manage/cancel/link/help thread → tell the model to answer THIS message, not the thread.
@@ -1726,6 +1751,25 @@ export async function runPlatformTurn(
     if (r.reconciled) console.log("[platform-turn] wording/link-kind fence: manage wording + booking link → honest no-upcoming reply");
   }
 
+  // ── VAGUE-CONTINUATION CLARIFY + UNSOLICITED APPOINTMENT-DETAIL GUARD (Live QA Professional #3) ──
+  //    Runs AFTER all reply-mutating lanes as a deterministic backstop (the model-independent net — flash-
+  //    lite volunteers appointment details despite the prompt). (1) A vague continuation → a neutral
+  //    clarification, never a guess. (2) The model must NEVER volunteer an existing appointment's
+  //    date/time/service unless the customer explicitly asked to view/manage it (a LIST/MANAGE route). Never
+  //    overrides an attached link or a manage-family route (those legitimately surface appointments).
+  const manageFamilyRoute = platformRoute === "LIST" || platformRoute === "MANAGE"
+    || platformRoute === "CANCEL" || platformRoute === "RESCHEDULE";
+  if (decision.ok && !guidanceHandled && !behaviorHandled && linkAttached === null && isVagueContinuation(latest)) {
+    replyText = CONTINUATION_CLARIFY;
+    platformRoute = "NONE"; platformRouteReason = "vague_continuation";
+    console.log("[platform-turn] vague continuation → neutral clarification (no invented context)");
+  } else if (decision.ok && linkAttached === null && !manageFamilyRoute
+             && announcesExistingAppointment(replyText) && !isManageHelpTopic(latest)) {
+    replyText = CONTINUATION_CLARIFY;
+    if (platformRouteReason === "-") platformRouteReason = "appt_detail_guard";
+    console.log("[platform-turn] appointment-detail guard: neutralized unsolicited existing-appointment details (route≠LIST/MANAGE)");
+  }
+
   // ── SET / CARRY the short-term pending offer: remember a platform-safe action we offered or
   //    attached this turn, so a LATER bare "כן" resolves to it. undefined ⇒ carry the existing
   //    one forward; object ⇒ refresh. Never set on a cold-yes clarification or a low-signal
@@ -2059,6 +2103,11 @@ export interface ContinuationInput {
    *  deriveLastAssistantContract(transcript).offeredBooking, computed by the CALLER. Consulted ONLY
    *  when there is no persisted `prevPending` at all; never overrides a persisted offer's stage. */
   fallbackOfferedBooking: boolean;
+  /** Live QA (Professional #2): did the IMMEDIATELY previous assistant turn actually offer/send the
+   *  pending action (offeredBooking/sentBookingLink for a BOOK pending; sentManageLink for MANAGE)?
+   *  A bare confirmation may resolve a pending offer ONLY when this holds — an unrelated FAQ/meta/complaint
+   *  turn in between makes the pending STALE, so "אוקיי" must not hijack it into a link. */
+  lastTurnOfferedPending: boolean;
 }
 /**
  * Precedence (top to bottom): a bare DECLINE always clears first, regardless of any other signal. A
@@ -2072,11 +2121,15 @@ export interface ContinuationInput {
  * (fallbackOfferedBooking) can still open a new offer. Everything else is NONE.
  */
 export function resolveContinuation(input: ContinuationInput): ContinuationVerdict {
-  const { latest, prevPending, lastWasReactive, fallbackOfferedBooking } = input;
+  const { latest, prevPending, lastWasReactive, fallbackOfferedBooking, lastTurnOfferedPending } = input;
   if (isBareDecline(latest)) return { status: "DECLINED", offerKind: prevPending?.kind ?? null };
   if (prevPending && lastWasReactive) {
     if (isExplicitLinkRequest(latest)) return { status: "EXPLICIT_RESEND", offerKind: prevPending.kind };
-    if (isBareAffirmation(latest)) {
+    // Live QA (Professional #2): a bare confirmation ("אוקיי"/"כן"/"סבבה") resolves the pending offer ONLY
+    // when the IMMEDIATELY previous assistant turn actually offered/sent it. If an unrelated FAQ/meta/
+    // complaint turn intervened (lastTurnOfferedPending=false), the pending is STALE → do NOT confirm it
+    // into a link; fall through to NONE. (An explicit "תשלח" above is a direct request and still resends.)
+    if (isBareAffirmation(latest) && lastTurnOfferedPending) {
       return prevPending.stage === "fulfilled"
         ? { status: "FULFILLED", offerKind: prevPending.kind }
         : { status: "OPEN_OFFER", offerKind: prevPending.kind };
@@ -2747,6 +2800,11 @@ const ASKED_WHICH_RE = /איזה\s+תור|מה\s+מעניין|מה\s+תרצ|לא
 // Did OUR last reply offer to book / propose scheduling? Lets a terse "כן" that follows
 // be resolved into a booking confirmation (→ booking link), distinct from a help offer.
 const BOOKING_OFFER_RE = /לקבוע|לקבע|קביעת|זמינות|תור\s+חדש|רוצה\s+ש?(אקבע|אבדוק|אסדר|אזמין|נתאם|נקבע|נסגור|אתאם)|שאקבע\s+לך|לבדוק\s+לך|נקבע\s+לך|אבדוק\s+לך|אסדר\s+לך|אזמין\s+לך|נתאם\s+לך|אתאם\s+לך|נסגור\s+לך\s+תור/;
+// Live QA (Professional #2): recognizes that our LAST reply actually OFFERED booking / a link even when it
+// used the OFFER phrasing ("רוצה שאשלח לך קישור?") rather than a "לקבוע"/"קביעת" verb (which BOOKING_OFFER_RE
+// misses). Feeds the stale-pending guard so a legit immediately-prior offer still confirms on "כן", while an
+// unrelated FAQ/parking reply (no offer/link phrase) does not.
+const LAST_TURN_BOOKING_OFFER_RE = /רוצה\s+ש?אשלח|(?:לשלוח|אשלח)\s+(?:לך\s+)?(?:את\s+)?ה?קישור|רוצה\s+(?:את\s+)?ה?קישור/;
 export function deriveLastAssistantContract(transcript: string): LastAssistantContract {
   const last = lastAssistantLine(transcript) ?? "";
   return {
