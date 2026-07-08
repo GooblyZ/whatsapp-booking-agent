@@ -42,7 +42,7 @@ import {
   shouldFenceLinkWording, stripPhantomLinkWording, mentionsPhantomLink, BOOKED_CLAIM_CORRECTION, LINK_SAFE_FALLBACK,
   forcesDeterministicClarify, LOW_SIGNAL_SHORT, LOW_SIGNAL_QUIET_REMINDER,
   machineNoisePlan, injectionPlan, looksLikeInjection, INJECTION_REFUSAL, OFF_TOPIC_DEFLECTION,
-  LOW_VALUE_BOUNDARY, ACK_CLOSE, LOW_VALUE_DEEP_AT,
+  LOW_VALUE_BOUNDARY, ACK_CLOSE, LOW_VALUE_DEEP_AT, MANAGE_LINE,
   planTransientContinuity, TRANSIENT_MICRO_ACK, fallbackTypeForLowSignal,
   shouldPreSkipSingleTokenClarify, isGenericSmalltalkQuestion, asksAnswerExpectedQuestion,
   hasPendingAnswerExpectedQuestion,
@@ -2870,7 +2870,7 @@ async function main(): Promise<void> {
   {
     const shallow = await runLane({ message: "אתה פה?", prevLow: 1 });
     const deep = await runLane({ message: "אתה פה?", prevLow: 4 });
-    const recover = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 4, model: { intent: "booking", appt: "BOOK", action: true, reply: "בשמחה!" } });
+    const recover = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 4, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "בשמחה!" } });
     check("presence anti-reset (runtime): shallow 'אתה פה?' recovers (low→0); deep 'אתה פה?' carries the streak (low stays 4, boundary, no Gemini)",
       shallow.low === 0 && shallow.modelCalled === false
       && deep.low === 4 && deep.outcome.replyText === LOW_VALUE_BOUNDARY && deep.outcome.suppressReply !== true
@@ -2922,7 +2922,7 @@ async function main(): Promise<void> {
   // (42.5) BUSINESS-INTENT RECOVERY FROM QUIET: booking → booking link; explicit cancel + an upcoming appt → manage
   //        link; the literal 'איך אני מבטל…' exits quiet; price/address/hours questions are never suppressed.
   {
-    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 5, model: { intent: "booking", appt: "BOOK", action: true } });
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 5, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת" } });
     const future = new Date(Date.now() + 86_400_000).toISOString();
     const cancel = await runLane({ message: "אני רוצה לבטל את התור", prevLow: 5, model: { intent: "cancel_request", appt: "CANCEL", action: true },
       upcoming: [{ id: "appt-1", start_time: future, status: "confirmed", services: { name: "תספורת" } }] });
@@ -3064,7 +3064,7 @@ async function main(): Promise<void> {
   }
   // (5) Business intent AFTER acknowledgements still recovers (booking link + reset; FAQ not suppressed).
   {
-    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true } });
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת" } });
     const addr = await runLane({ message: "מה הכתובת?", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "faq", reply: "הכתובת…" } });
     check("ack (runtime): clear business intent after acks recovers — booking link attached (Gemini consulted), FAQ not suppressed",
       book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0
@@ -3125,7 +3125,7 @@ async function main(): Promise<void> {
   }
   // (6) Business intent AFTER closures still recovers; (7) repeated business FAQ is never hostile-quieted.
   {
-    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true } });
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת" } });
     const faqDeep = await runLane({ message: "מה הכתובת?", prevLow: 4, lastAssistantReason: ACK_REASON, model: { intent: "faq", reply: "הכתובת…" } });
     check("closure (runtime): business intent after closures recovers (booking link, Gemini) — and a repeated business FAQ is never suppressed",
       book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0
@@ -3187,7 +3187,7 @@ async function main(): Promise<void> {
   }
   // (5) Regression: business recovery after a soft-affirm closure still works.
   {
-    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true } });
+    const book = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, lastAssistantReason: ACK_REASON, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת" } });
     check("soft-affirm (runtime): business intent after a 'סבבה' closure still recovers (booking link, Gemini)",
       book.outcome.linkAttached === "booking" && book.modelCalled === true && book.low === 0,
       `link=${book.outcome.linkAttached} low=${book.low}`);
@@ -3202,7 +3202,7 @@ async function main(): Promise<void> {
   section("47. Prompt composition baseline — static-shell lock + facts size instrumentation");
   // Golden hash of the static shell with default owner settings + empty facts (the date anchor changes daily,
   // so it is excluded from the hash). Phase 2 must keep this hash OR update it deliberately as a no-op.
-  const SHELL_BASELINE_HASH = "b182d75008"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-08 for BOUNDED SERVICE-DISCOVERY (platform APPOINTMENTS rewrite: allow ONE service-discovery clarification before the link; keep no in-chat scheduling — intended). Prior: 1ad4113227 (Slice S1 INV-5 identity + INV-2 grounding lines); e8dceaf56d (Phase B2 consolidated STYLE block).
+  const SHELL_BASELINE_HASH = "c38d47749a"; // date-anchor-excluded safeHash of personaPrompt({}); updated 2026-07-08 for LIVE-QA persona fixes (RELEVANCE faq-vs-meta for business-about #3; firm gender-neutral customer address + slash-gender ban + gender-correction handling #2; explicit no-guess-on-ambiguous #7 — all intended). Prior: b182d75008 (bounded service-discovery); 1ad4113227 (Slice S1 INV-5 identity + INV-2 grounding); e8dceaf56d (Phase B2 STYLE block).
   {
     const shell = personaPrompt({}); // platform-mode persona, default owner settings, empty facts block
     const shellStable = shell.split("\n").filter((l) => !l.includes("Right now: TODAY")).join("\n");
@@ -3428,7 +3428,7 @@ async function main(): Promise<void> {
   }
   // (2) trivia burst (+ trivia history) → latest booking: clean frame; booking link still attaches.
   {
-    const r = await runLane({ message: `${trivia2}\nאני רוצה לקבוע תור`, prevLow: 5, historyTurns: triviaHistory, transcript: triviaTranscript, model: { intent: "booking", appt: "BOOK", action: true } });
+    const r = await runLane({ message: `${trivia2}\nאני רוצה לקבוע תור`, prevLow: 5, historyTurns: triviaHistory, transcript: triviaTranscript, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת" } });
     check("mixed-burst (runtime): booking recovery → clean frame (no trivia anywhere); booking link attaches; low→0",
       r.modelCalled === true && r.modelMessage === "אני רוצה לקבוע תור" && !leaks(r.modelContext)
       && r.outcome.linkAttached === "booking" && r.low === 0,
@@ -3573,7 +3573,7 @@ async function main(): Promise<void> {
     // hostile in-chat confirmation, the deterministic layer attaches the booking LINK and corrects the claim.
     for (const [name, ci] of [["casual", casualText], ["professional", proText], ["hostile", HOSTILE_53]] as const) {
       const r = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, aiSettings: { custom_instructions: ci },
-        model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה, קבעתי לך תור!" } });
+        model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "מעולה, קבעתי לך תור!" } });
       check(`§53.C booking invariant under '${name}' persona: booking LINK attaches; no in-chat 'booked' claim survives`,
         r.outcome.linkAttached === "booking" && !claimsBookingCompleted(r.outcome.replyText),
         `link=${r.outcome.linkAttached} reply=${JSON.stringify(r.outcome.replyText).slice(0, 40)}`);
@@ -3856,7 +3856,7 @@ async function main(): Promise<void> {
     //    in-chat "booked" claim survives — even when the stubbed model "confirms" — under BOTH personas. ──
     for (const [name, s] of [["warm", settingsA], ["premium", settingsB]] as const) {
       const r = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, historyTurns: history56, aiSettings: s,
-        model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה, קבעתי לך תור!" } });
+        model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "מעולה, קבעתי לך תור!" } });
       check(`§56.4 booking invariant mid-conversation under '${name}': booking LINK attaches; no in-chat 'booked' claim survives`,
         r.outcome.linkAttached === "booking" && !claimsBookingCompleted(r.outcome.replyText),
         `link=${r.outcome.linkAttached} reply=${JSON.stringify(r.outcome.replyText).slice(0, 40)}`);
@@ -4729,8 +4729,8 @@ async function main(): Promise<void> {
     const upcoming = [{ id: "appt-1", start_time: future, status: "confirmed", services: { name: "תספורת" } }];
     const hasGuidance = (t: string | undefined) => !!t && t.includes("דרך הקישור") && t.includes("בוחרים");
 
-    const r1 = await runLane({ message: "אפשר לקבוע תור?", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "מה תרצה שנעשה?" } });
-    check("E2E #1: 'אפשר לקבוע תור?' → booking link + guidance copy, NOT the model's 'מה תרצה שנעשה?'",
+    const r1 = await runLane({ message: "אפשר לקבוע תור לתספורת?", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "מה תרצה שנעשה?" } });
+    check("E2E #1: 'אפשר לקבוע תור לתספורת?' (service known) → booking link + guidance copy, NOT the model's 'מה תרצה שנעשה?'",
       r1.outcome.linkAttached === "booking" && hasGuidance(r1.outcome.replyText) && !(r1.outcome.replyText ?? "").includes("מה תרצה"),
       `link=${r1.outcome.linkAttached} reply="${r1.outcome.replyText}"`);
 
@@ -4781,9 +4781,9 @@ async function main(): Promise<void> {
       !(r16.outcome.replyText ?? "").includes("לא יכול"),
       `link=${r16.outcome.linkAttached} reply="${r16.outcome.replyText}"`);
 
-    const r19a = await runLane({ message: "אפשר לקבוע תור?", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "כן" } });
-    const r19b = await runLane({ message: "אפשר לקבוע תור?", prevLow: 0, transcript: `Assistant (you, earlier): ${r19a.outcome.replyText}`, lastAssistantSource: "ai_turn", model: { intent: "booking", appt: "BOOK", action: true, reply: "כן" } });
-    check("E2E #19: repeated 'אפשר לקבוע תור?' → turn-2 reply differs from turn-1 (short/nudge form, no robotic repeat)",
+    const r19a = await runLane({ message: "אפשר לקבוע תור לתספורת?", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "כן" } });
+    const r19b = await runLane({ message: "אפשר לקבוע תור לתספורת?", prevLow: 0, transcript: `Assistant (you, earlier): ${r19a.outcome.replyText}`, lastAssistantSource: "ai_turn", model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "כן" } });
+    check("E2E #19: repeated 'אפשר לקבוע תור לתספורת?' → turn-2 reply differs from turn-1 (short/nudge form, no robotic repeat)",
       r19a.outcome.linkAttached === "booking" && (r19b.outcome.replyText ?? "") !== (r19a.outcome.replyText ?? ""),
       `t1="${r19a.outcome.replyText}" t2="${r19b.outcome.replyText}"`);
   })();
@@ -4886,14 +4886,14 @@ async function main(): Promise<void> {
       pickExplicit.outcome.linkAttached === "booking", `link=${pickExplicit.outcome.linkAttached} reply="${pickExplicit.outcome.replyText}"`);
 
     // (4) Explicit booking / link / site intent → link (unchanged E1/Slice B).
-    const wantBook = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה" } });
-    check("§65: 'אני רוצה לקבוע תור' → booking link", wantBook.outcome.linkAttached === "booking", `link=${wantBook.outcome.linkAttached}`);
+    const wantBook = await runLane({ message: "אני רוצה לקבוע תור לתספורת", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "מעולה" } });
+    check("§65: 'אני רוצה לקבוע תור לתספורת' (service known) → booking link", wantBook.outcome.linkAttached === "booking", `link=${wantBook.outcome.linkAttached}`);
     const sendLink = await runLane({ message: "שלח קישור", prevLow: 0, pendingOffer: softPending, transcript: offeredTranscript, lastAssistantSource: "ai_turn", model: { intent: "unclear", action: false, reply: "בסדר" } });
     check("§65: soft-interest offer + explicit 'שלח קישור' → booking link (link request converts any offer)",
       sendLink.outcome.linkAttached === "booking", `link=${sendLink.outcome.linkAttached}`);
 
     // (5) Safe booking-link copy: a link path never keeps a selection/booking claim.
-    const unsafe = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "מעולה, עוברים לצבע, קבע תור באתר ונתראה" } });
+    const unsafe = await runLane({ message: "אני רוצה לקבוע תור לתספורת", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "מעולה, עוברים לצבע, קבע תור באתר ונתראה" } });
     check("§65: booking link + unsafe model copy → link kept, no 'עוברים ל'/'נתראה'",
       unsafe.outcome.linkAttached === "booking"
       && !(unsafe.outcome.replyText ?? "").includes("עוברים ל") && !(unsafe.outcome.replyText ?? "").includes("נתראה"),
@@ -5090,7 +5090,7 @@ async function main(): Promise<void> {
       interest.outcome.linkAttached === null,
       `link=${interest.outcome.linkAttached} reply="${interest.outcome.replyText}"`);
     const explicit = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0,
-      model: { intent: "booking", appt: "BOOK", action: true, reply: "בשמחה!" } });
+      model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת", reply: "בשמחה!" } });
     check("§68 INV-3 E2E no-regression: explicit 'אני רוצה לקבוע תור' → booking link",
       explicit.outcome.linkAttached === "booking", `link=${explicit.outcome.linkAttached}`);
     // INV-2 E2E — a covered-KB contradiction is corrected; a matching answer is kept; unknown still defers.
@@ -5159,10 +5159,15 @@ async function main(): Promise<void> {
       tier("אש") === "none" && tier("סבבה") === "none" && tier("תודה") === "none");
     check("§69 none: bare greeting 'היי' → none",
       tier("היי") === "none");
+    // Live QA #8: social continuation / closure carry no info request → no KB.
+    check("§69 none: social continuation 'וואלה בסדר' → none (Live QA #8)",
+      tier("וואלה בסדר") === "none");
+    check("§69 none: closure 'תודה רבה' → none (Live QA #8)",
+      tier("תודה רבה") === "none");
+    check("§69 none: 'אני רוצה לקבוע תור' (booking, NO service) → none (Live QA #8: discovery uses structured services, not KB)",
+      tier("אני רוצה לקבוע תור") === "none");
 
     // (3) CONSERVATIVE fallback — any doubt keeps KB (never starve).
-    check("§69 fallback: 'אני רוצה לקבוע תור' (booking, NO known service) → not none (discovery may need KB)",
-      tier("אני רוצה לקבוע תור") !== "none");
     check("§69 fallback: bare service word 'תספורת' (no booking verb, no question) → not none",
       tier("תספורת") !== "none");
     check("§69 fallback: name-game with '?' ('איך קוראים לי?') → not none (a '?' is treated as doubt → keep KB)",
@@ -5177,8 +5182,8 @@ async function main(): Promise<void> {
       isBookingImperative("אני רוצה לקבוע תור לתספורת") && messageNamesService("אני רוצה לקבוע תור לתספורת", SERVICES));
     check("§69 pure: classifyKbNeed — INFO wins over a booking imperative (mixed) → not none",
       classifyKbNeed({ message: "רוצה לקבוע תספורת, כמה עולה?", serviceKnown: true, bookingImperative: true, nonInfoAck: false, infoTopicRecognized: false }) === "broad");
-    check("§69 pure: classifyKbNeed — booking imperative WITHOUT known service → broad (not none)",
-      classifyKbNeed({ message: "אני רוצה לקבוע תור", serviceKnown: false, bookingImperative: true, nonInfoAck: false, infoTopicRecognized: false }) === "broad");
+    check("§69 pure: classifyKbNeed — booking imperative WITHOUT known service → none (Live QA #8: discovery uses service names, not KB)",
+      classifyKbNeed({ message: "אני רוצה לקבוע תור", serviceKnown: false, bookingImperative: true, nonInfoAck: false, infoTopicRecognized: false }) === "none");
 
     // (5) GROUNDING NOT WEAKENED — structured facts always present, even on a "none" turn.
     check("§69 grounding: structured facts (services + 'Services:' header) present even on a 'none' turn",
@@ -5296,13 +5301,46 @@ async function main(): Promise<void> {
       genderedAddressCount("תוכל להיכנס מכאן") >= 1 && genderedAddressCount("אתה רוצה לקבוע?") >= 1);
     check("§72 scorer: a natural NEUTRAL reply scores 0 ('אפשר לשלוח קישור לקביעת תור?')",
       genderedAddressCount("אפשר לשלוח קישור לקביעת תור?") === 0);
-    check("§72 prompt instructs neutral customer addressing by default",
-      personaPrompt({}).includes("neutral phrasing") || personaPrompt({}).includes("neutral forms"));
+    check("§72 prompt instructs GENDER-NEUTRAL customer addressing by default",
+      personaPrompt({}).includes("GENDER-NEUTRAL Hebrew") || personaPrompt({}).includes("neutral turns"));
+    // Live QA #2/#6: slash-gender scorer + deterministic-copy cleanliness (no /g flag → .test is stateless).
+    const SLASH_GENDER_RE = /(?:כתוב|שלח|תוכל|תרצה|בוא|קח|תבחר|תכתוב|רוצה)\s*\/\s*[א-ת]{1,6}/;
+    check("§72 scorer: slash-gender IS flagged ('כתוב/כתבי', 'שלח/י')",
+      SLASH_GENDER_RE.test("כתוב/כתבי לי") && SLASH_GENDER_RE.test("שלח/י הודעה"));
+    check("§72 copy: LOW_VALUE_BOUNDARY has no slash-gender / is not the old robotic scope line (Live QA #6)",
+      !SLASH_GENDER_RE.test(LOW_VALUE_BOUNDARY) && !LOW_VALUE_BOUNDARY.includes("כתוב/כתבי"));
+    check("§72 copy: MANAGE_LINE is natural — no markdown asterisks, no '(צפייה' jargon block (Live QA #5)",
+      !MANAGE_LINE.includes("*") && !MANAGE_LINE.includes("(צפייה"));
+    check("§72 prompt forbids slash-gender + handles a gender correction ('אני בת') (Live QA #2)",
+      personaPrompt({}).includes("slash-gender") && personaPrompt({}).includes("אני בת"));
+    check("§72 prompt: business-about is faq (answer from facts), bot-identity is meta (Live QA #3)",
+      personaPrompt({}).includes("ספרו לי על העסק") && personaPrompt({}).includes('is "meta"'));
+    check("§72 prompt: do-not-guess on unclear, ask a short clarification instead (Live QA #7)",
+      personaPrompt({}).includes("do NOT guess") && personaPrompt({}).includes("לנסח שוב"));
+    check("§72 pack: warm_casual carries a concrete WhatsApp-native phrasing example (Live QA #1)",
+      PERSONA_PACKS.warm_casual.voiceText.includes("כמו טופס") && PERSONA_PACKS.warm_casual.voiceText.includes("סבבה"));
     // Restraint (data-level; the runtime emoji-under-guard coupling is a later chunk): guard collapses emoji.
     check("§72 restraint data: both packs declare guardCap 0 (emoji removed under serious/guard)",
       PERSONA_PACKS.warm_casual.emoji.guardCap === 0 && PERSONA_PACKS.professional_elegant.emoji.guardCap === 0);
     check("§72 Professional pack guards against bureaucratic overuse (ניתן/בהחלט)",
       PERSONA_PACKS.professional_elegant.promptRules.some((r) => r.includes("ניתן") && r.includes("בהחלט")));
+  }
+
+  section("73. Live QA — bounded service-discovery before the booking link (failure #4)");
+  {
+    // Booking intent, NO service named → withhold the link and ask ONE discovery question.
+    const noSvc = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, reply: "בשמחה" } });
+    check("§73 booking-no-service → NO link + bounded service-discovery asked (Live QA #4)",
+      noSvc.outcome.linkAttached === null && /שירות/.test(noSvc.outcome.replyText),
+      `link=${noSvc.outcome.linkAttached} reply="${noSvc.outcome.replyText}"`);
+    // A service-known booking still attaches the link immediately — discovery never blocks a real booking.
+    const withSvc = await runLane({ message: "אני רוצה לקבוע תור לתספורת", prevLow: 0, model: { intent: "booking", appt: "BOOK", action: true, service: "תספורת" } });
+    check("§73 booking WITH a named service → booking link attaches (Live QA #4)",
+      withSvc.outcome.linkAttached === "booking", `link=${withSvc.outcome.linkAttached}`);
+    // Once a booking offer is already in play, a repeat vague booking attaches the link (no discovery loop).
+    const engaged = await runLane({ message: "אני רוצה לקבוע תור", prevLow: 0, pendingOffer: { kind: "BOOK", stage: "offered", source: "soft_interest_offer", at: Date.now() }, model: { intent: "booking", appt: "BOOK", action: true } });
+    check("§73 booking-no-service but booking ALREADY engaged (prior offer) → link attaches, no loop",
+      engaged.outcome.linkAttached === "booking", `link=${engaged.outcome.linkAttached}`);
   }
 
   // ── summary ────────────────────────────────────────────────────────────────────

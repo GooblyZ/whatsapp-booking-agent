@@ -122,7 +122,7 @@ export interface ReceptionistDecision {
 // is unsure". The grounding fallback is made fact-aware in groundingFallback().
 export const FALLBACK = {
   aiDisabled:
-    "כדי לקבוע תור כתוב/כתבי 'תור' 🙂 לכל שאלה אחרת נשמח לעזור ישירות.",
+    "כדי לקבוע תור אפשר לכתוב 'תור' 🙂 ולכל שאלה אחרת נשמח לעזור ישירות.",
   noise:
     "לא בטוח/ה שהבנתי 🙂 אפשר לשאול אותי כל שאלה על העסק, או לקבוע תור.",
   abuse:

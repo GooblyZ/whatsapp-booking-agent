@@ -72,9 +72,11 @@ const BOOKING_IMPERATIVE_RE =
 // Pure link (re)send request.
 const LINK_REQUEST_RE = /(?:שלח|תשלח|לשלוח|תביא|איפה|שוב).{0,12}(?:קישור|לינק)|(?:קישור|לינק).{0,12}(?:שוב|בבקשה)/;
 
-// Bare short ack / closure — the WHOLE message is essentially one closure token (+ light punctuation).
+// Bare short ack / closure / social continuation — the WHOLE message is essentially one closure/filler
+// token (+ light punctuation). Live QA (failure #8): "וואלה בסדר" / "בסדר גמור" style social continuations
+// were falling to "broad" (full KB) because they weren't recognized as acks. They carry no info request.
 const BARE_ACK_RE =
-  /^(?:אש|סבבה(?:\s*גמור)?|תודה(?:\s*רבה)?|יופי|מעולה|מצוין|אחלה|אוקיי?|כן|בסדר|טוב|היידה|וואו|אדיר|מגניב|פצצה|תנקס|קיבלתי|הבנתי|ביי|נתראה)\s*[!.…🙂😊👍]*$/;
+  /^(?:אש|סבבה(?:\s*גמור)?|תודה(?:\s*רבה)?|יופי|מעולה|מצוין|אחלה|אוקיי?(?:\s*סבבה)?|כן|בסדר(?:\s*גמור)?|וואלה(?:\s*(?:בסדר|סבבה|טוב))?|סבבה|טוב|היידה|וואו|אדיר|מגניב|פצצה|תנקס|קיבלתי|הבנתי|סגור|עשינו|ביי|נתראה)\s*[!.…🙂😊👍]*$/;
 
 // Bare greeting — the WHOLE message is a greeting (a first-turn greeting still needs no KB).
 const BARE_GREETING_RE =
@@ -108,14 +110,20 @@ export function messageNamesService(message: string, serviceNames: string[] = []
  *   1) informational (scopable topic OR info-question shape) → "scoped" if a single scopable topic is
  *      recognized, else "broad". (Info ALWAYS keeps KB — never "none".)
  *   2) a bare non-info action (link/ack/greeting) → "none".
- *   3) a booking imperative WITH a known service (and no info, per #1) → "none".
- *   4) otherwise (ambiguous, booking w/o known service, bare service mention, …) → "broad" (safe default).
+ *   3) a booking imperative (with OR without a named service) → "none". A booking turn is answered from
+ *      the STRUCTURED service list — either a clean book (service known) or bounded service-DISCOVERY
+ *      (service unknown, whose answer is the service NAMES, not the KB). A price/policy question ALONGSIDE
+ *      a booking already returned at #1 (info shape), so a real FAQ next to a booking still keeps KB.
+ *   4) otherwise (ambiguous, bare service mention, …) → "broad" (safe default).
  */
 export function classifyKbNeed(s: KbNeedSignals): KbTier {
   if (s.infoTopicRecognized || hasInfoQuestionShape(s.message)) {
     return s.infoTopicRecognized ? "scoped" : "broad";
   }
   if (s.nonInfoAck) return "none";
-  if (s.bookingImperative && s.serviceKnown) return "none";
+  // Live QA (failure #8): booking-WITHOUT-service was sending the full KB. A booking turn never needs KB —
+  // discovery uses the structured service names, not knowledge-base items. serviceKnown no longer gates this
+  // (mixed booking+info is already handled by the info branch above, so FAQs are never starved).
+  if (s.bookingImperative) return "none";
   return "broad";
 }

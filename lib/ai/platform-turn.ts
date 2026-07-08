@@ -115,7 +115,7 @@ export function operatingModeReason(opts: {
 // WhatsApp). Emojis are intentionally omitted here so the CTA looks the same
 // regardless of the owner's emoji setting and never trips the chokepoint.
 const BOOK_LINE = "*לקביעת תור — מהיר ופשוט:*";
-const MANAGE_LINE = "*לניהול התור (צפייה · שינוי · ביטול):*";
+export const MANAGE_LINE = "לניהול התור — צפייה, שינוי או ביטול:";
 const MY_APPTS_LINE = "*כל התורים שלך — לבחירה וניהול:*";
 // Honest reply for an explicit manage/list ask when there are NO upcoming appointments: says there are
 // no FUTURE appointments (never "none at all" — past ones may exist in history) and offers booking as a
@@ -220,6 +220,12 @@ const BOOK_GUIDANCE_FULL =
 // shouldn't get the identical full explanation each time).
 const BOOK_GUIDANCE_SHORT =
   "הכול דרך הקישור — בוחרים שירות, יום ושעה ומאשרים שם.";
+// ── BOUNDED SERVICE-DISCOVERY (Live QA failure #4) ───────────────────────────────
+// One deterministic, gender-neutral discovery question for a booking intent with NO service named yet —
+// so the booking link is withheld until the customer names a service (or asks to proceed). NOT a scheduling
+// flow (no day/time/name/phone); the SYSTEM attaches the link next turn once a service is known.
+const SERVICE_DISCOVERY_LINE =
+  "לאיזה שירות לקבוע את התור, או שעדיף שאציג בקצרה מה יש אצלנו?";
 // WhatsApp-aware link-trouble recovery: the CTA button doesn't render on every device — resend the link.
 // Neutral lead so it pairs with EITHER a booking or a manage label (chosen by the resend kind).
 const LINK_TROUBLE_RECOVERY =
@@ -1134,6 +1140,10 @@ export async function runPlatformTurn(
   let guidance: BookingGuidanceVerdict = { intent: "NONE", link: "none", copy: "KEEP_MODEL" };
   let guidanceHandled = false;
   let behaviorHandled = false; // E3: a class B/C/D/F lane produced the reply this turn (no link; don't override)
+  // E2.1 / Live-QA failure #4: a deterministic no-link OFFER or a bounded service-DISCOVERY ask was produced
+  // this turn (both record a soft-interest pending so a later "כן"/service pick resolves to a link). Declared
+  // here so the routing chain below (service-discovery withhold) and the E2.1 OFFER lane can both set it.
+  let offerProduced = false;
 
   if (decision.ok && suppressLinkFor(messageText)) {
     platformRoute = "NONE"; // complaints / bare-meta / one-char never get a link
@@ -1185,6 +1195,15 @@ export async function runPlatformTurn(
       replyText = route === "BOOK" ? `בטח! ${FENCE_BRIDGE_BOOK}` : `בטח! ${FENCE_BRIDGE_MANAGE}`;
     }
 
+    // ── BOUNDED SERVICE-DISCOVERY GATE (Live QA failure #4): a booking link attaches only when the turn
+    //    is ready for it — a service is KNOWN (model extracted one, or the message names one), the customer
+    //    explicitly asked for the link / to proceed, or a booking offer/link was ALREADY in play. Otherwise a
+    //    booking intent (even an explicit "אני רוצה לקבוע תור") gets ONE discovery question first and NO link.
+    const serviceKnown = !!u.serviceName || activeServiceNames.some((n) => n && messageText.includes(n));
+    const wantsDirectLink = isExplicitLinkRequest(latest)
+      || guidance.intent === "SITE_REQUEST" || guidance.intent === "BOOK_HOWTO";
+    const bookingAlreadyEngaged = prevPending?.kind === "BOOK"
+      || lastContract.offeredBooking || lastContract.sentBookingLink;
     if (linkKind && reason === "model_intent" && !bookingSignal) {
       // Defense-in-depth floor: a MODEL-derived operation with no corroborating signal in
       // the message is not trusted to attach a link (the evidence gate normally already
@@ -1242,6 +1261,29 @@ export async function runPlatformTurn(
       }
       ({ replyText, interactive } = attachPlatformLink(replyText, label, url, lastAssistant, messageText));
       logPlatformLink(linkAttached, url);
+    } else if (linkKind === "booking" && !serviceKnown && !wantsDirectLink && !bookingAlreadyEngaged) {
+      // ── BOUNDED SERVICE-DISCOVERY (Live QA failure #4): booking intent but NO service named yet, no
+      //    explicit link/proceed request, and no active booking context → ask ONE discovery question and
+      //    DO NOT attach the link. The link follows next turn once a service is named ("תספורת") or the
+      //    customer asks to proceed ("כן"/"תשלח"). Records a soft-interest pending (offerProduced below) so
+      //    that affirmative resolves to a link (Slice B); fires ONCE (a prior offer/link sets
+      //    bookingAlreadyEngaged, so a repeat vague booking gets the link instead of looping the question).
+      let warm = defuseSchedulingQuestion(replyText).text; // keep the model's warmth; a service-pick Q survives
+      warm = defuseCapabilityPromise(warm).text;
+      const refused = defuseActionRefusal(warm, "BOOK");
+      if (refused.defused) warm = refused.text;
+      if (mentionsSelectionOrBookingClaim(warm)) warm = ""; // never keep a selection/booking claim before discovery
+      // Keep the model's own question if it already asked one (its discovery phrasing); else add the ask.
+      replyText = warm.trim()
+        ? (/[?？]/.test(warm) ? warm.trim() : `${warm.trim()}\n${SERVICE_DISCOVERY_LINE}`)
+        : SERVICE_DISCOVERY_LINE;
+      offerProduced = true;
+      platformRoute = "BOOK";
+      platformRouteReason = "service_discovery";
+      // Neutralize the booking-guidance verdict so the escape below can't re-attach a link this turn.
+      guidance = { intent: "NONE", link: "none", copy: "KEEP_MODEL" };
+      guidanceHandled = true;
+      console.log("[platform-turn] booking link withheld: no service named → bounded service-discovery (no link)");
     } else if (linkKind === "booking") {
       // ── BOOKING-GUIDANCE COPY (Slice E1, failure #1): on a HIGH-CONFIDENCE book intent (the customer's
       //    own words named booking, or a service answer while booking context is active) the model's raw
@@ -1355,7 +1397,6 @@ export async function runPlatformTurn(
   const wantsBook = (latestSignal === "action" && escapeOp === "BOOK") || confirmIntoBooking;
   const pendingResolved = confirmIntoBooking || confirmIntoManage;
   const softIntentLink = false; // retained for telemetry parity; bare interest now routes to an OFFER (E2.1)
-  let offerProduced = false; // E2.1: a deterministic service-interest OFFER (no link) was produced this turn
   if (decision.ok && !guidanceHandled && !suppressLinkFor(latest) && wantsManage && (latestSignal === "help" || linkAttached === null)) {
     // HELP overrides even an attached link (truth-safe guidance beats a vague model reply);
     // a MISSED manage operation fires only when nothing was attached. Skipped when the booking-guidance
@@ -1886,7 +1927,7 @@ export const OFF_TOPIC_DEFLECTION = "זה לא בתחום שלי 🙂 לגבי �
 // ONE human-visible boundary shown by every low-value lane (machine-noise / injection / off-topic) BEFORE
 // it goes quiet — so the customer always knows how to recover instead of hitting sudden silence. Never says
 // "quiet mode"/"blocked"; just states the scope + how to get help. Shared + reusable.
-export const LOW_VALUE_BOUNDARY = "אני כאן לעזור עם תורים ושאלות על העסק 🙂 כתוב/כתבי לי ברור מה צריך ואשמח לעזור.";
+export const LOW_VALUE_BOUNDARY = "אני כאן 🙂 אשמח לעזור עם תור או עם כל שאלה על העסק — אפשר לכתוב לי מה צריך.";
 // Post-CTA / post-answer ACKNOWLEDGEMENT close (מעולה/תודה/מגניב …) — a natural, short close, never an
 // "I didn't understand" clarify and never a CTA.
 export const ACK_CLOSE = "בשמחה 🙂";
